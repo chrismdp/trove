@@ -184,6 +184,18 @@ fn empty_store_with_no_types_checks_nothing() {
 }
 
 #[test]
+fn template_placeholder_files_are_skipped_not_failed() {
+    let store = TempStore::new("template");
+    store
+        .schema("person", PERSON_SCHEMA)
+        // a template: {{placeholder}} is not valid YAML, but it's not corruption
+        .note("templates/person.md", "---\ntype: person\nname: {{title}}\ndob: {{date}}\n---\n");
+
+    let s = check::run(store.path(), true).unwrap();
+    assert_eq!(s.failed, 0, "template files must not count as failures");
+}
+
+#[test]
 fn mixed_store_counts_each_bucket() {
     let store = TempStore::new("mixed");
     store

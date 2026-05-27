@@ -55,6 +55,12 @@ pub fn run(store: &Path, quiet: bool) -> Result<Summary> {
         let doc = match frontmatter::parse(&raw) {
             Ok(d) => d,
             Err(e) => {
+                // Template files (Obsidian/Jekyll) carry {{placeholder}} syntax
+                // that is deliberately not valid YAML — skip, don't fail.
+                if raw.contains("{{") {
+                    s.untyped += 1;
+                    continue;
+                }
                 s.failed += 1;
                 report_fail(rel, &[format!("{e}")]);
                 continue;
