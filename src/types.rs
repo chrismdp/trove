@@ -97,6 +97,13 @@ impl Registry {
         Ok(Self { schemas })
     }
 
+    /// A registry with no schemas — nothing is governed, so the write path
+    /// gates nothing (pure pass-through). Used when `trove mount` runs without
+    /// a `--types` directory.
+    pub fn empty() -> Self {
+        Self { schemas: Vec::new() }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.schemas.is_empty()
     }

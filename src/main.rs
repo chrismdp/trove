@@ -44,6 +44,11 @@ enum Command {
         /// Local block-cache directory.
         #[arg(long, default_value = "/tmp/trove-cache")]
         cache: PathBuf,
+        /// Directory containing a `.types/` schema registry. When set, writes
+        /// are validated against it (the "filesystem that talks back"); when
+        /// omitted the mount is a plain pass-through.
+        #[arg(long)]
+        types: Option<PathBuf>,
     },
 }
 
@@ -77,11 +82,24 @@ fn run() -> Result<usize> {
         }
 
         #[cfg(feature = "mount")]
-        Command::Mount { mountpoint, volume, meta, cache } => {
+        Command::Mount { mountpoint, volume, meta, cache, types } => {
             let cache = cache.to_string_lossy();
             let fs = trove::jfs::Fs::init(&volume, &meta, &cache)?;
-            println!("{} mounting volume {volume:?} at {}", "trove:".bold(), mountpoint.display());
-            trove::mount::mount_blocking(fs, &mountpoint)?;
+            let registry = match &types {
+                Some(dir) => trove::types::Registry::load(dir)?,
+                None => trove::types::Registry::empty(),
+            };
+            println!(
+                "{} mounting volume {volume:?} at {} ({})",
+                "trove:".bold(),
+                mountpoint.display(),
+                if registry.is_empty() {
+                    "no validation".to_string()
+                } else {
+                    format!("validating via {}", types.as_ref().unwrap().display())
+                }
+            );
+            trove::mount::mount_blocking(fs, registry, &mountpoint)?;
             Ok(0)
         }
     }

@@ -162,6 +162,51 @@ impl Fs {
         check(unsafe { jfs_stat(PID, self.handle, cpath.as_ptr(), &mut info) }, "stat")?;
         Ok(info)
     }
+
+    /// Does a path exist in the volume?
+    pub fn exists(&self, path: &str) -> bool {
+        self.stat(path).is_ok()
+    }
+
+    /// Read a whole file into memory. The `mount` layer buffers the full
+    /// contents on open so it can validate the file as a unit before it commits
+    /// (markdown notes are small; whole-file buffering is the design).
+    pub fn read_all(&self, path: &str) -> Result<Vec<u8>> {
+        let info = self.stat(path)?;
+        let f = self.open(path, 0)?;
+        let mut buf = vec![0u8; info.length as usize];
+        let (mut filled, mut off) = (0usize, 0i64);
+        while filled < buf.len() {
+            let n = f.read_at(&mut buf[filled..], off)?;
+            if n == 0 {
+                break;
+            }
+            filled += n;
+            off += n as i64;
+        }
+        buf.truncate(filled);
+        Ok(buf)
+    }
+
+    /// Write a whole file, replacing any existing contents (truncate semantics).
+    /// This is the commit step on the write path: once a buffer has passed
+    /// validation, its bytes land here atomically from the agent's point of view
+    /// (a single close/fsync). Unlink-then-create guarantees a clean truncate.
+    pub fn write_all(&self, path: &str, bytes: &[u8], mode: u16) -> Result<()> {
+        let _ = self.unlink(path); // ignore ENOENT — new file
+        let f = self.create(path, mode)?;
+        let mut off = 0i64;
+        while (off as usize) < bytes.len() {
+            let n = f.write_at(&bytes[off as usize..], off)?;
+            if n == 0 {
+                bail!("short write to {path}");
+            }
+            off += n as i64;
+        }
+        f.flush()?;
+        f.fsync()?;
+        Ok(())
+    }
 }
 
 /// An open file handle. Closes on drop. Must not outlive its `Fs` (the libjfs
