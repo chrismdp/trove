@@ -19,6 +19,10 @@ pub mod jfs;
 #[cfg(feature = "mount")]
 pub mod versioning;
 
+/// The `trove embed` worker: content -> header chunks -> OpenAI -> `blob_chunks`.
+#[cfg(feature = "mount")]
+pub mod embed;
+
 /// The `trove mount` FUSE filesystem, backed by `jfs`.
 #[cfg(feature = "mount")]
 pub mod mount;

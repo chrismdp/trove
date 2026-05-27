@@ -129,6 +129,46 @@ impl VersionStore {
     }
 }
 
+/// One embedding row to write for a blob. `embedding` is the pgvector text
+/// literal (`"[0.1,0.2,…]"`) or `None` for a processed-but-not-embedded blob
+/// (empty/binary) — a sentinel so the blob stops showing as "needs embedding".
+pub struct ChunkInsert<'a> {
+    pub ordinal: i32,
+    pub heading: Option<&'a str>,
+    pub start_byte: i32,
+    pub end_byte: i32,
+    pub embedding: Option<String>,
+}
+
+impl VersionStore {
+    /// Replace all embedding chunks for `blob_hash` (delete + insert in one
+    /// transaction) — idempotent re-embedding. After this, the blob is no longer
+    /// "pending" (it has rows), so a re-run won't re-process it.
+    pub fn replace_chunks(
+        &mut self,
+        blob_hash: &str,
+        model: &str,
+        rows: &[ChunkInsert],
+    ) -> Result<()> {
+        let mut tx = self.client.transaction()?;
+        tx.execute("delete from blob_chunks where blob_hash = $1", &[&blob_hash])?;
+        for r in rows {
+            tx.execute(
+                // `$6::text::vector`: bind the param as text (so the driver
+                // serializes a Rust String/None), then cast text -> vector.
+                // `$6::vector` alone makes the server type the param as `vector`,
+                // which the driver can't serialize a String into.
+                "insert into blob_chunks \
+                 (blob_hash, ordinal, heading, start_byte, end_byte, embedding, embedding_model) \
+                 values ($1, $2, $3, $4, $5, $6::text::vector, $7)",
+                &[&blob_hash, &r.ordinal, &r.heading, &r.start_byte, &r.end_byte, &r.embedding, &model],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+}
+
 /// Lowercase hex sha256 — the blob content-address.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();

@@ -10,12 +10,10 @@ name = "trove"
 path = "src/main.rs"
 
 [features]
-# `mount` pulls in the JuiceFS-backed FUSE filesystem (links libjfs). Kept
-# behind a feature so `trove check` and the validator build with no native deps.
 # `mount` pulls the substrate runtime: JuiceFS-backed FUSE (libjfs) + COW
-# version capture. Kept behind a feature so `trove check` and the validator
-# build with no native deps (FFI).
-mount = ["dep:fuser", "dep:libc"]
+# version capture + the `trove embed` worker (ureq for the OpenAI call). Kept
+# behind a feature so `trove check` and the validator build with no native deps.
+mount = ["dep:fuser", "dep:libc", "dep:ureq"]
 
 [dependencies]
 fuser = { version = "0.17", optional = true }
@@ -32,3 +30,4 @@ colored = "2"
 postgres = "0.19"
 sha2 = "0.10"
 hex = "0.4"
+ureq = { version = "2", features = ["json"], optional = true }

@@ -55,6 +55,27 @@ enum Command {
         #[arg(long)]
         versions_db: Option<String>,
     },
+
+    /// Embed un-embedded version blobs into `blob_chunks` for search. Reads
+    /// content via libjfs, chunks by header, calls OpenAI. Needs OPENAI_API_KEY.
+    #[cfg(feature = "mount")]
+    Embed {
+        /// JuiceFS volume name (must already be formatted).
+        #[arg(long)]
+        volume: String,
+        /// Metadata engine URL (same Postgres as --versions-db in production).
+        #[arg(long)]
+        meta: String,
+        /// Local block-cache directory.
+        #[arg(long, default_value = "/tmp/trove-cache")]
+        cache: PathBuf,
+        /// Postgres URL for the version chain + embeddings.
+        #[arg(long)]
+        versions_db: String,
+        /// Run forever, sweeping every N seconds, instead of a single pass.
+        #[arg(long)]
+        watch: Option<u64>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -112,6 +133,26 @@ fn run() -> Result<usize> {
             );
             trove::mount::mount_blocking(fs, registry, versions, &mountpoint)?;
             Ok(0)
+        }
+
+        #[cfg(feature = "mount")]
+        Command::Embed { volume, meta, cache, versions_db, watch } => {
+            let api_key = std::env::var("OPENAI_API_KEY")
+                .map_err(|_| anyhow::anyhow!("OPENAI_API_KEY not set"))?;
+            let fs = trove::jfs::Fs::init(&volume, &meta, &cache.to_string_lossy())?;
+            let mut versions = trove::version::VersionStore::connect(&versions_db)?;
+            match watch {
+                Some(secs) => {
+                    println!("{} embedding (watch, every {secs}s)…", "trove:".bold());
+                    trove::embed::run_watch(&fs, &mut versions, &api_key, std::time::Duration::from_secs(secs))?;
+                    Ok(0)
+                }
+                None => {
+                    let n = trove::embed::run_once(&fs, &mut versions, &api_key)?;
+                    println!("{} embedded {n} blob(s)", "trove:".bold());
+                    Ok(0)
+                }
+            }
         }
     }
 }
