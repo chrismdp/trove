@@ -5,12 +5,17 @@ down to the filesystem layer, so any agent — or human — gets typed, validate
 schema-checked shared state with zero per-agent integration. You don't need MCP
 to coordinate agents; you need a filesystem that talks back.
 
-## Status — v0.1 (single-tenant, local-first)
+## Status — v0.1 (single-tenant)
 
-The load-bearing core first: **schema-on-write validation** for a
-markdown+frontmatter store. This is the moat (the *backing*, not the interface),
-and it's what makes the rest — embeddings search, the FUSE projection, per-path
-ACLs — meaningful rather than a dumb mount.
+Built and tested end-to-end: **schema-on-write validation**, a **FUSE mount**
+over JuiceFS (R2 + Postgres), **copy-on-write version history** (via `jfs_clone`,
+zero byte duplication), and **semantic-search embeddings** that self-trigger on
+write. One write flows: validate → COW-clone a version → record the chain →
+embed. See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the full design, schema,
+how to run it, and the e2e test map.
+
+Not yet built: the `trove search` query command (vectors are produced + indexed,
+just no query surface yet) and the `trove log/diff/cat/restore` history CLI.
 
 ### `trove check <store>`
 
@@ -28,14 +33,18 @@ trove check ~/vault --quiet  # failures + summary only
 The type registry (`.types/*.json`) is **data in the store, not code** — editing
 a schema is how you migrate; writes self-heal lazily as records are touched.
 
-## Roadmap
+## Commands
 
-1. **`trove check`** — schema-on-write validation. ✅ done
-2. **`trove search`** — embeddings / semantic search over the store (embedded
-   vector index, local-first; see `docs/backend.md`).
-3. **`trove mount`** — FUSE projection so the validation contract runs on the
-   write path: a `close()`/`fsync()` that violates schema returns `EINVAL` with
-   a sibling `.errors` file, ACL violations return `EACCES`/`EROFS`.
+- **`trove check <store>`** — schema-on-write validation. ✅
+- **`trove mount <mnt> --volume … --meta … [--types …] [--versions-db …] [--embed]`**
+  — the FUSE projection. The validation gate runs on the write path (a
+  schema-violating `fsync` returns `EINVAL` + a `.errors` sidecar); `--versions-db`
+  turns on COW version history; `--embed` self-triggers embedding on each commit. ✅
+- **`trove embed --volume … --meta … --versions-db … [--watch SECS]`** — backfill /
+  poll embeddings for any un-embedded blobs. ✅
+- **`trove search`** — semantic query over the embeddings. _next_
+
+See **[ARCHITECTURE.md](ARCHITECTURE.md)** for how it all fits together.
 
 ## Licence
 
