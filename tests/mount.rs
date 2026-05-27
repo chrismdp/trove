@@ -443,3 +443,48 @@ fn validation_gate_rejects_bad_write_and_commits_good() {
     drop(session);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// End-to-end versioning: a valid write through the kernel is captured as a
+/// version (best-effort, via the WAL) and is recoverable as history. Exercises
+/// mount -> commit barrier -> recorder -> WAL -> drain -> R2 + Postgres.
+#[test]
+fn a_committed_write_is_recorded_as_a_version() {
+    let (fs, dir) = fresh_fs("ver");
+
+    let schema_root = dir.join("schemas");
+    std::fs::create_dir_all(schema_root.join(".types")).unwrap();
+    std::fs::write(schema_root.join(".types/person.json"), PERSON_SCHEMA).unwrap();
+    let registry = Registry::load(&schema_root).unwrap();
+
+    // Recorder over the live backends (local Supabase + real R2).
+    let db = std::env::var("TROVE_DB_URL")
+        .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:54322/postgres".to_string());
+    let vs = trove::version::VersionStore::connect(&db).expect("version DB up? (`supabase start`)");
+    let bs = trove::blobstore::BlobStore::from_env().expect("R2 creds in env");
+    let rec = trove::recorder::Recorder::new(vs, bs, dir.join("wal")).unwrap();
+
+    let mountpoint = dir.join("mnt");
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    let session =
+        mount::spawn_with_recorder(fs, registry, Some(rec.clone()), &mountpoint).expect("mount");
+    wait_mounted(&mountpoint);
+
+    std::fs::create_dir(mountpoint.join("people")).expect("mkdir people");
+    // Unique name so the shared version DB doesn't collide across runs.
+    let rel = format!("people/{}.md", uniq("p"));
+    let body = "---\ntype: person\nage: 30\n---\nrecorded\n";
+    std::fs::write(mountpoint.join(&rel), body).expect("valid write commits");
+
+    // The write returned without touching the DB (WAL-only); draining applies it.
+    assert_eq!(rec.drain_once().unwrap().applied, 1, "one version queued for the write");
+
+    // History is now queryable, and the recorded bytes round-trip from R2.
+    let jfs_path = format!("/{rel}");
+    let log = trove::version::VersionStore::connect(&db).unwrap().log(&jfs_path).unwrap();
+    assert_eq!(log.len(), 1, "exactly one version (no double-commit on close)");
+    assert_eq!(log[0].rev, 1);
+    assert_eq!(rec.cat(&jfs_path, 1).unwrap().as_deref(), Some(body.as_bytes()));
+
+    drop(session);
+    let _ = std::fs::remove_dir_all(&dir);
+}

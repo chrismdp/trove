@@ -22,6 +22,7 @@ use fuser::{
     ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite,
     RenameFlags, Request, TimeOrNow, WriteFlags,
 };
+use crate::recorder::Recorder;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io;
@@ -64,6 +65,10 @@ enum OpenFile {
 struct Inner {
     fs: Fs,
     registry: Registry,
+    /// Best-effort version recorder. `None` = versioning off (plain mount).
+    /// When set, a validated commit also appends the version to its WAL — never
+    /// blocking the write (see `recorder`).
+    recorder: Option<Recorder>,
     ino_to_path: HashMap<u64, String>,
     path_to_ino: HashMap<String, u64>,
     next_ino: u64,
@@ -209,6 +214,14 @@ impl Inner {
             Ok(()) => {
                 self.fs.write_all(&path, &buf, 0o644).map_err(|_| Errno::EIO)?;
                 let _ = self.fs.unlink(&format!("{path}.errors")); // clear stale sidecar
+                // Best-effort version capture: the file is already saved to jfs
+                // (the live source of truth); recording only appends to a local
+                // WAL, so a versioning hiccup must never fail the write.
+                if let Some(rec) = &self.recorder {
+                    if let Err(e) = rec.record(&path, &buf, None) {
+                        eprintln!("trove: version not recorded for {path}: {e:#}");
+                    }
+                }
                 if let Some(OpenFile::Write { dirty, rejected, .. }) = self.open_files.get_mut(&fh) {
                     *dirty = false;
                     *rejected = false;
@@ -247,7 +260,14 @@ pub struct TroveFs {
 }
 
 impl TroveFs {
+    /// A plain mount with no version recording.
     pub fn new(fs: Fs, registry: Registry) -> Self {
+        Self::with_recorder(fs, registry, None)
+    }
+
+    /// A mount that also records each validated commit through `recorder`
+    /// (best-effort; the write is never blocked on it).
+    pub fn with_recorder(fs: Fs, registry: Registry, recorder: Option<Recorder>) -> Self {
         let mut ino_to_path = HashMap::new();
         let mut path_to_ino = HashMap::new();
         ino_to_path.insert(ROOT_INO, "/".to_string());
@@ -256,6 +276,7 @@ impl TroveFs {
             inner: Mutex::new(Inner {
                 fs,
                 registry,
+                recorder,
                 ino_to_path,
                 path_to_ino,
                 next_ino: 2,
@@ -945,10 +966,25 @@ fn config() -> fuser::Config {
 
 /// Mount in the background; the returned session unmounts on drop. For tests.
 pub fn spawn(fs: Fs, registry: Registry, mountpoint: &Path) -> io::Result<BackgroundSession> {
-    fuser::spawn_mount2(TroveFs::new(fs, registry), mountpoint, &config())
+    spawn_with_recorder(fs, registry, None, mountpoint)
+}
+
+/// Background mount with optional version recording. For tests.
+pub fn spawn_with_recorder(
+    fs: Fs,
+    registry: Registry,
+    recorder: Option<Recorder>,
+    mountpoint: &Path,
+) -> io::Result<BackgroundSession> {
+    fuser::spawn_mount2(TroveFs::with_recorder(fs, registry, recorder), mountpoint, &config())
 }
 
 /// Mount in the foreground; blocks until unmounted. For the `trove mount` CLI.
-pub fn mount_blocking(fs: Fs, registry: Registry, mountpoint: &Path) -> io::Result<()> {
-    fuser::mount2(TroveFs::new(fs, registry), mountpoint, &config())
+pub fn mount_blocking(
+    fs: Fs,
+    registry: Registry,
+    recorder: Option<Recorder>,
+    mountpoint: &Path,
+) -> io::Result<()> {
+    fuser::mount2(TroveFs::with_recorder(fs, registry, recorder), mountpoint, &config())
 }

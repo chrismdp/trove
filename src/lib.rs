@@ -19,6 +19,10 @@ pub mod jfs;
 #[cfg(feature = "mount")]
 pub mod blobstore;
 
+/// Best-effort, eventually-consistent version recorder (WAL + drainer).
+#[cfg(feature = "mount")]
+pub mod recorder;
+
 /// The `trove mount` FUSE filesystem, backed by `jfs`.
 #[cfg(feature = "mount")]
 pub mod mount;
