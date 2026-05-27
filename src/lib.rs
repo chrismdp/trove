@@ -5,6 +5,7 @@
 //! search and the FUSE projection build on the same contract.
 
 pub mod commands;
+pub mod config;
 pub mod frontmatter;
 pub mod types;
 pub mod validate;
