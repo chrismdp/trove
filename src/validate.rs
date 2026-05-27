@@ -71,8 +71,13 @@ mod tests {
     use crate::frontmatter;
 
     fn registry_with(name: &str, schema: serde_json::Value) -> Registry {
-        // Build a registry by writing to a temp store.
-        let dir = std::env::temp_dir().join(format!("trove-test-{}", std::process::id()));
+        // Unique dir per call — tests run in parallel, so a shared path races
+        // (one test's remove_dir_all vs another's read).
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join(format!("trove-test-{}-{}", std::process::id(), n));
         let types = dir.join(".types");
         std::fs::create_dir_all(&types).unwrap();
         std::fs::write(
@@ -110,6 +115,6 @@ mod tests {
         );
         // dob parses as an integer-ish scalar, not a string.
         let doc = frontmatter::parse("---\ntype: person\ndob: 42\n---\n").unwrap();
-        matches!(validate(&doc, &reg), Verdict::Invalid(_));
+        assert!(matches!(validate(&doc, &reg), Verdict::Invalid(_)));
     }
 }
