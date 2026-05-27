@@ -29,6 +29,22 @@ enum Command {
         #[arg(short, long)]
         quiet: bool,
     },
+
+    /// Mount a JuiceFS-backed Trove filesystem at <mountpoint> (foreground).
+    #[cfg(feature = "mount")]
+    Mount {
+        /// Where to mount (an existing empty directory).
+        mountpoint: PathBuf,
+        /// JuiceFS volume name (must already be formatted).
+        #[arg(long)]
+        volume: String,
+        /// Metadata engine URL, e.g. postgres://… or sqlite3://…
+        #[arg(long)]
+        meta: String,
+        /// Local block-cache directory.
+        #[arg(long, default_value = "/tmp/trove-cache")]
+        cache: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -58,6 +74,15 @@ fn run() -> Result<usize> {
                 if s.failed == 1 { "failure" } else { "failures" }
             );
             Ok(s.failed)
+        }
+
+        #[cfg(feature = "mount")]
+        Command::Mount { mountpoint, volume, meta, cache } => {
+            let cache = cache.to_string_lossy();
+            let fs = trove::jfs::Fs::init(&volume, &meta, &cache)?;
+            println!("{} mounting volume {volume:?} at {}", "trove:".bold(), mountpoint.display());
+            trove::mount::mount_blocking(fs, &mountpoint)?;
+            Ok(0)
         }
     }
 }

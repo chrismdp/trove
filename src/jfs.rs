@@ -12,7 +12,6 @@
 
 use anyhow::{bail, Result};
 use std::ffi::CString;
-use std::marker::PhantomData;
 use std::os::raw::{c_char, c_int};
 
 /// Mirrors the cgo `fileInfo` struct in `libjfs-amd64.h`.
@@ -126,17 +125,17 @@ impl Fs {
     }
 
     /// Create a file (O_CREAT|O_WRONLY semantics) and return an open handle.
-    pub fn create(&self, path: &str, mode: u16) -> Result<File<'_>> {
+    pub fn create(&self, path: &str, mode: u16) -> Result<File> {
         let cpath = cs(path)?;
         let fd = unsafe { jfs_create(PID, self.handle, cpath.as_ptr(), mode, 0) };
-        Ok(File { fd: check(fd, "create")?, _fs: PhantomData })
+        Ok(File { fd: check(fd, "create")? })
     }
 
     /// Open an existing file. `flags` are POSIX open flags (0 = O_RDONLY).
-    pub fn open(&self, path: &str, flags: c_int) -> Result<File<'_>> {
+    pub fn open(&self, path: &str, flags: c_int) -> Result<File> {
         let cpath = cs(path)?;
         let fd = unsafe { jfs_open(PID, self.handle, cpath.as_ptr(), 0, flags) };
-        Ok(File { fd: check(fd, "open")?, _fs: PhantomData })
+        Ok(File { fd: check(fd, "open")? })
     }
 
     pub fn mkdir(&self, path: &str, mode: u16) -> Result<()> {
@@ -165,13 +164,13 @@ impl Fs {
     }
 }
 
-/// An open file handle. Borrows the `Fs` so it cannot outlive the filesystem.
-pub struct File<'a> {
+/// An open file handle. Closes on drop. Must not outlive its `Fs` (the libjfs
+/// volume handle); the `mount` layer guarantees this by owning both together.
+pub struct File {
     fd: c_int,
-    _fs: PhantomData<&'a Fs>,
 }
 
-impl File<'_> {
+impl File {
     /// Write `buf` at `offset`; returns bytes written.
     pub fn write_at(&self, buf: &[u8], offset: i64) -> Result<usize> {
         let n = unsafe { jfs_pwrite(PID, self.fd, buf.as_ptr() as usize, buf.len() as c_int, offset) };
@@ -195,7 +194,7 @@ impl File<'_> {
     }
 }
 
-impl Drop for File<'_> {
+impl Drop for File {
     fn drop(&mut self) {
         unsafe { jfs_close(PID, self.fd) };
     }

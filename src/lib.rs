@@ -13,3 +13,7 @@ pub mod validate;
 /// core crate has no native dependency.
 #[cfg(feature = "mount")]
 pub mod jfs;
+
+/// The `trove mount` FUSE filesystem, backed by `jfs`.
+#[cfg(feature = "mount")]
+pub mod mount;
