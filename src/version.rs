@@ -114,6 +114,16 @@ impl VersionStore {
         Ok(rows.first().map(|r| r.get(0)))
     }
 
+    /// Every distinct path that has at least one version, alphabetically. The
+    /// `trove server` `/files` listing (the live tree's known files, from the
+    /// version chain — no libjfs walk needed).
+    pub fn paths(&mut self) -> Result<Vec<String>> {
+        let rows = self
+            .client
+            .query("select distinct path from file_versions order by path", &[])?;
+        Ok(rows.iter().map(|r| r.get(0)).collect())
+    }
+
     /// Doctor support: is pgvector installed, and which of Trove's expected
     /// tables are missing? Returns `(pgvector_present, missing_tables)`. Run
     /// against the connected DB so `trove doctor` can report schema readiness.

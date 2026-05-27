@@ -110,6 +110,24 @@ enum Command {
         versions_db: Option<String>,
     },
 
+    /// Serve a single-tenant, read-only HTTP view of the store (file list +
+    /// semantic search + raw file content). Binds 127.0.0.1 only; front with
+    /// nginx for external access. Needs the version DB, libjfs, and OPENAI_API_KEY.
+    #[cfg(feature = "mount")]
+    Server {
+        /// Port to bind on 127.0.0.1.
+        #[arg(long, default_value_t = 38080)]
+        port: u16,
+        #[arg(long)]
+        volume: Option<String>,
+        #[arg(long)]
+        meta: Option<String>,
+        #[arg(long)]
+        cache: Option<PathBuf>,
+        #[arg(long)]
+        versions_db: Option<String>,
+    },
+
     /// Preflight: check secrets, the version DB + pgvector + schema, and the
     /// JuiceFS backend are all wired up. Exits non-zero if anything's missing.
     #[cfg(feature = "mount")]
@@ -378,6 +396,15 @@ fn run() -> Result<usize> {
             let mut versions = connect_versions(versions_db, &cfg)?;
             let n = trove::demo::seed(&mut versions, &api_key)?;
             println!("{} seeded {n} demo doc(s) under /demo/", "trove:".bold());
+            Ok(0)
+        }
+
+        #[cfg(feature = "mount")]
+        Command::Server { port, volume, meta, cache, versions_db } => {
+            let api_key = openai_key()?;
+            let fs = init_fs(volume, meta, cache, &cfg)?;
+            let mut versions = connect_versions(versions_db, &cfg)?;
+            trove::commands::server::run(&fs, &mut versions, &api_key, port)?;
             Ok(0)
         }
 
