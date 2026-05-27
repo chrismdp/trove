@@ -46,6 +46,10 @@ fn fresh_fs() -> Fs {
 #[test]
 fn embed_blob_writes_one_vector_per_header_chunk() {
     let key = std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY (source ~/.secret_env)");
+    // This test verifies the per-header chunking specifically, so pin that
+    // strategy (the default is now the size-capped paragraph chunker, which
+    // would cluster these two tiny sections into one chunk).
+    std::env::set_var("TROVE_CHUNK_STRATEGY", "heading");
     let fs = fresh_fs();
     let mut vs = VersionStore::connect(&db_url()).expect("version DB up?");
 

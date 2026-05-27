@@ -78,6 +78,155 @@ fn heading_text(line: &str) -> Option<String> {
     }
 }
 
+// Paragraph chunking sizes. No tokenizer dependency — we approximate at the
+// well-known ~4 chars per token, so these map to roughly 100 and 1000 tokens.
+// MAX stays well under `text-embedding-3-large`'s ~8191-token input cap.
+const MIN_CHUNK_CHARS: usize = 400;
+const MAX_CHUNK_CHARS: usize = 4000;
+
+/// A paragraph block — its end offset, plus heading classification. (The start
+/// is implicit: the previous block's end, tracked by the caller.)
+struct Block {
+    end: usize,
+    /// The block is ONLY an ATX heading line (so it must attach to what follows).
+    is_heading_only: bool,
+    /// Heading text if the block opens with an ATX heading.
+    heading: Option<String>,
+}
+
+/// Paragraph-based chunking with size caps and heading attachment — the
+/// recommended default (set `TROVE_CHUNK_STRATEGY=heading` for the older
+/// split-at-every-heading behaviour). Splits on blank lines, then:
+/// clusters consecutive paragraphs until a chunk reaches `MIN_CHUNK_CHARS`,
+/// never exceeding `MAX_CHUNK_CHARS` (a single over-max paragraph is hard-split
+/// at a char/newline boundary), and keeps a lone heading line attached to the
+/// paragraph that follows it (never a heading-only chunk while content follows).
+/// Byte ranges partition the emitted spans and round-trip (`&content[s..e] == text`).
+pub fn chunk_paragraphs(content: &str) -> Vec<Chunk> {
+    let blocks = paragraph_blocks(content);
+    if blocks.is_empty() {
+        return Vec::new();
+    }
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    let mut heading: Option<String> = None;
+    for (i, b) in blocks.iter().enumerate() {
+        if heading.is_none() {
+            heading = b.heading.clone();
+        }
+        let cur = b.end - start;
+        let last = i + 1 == blocks.len();
+        let next_would_exceed = !last && (blocks[i + 1].end - start) > MAX_CHUNK_CHARS;
+        // Close after this block when it's the last; or it isn't a lone heading
+        // (keep a heading with its following paragraph) AND we've reached MIN or
+        // adding the next block would bust MAX.
+        let close = last || (!b.is_heading_only && (cur >= MIN_CHUNK_CHARS || next_would_exceed));
+        if close {
+            emit(&mut chunks, content, start, b.end, heading.take());
+            start = b.end;
+        }
+    }
+    chunks
+}
+
+/// Push a chunk for `[start, end)`, hard-splitting it into `<= MAX_CHUNK_CHARS`
+/// pieces (at a char boundary, preferring a late newline) if it's oversized.
+/// Whitespace-only spans are dropped. Only the first piece keeps the heading.
+fn emit(chunks: &mut Vec<Chunk>, content: &str, start: usize, end: usize, heading: Option<String>) {
+    if content[start..end].trim().is_empty() {
+        return;
+    }
+    let mut h = heading;
+    let mut s = start;
+    while s < end {
+        let mut e = (s + MAX_CHUNK_CHARS).min(end);
+        while e > s && !content.is_char_boundary(e) {
+            e -= 1;
+        }
+        // Prefer breaking on a newline in the last fifth, for cleaner chunks.
+        if e < end {
+            if let Some(nl) = content[s..e].rfind('\n') {
+                if nl * 5 > (e - s) * 4 {
+                    e = s + nl + 1;
+                }
+            }
+        }
+        if e <= s {
+            break; // no progress possible (pathological); bail rather than loop
+        }
+        if !content[s..e].trim().is_empty() {
+            chunks.push(Chunk { heading: h.take(), start: s, end: e, text: content[s..e].to_string() });
+        }
+        s = e;
+    }
+}
+
+/// Tile `content` into paragraph blocks (separated by blank lines), contiguous
+/// and covering `[0, len)` — leading blank lines fold into the first block.
+fn paragraph_blocks(content: &str) -> Vec<Block> {
+    let mut starts = Vec::new();
+    let mut off = 0usize;
+    let mut prev_blank = true; // document start behaves like "after a blank line"
+    for line in content.split_inclusive('\n') {
+        let blank = line.trim().is_empty();
+        if !blank && prev_blank {
+            starts.push(off);
+        }
+        prev_blank = blank;
+        off += line.len();
+    }
+    if starts.is_empty() {
+        return Vec::new(); // entirely blank
+    }
+    // Boundaries tile the whole document: force the first to 0.
+    let mut bounds = Vec::with_capacity(starts.len() + 1);
+    bounds.push(0);
+    bounds.extend(starts.iter().skip(1).copied());
+    bounds.push(content.len());
+
+    bounds
+        .windows(2)
+        .map(|w| {
+            let (s, e) = (w[0], w[1]);
+            let (heading, is_heading_only) = classify(&content[s..e]);
+            Block { end: e, is_heading_only, heading }
+        })
+        .collect()
+}
+
+/// Classify a block's text: `(heading text if it opens with an ATX heading,
+/// whether the block is ONLY that heading line)`.
+fn classify(text: &str) -> (Option<String>, bool) {
+    let mut heading = None;
+    let mut other = false;
+    let mut first = true;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if first {
+            first = false;
+            if let Some(h) = heading_text(line.trim_start()) {
+                heading = Some(h);
+                continue;
+            }
+        }
+        other = true;
+    }
+    let is_heading_only = heading.is_some() && !other;
+    (heading, is_heading_only)
+}
+
+/// Chunk `content` using the configured strategy (paragraph by default;
+/// `TROVE_CHUNK_STRATEGY=heading` for split-at-every-heading). This is what the
+/// embed path uses, so the strategy is one switch in one place.
+pub fn chunk(content: &str) -> Vec<Chunk> {
+    match std::env::var("TROVE_CHUNK_STRATEGY").as_deref() {
+        Ok("heading") => chunk_markdown(content),
+        _ => chunk_paragraphs(content),
+    }
+}
+
 /// Embed `texts` in one OpenAI request; returns vectors in input order.
 fn embed_texts(api_key: &str, texts: &[String]) -> Result<Vec<Vec<f32>>> {
     let resp = ureq::post("https://api.openai.com/v1/embeddings")
@@ -138,7 +287,7 @@ pub fn embed_content(
         }
     };
 
-    let chunks = chunk_markdown(text);
+    let chunks = chunk(text);
     let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
     let embeddings = embed_texts(api_key, &texts)?;
 
@@ -269,5 +418,73 @@ mod tests {
         let c = chunk_markdown("#nospace is text\nmore\n");
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].heading, None);
+    }
+
+    // --- paragraph chunker ---
+
+    /// Every emitted chunk's byte range round-trips to its text and the chunks
+    /// are ordered + non-overlapping.
+    fn assert_well_formed(content: &str, chunks: &[Chunk]) {
+        let mut prev_end = 0;
+        for c in chunks {
+            assert_eq!(&content[c.start..c.end], c.text, "range must round-trip");
+            assert!(c.start >= prev_end, "chunks ordered + non-overlapping");
+            prev_end = c.end;
+        }
+    }
+
+    #[test]
+    fn short_paragraphs_cluster_into_one_chunk() {
+        let md = "one short para\n\nanother short para\n\na third\n";
+        let c = chunk_paragraphs(md);
+        assert_eq!(c.len(), 1, "small paras (< MIN) cluster together");
+        assert!(c[0].text.contains("third"));
+        assert_well_formed(md, &c);
+    }
+
+    #[test]
+    fn heading_travels_with_the_following_paragraph() {
+        let md = "## Section\n\nbody paragraph under the heading\n";
+        let c = chunk_paragraphs(md);
+        assert_eq!(c.len(), 1, "no orphan heading-only chunk");
+        assert_eq!(c[0].heading.as_deref(), Some("Section"));
+        assert!(c[0].text.contains("body paragraph"), "heading chunk includes the para");
+        assert_well_formed(md, &c);
+    }
+
+    #[test]
+    fn oversized_paragraph_is_hard_split_under_max() {
+        // One blank-line-free paragraph far larger than MAX.
+        let big = "word ".repeat(MAX_CHUNK_CHARS); // ~5 * MAX chars, no blank lines
+        let c = chunk_paragraphs(&big);
+        assert!(c.len() > 1, "an over-max paragraph splits into several chunks");
+        for chunk in &c {
+            assert!(chunk.text.len() <= MAX_CHUNK_CHARS, "each piece is <= MAX");
+        }
+        assert_well_formed(&big, &c);
+    }
+
+    #[test]
+    fn long_document_splits_at_paragraph_boundaries_near_min() {
+        // Several paragraphs each ~MIN/2, so chunks form around MIN and break on
+        // paragraph boundaries (not mid-paragraph).
+        let para = format!("{}\n", "x".repeat(MIN_CHUNK_CHARS / 2));
+        let doc = vec![para.clone(); 8].join("\n");
+        let c = chunk_paragraphs(&doc);
+        assert!(c.len() >= 2, "a long doc yields multiple chunks");
+        for chunk in &c {
+            assert!(chunk.text.len() <= MAX_CHUNK_CHARS);
+        }
+        assert_well_formed(&doc, &c);
+    }
+
+    #[test]
+    fn chunk_selector_honours_the_strategy_env() {
+        let md = "# A\nalpha\n\n# B\nbeta\n";
+        std::env::set_var("TROVE_CHUNK_STRATEGY", "heading");
+        assert_eq!(chunk(md).len(), chunk_markdown(md).len());
+        std::env::remove_var("TROVE_CHUNK_STRATEGY");
+        // default = paragraph: these two tiny headed paras cluster into one.
+        assert_eq!(chunk(md).len(), chunk_paragraphs(md).len());
     }
 }
