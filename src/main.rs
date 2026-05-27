@@ -110,6 +110,20 @@ enum Command {
         versions_db: Option<String>,
     },
 
+    /// Preflight: check secrets, the version DB + pgvector + schema, and the
+    /// JuiceFS backend are all wired up. Exits non-zero if anything's missing.
+    #[cfg(feature = "mount")]
+    Doctor {
+        #[arg(long)]
+        versions_db: Option<String>,
+        #[arg(long)]
+        volume: Option<String>,
+        #[arg(long)]
+        meta: Option<String>,
+        #[arg(long)]
+        cache: Option<PathBuf>,
+    },
+
     /// Show a path's version history, newest first. Needs only the version DB.
     #[cfg(feature = "mount")]
     Log {
@@ -365,6 +379,23 @@ fn run() -> Result<usize> {
             let n = trove::demo::seed(&mut versions, &api_key)?;
             println!("{} seeded {n} demo doc(s) under /demo/", "trove:".bold());
             Ok(0)
+        }
+
+        #[cfg(feature = "mount")]
+        Command::Doctor { versions_db, volume, meta, cache } => {
+            let checks = trove::commands::doctor::run(&cfg, versions_db, volume, meta, cache);
+            let failed = checks.iter().filter(|c| !c.ok).count();
+            println!("{}", "trove doctor".bold());
+            for c in &checks {
+                let mark = if c.ok { "✓".green() } else { "✗".red() };
+                println!("  {mark} {:<18} {}", c.name, c.detail.dimmed());
+            }
+            if failed == 0 {
+                println!("\n{} all checks passed", "✓".green().bold());
+            } else {
+                println!("\n{} {failed} check(s) failed", "✗".red().bold());
+            }
+            Ok(failed)
         }
 
         #[cfg(feature = "mount")]

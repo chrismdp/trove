@@ -114,6 +114,30 @@ impl VersionStore {
         Ok(rows.first().map(|r| r.get(0)))
     }
 
+    /// Doctor support: is pgvector installed, and which of Trove's expected
+    /// tables are missing? Returns `(pgvector_present, missing_tables)`. Run
+    /// against the connected DB so `trove doctor` can report schema readiness.
+    pub fn diagnostics(&mut self) -> Result<(bool, Vec<String>)> {
+        let pgvector: bool = self
+            .client
+            .query_one(
+                "select exists(select 1 from pg_extension where extname = 'vector')",
+                &[],
+            )?
+            .get(0);
+        let mut missing = Vec::new();
+        for table in ["blobs", "file_versions", "blob_chunks"] {
+            let present: bool = self
+                .client
+                .query_one("select to_regclass($1) is not null", &[&table])?
+                .get(0);
+            if !present {
+                missing.push(table.to_string());
+            }
+        }
+        Ok((pgvector, missing))
+    }
+
     /// Hashes of blobs not yet embedded — i.e. with no `blob_chunks` rows. The
     /// server-side `trove embed` worker's sweep (it reads each blob's content
     /// from its JuiceFS clone, chunks it, and inserts the embeddings). Capped by
