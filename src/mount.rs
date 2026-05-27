@@ -14,7 +14,7 @@
 //! a `Mutex`. Inode/handle ids and flags are newtypes (`INodeNo`, `FileHandle`,
 //! `OpenFlags`, …) — we convert at the boundary.
 
-use crate::jfs::{FileInfo, Fs};
+use crate::jfs::{File, FileInfo, Fs};
 use crate::types::Registry;
 use fuser::{
     BackgroundSession, BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem,
@@ -30,16 +30,35 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const TTL: Duration = Duration::from_secs(1);
+/// A freshly `create`d file exists only in its handle buffer, not yet in jfs.
+/// Replying with a zero TTL stops the kernel caching a *positive* dentry for it,
+/// so a rejected write leaves no phantom: the next access re-looks-up and misses.
+const NO_CACHE: Duration = Duration::ZERO;
 const ROOT_INO: u64 = 1;
 
-/// An open file handle. The full contents are buffered here so the file can be
-/// validated as a unit at the commit barrier. `dirty` means the buffer has been
-/// modified (or the file is freshly created / truncated) and has not yet been
-/// committed to `jfs`.
-struct OpenFile {
-    path: String,
-    buf: Vec<u8>,
-    dirty: bool,
+/// An open file handle. Reads and writes take different routes so we only pay
+/// the buffering cost (and the validation gate) when something is actually being
+/// written — the read-heavy path stays a cheap, coherent pass-through.
+enum OpenFile {
+    /// Read-only: stream straight from jfs. No buffering, no validation, full
+    /// coherence with concurrent writers.
+    Read { reader: File },
+    /// Ungoverned writable file (binary, or any path no schema can claim):
+    /// writes stream straight to jfs. No buffering — keeps large/binary files
+    /// cheap — and nothing to validate, so no gate.
+    PassThrough { writer: File },
+    /// Governed writable file: the whole proposed file is buffered so it can be
+    /// validated as a unit at the commit barrier. `dirty` means uncommitted
+    /// changes (or a fresh create / truncate) are pending. `rejected` means the
+    /// last commit attempt failed validation — the buffer won't persist, so it's
+    /// hidden from `lookup`/`getattr` immediately (FUSE `release` is async, so we
+    /// can't wait for the handle to drop to stop reporting a phantom).
+    Write {
+        path: String,
+        buf: Vec<u8>,
+        dirty: bool,
+        rejected: bool,
+    },
 }
 
 struct Inner {
@@ -95,10 +114,15 @@ impl Inner {
     /// `lookup`/`getattr` answer for a freshly created file that has not been
     /// committed to `jfs` yet (it lives only in a handle's buffer).
     fn inflight_size(&self, path: &str) -> Option<u64> {
-        self.open_files
-            .values()
-            .find(|of| of.dirty && of.path == path)
-            .map(|of| of.buf.len() as u64)
+        self.open_files.values().find_map(|of| match of {
+            // A rejected buffer won't persist, so it must not look like it exists.
+            OpenFile::Write { path: p, buf, dirty, rejected }
+                if *dirty && !*rejected && p == path =>
+            {
+                Some(buf.len() as u64)
+            }
+            _ => None,
+        })
     }
 
     /// Validate a buffer destined for `path`. `Ok(())` means it may persist;
@@ -156,7 +180,8 @@ impl Inner {
     /// failing close/fsync surfaces the rejection to the agent.
     fn commit(&mut self, fh: u64) -> Result<(), Errno> {
         let (path, buf) = match self.open_files.get(&fh) {
-            Some(of) if of.dirty => (of.path.clone(), of.buf.clone()),
+            Some(OpenFile::Write { path, buf, dirty: true, .. }) => (path.clone(), buf.clone()),
+            // read / pass-through handle, or a clean write handle: nothing to commit
             Some(_) => return Ok(()),
             None => return Err(Errno::EBADF),
         };
@@ -165,8 +190,9 @@ impl Inner {
             Ok(()) => {
                 self.fs.write_all(&path, &buf, 0o644).map_err(|_| Errno::EIO)?;
                 let _ = self.fs.unlink(&format!("{path}.errors")); // clear stale sidecar
-                if let Some(of) = self.open_files.get_mut(&fh) {
-                    of.dirty = false;
+                if let Some(OpenFile::Write { dirty, rejected, .. }) = self.open_files.get_mut(&fh) {
+                    *dirty = false;
+                    *rejected = false;
                 }
                 Ok(())
             }
@@ -174,9 +200,26 @@ impl Inner {
                 let _ = self
                     .fs
                     .write_all(&format!("{path}.errors"), report.as_bytes(), 0o644);
+                // Mark rejected so the phantom file disappears immediately, even
+                // before the async `release` drops the handle.
+                if let Some(OpenFile::Write { rejected, .. }) = self.open_files.get_mut(&fh) {
+                    *rejected = true;
+                }
                 Err(Errno::EINVAL)
             }
         }
+    }
+
+    /// The commit barrier (`flush`/`fsync`): pass-through handles sync their jfs
+    /// writer directly; governed handles validate + commit their buffer.
+    fn barrier(&mut self, fh: u64) -> Result<(), Errno> {
+        if let Some(OpenFile::PassThrough { writer }) = self.open_files.get(&fh) {
+            return writer
+                .flush()
+                .and_then(|_| writer.fsync())
+                .map_err(|_| Errno::EIO);
+        }
+        self.commit(fh)
     }
 }
 
@@ -308,18 +351,41 @@ impl Filesystem for TroveFs {
             reply.error(Errno::EINVAL);
             return;
         };
-        // Nothing touches jfs yet: a new file lives only in its buffer until it
-        // validates at the commit barrier. `mode` is advisory for now (the
-        // committed file is written 0o644).
-        let _ = mode;
+        let rel = Path::new(path.strip_prefix('/').unwrap_or(&path));
+        if !g.registry.may_govern(rel) {
+            // Ungoverned (binary, or a path no schema can claim): create in jfs
+            // now and stream writes straight through. Normal TTL — it persists.
+            match g.fs.create(&path, (mode & 0o7777) as u16) {
+                Ok(writer) => {
+                    let ino = g.intern(&path);
+                    let fi = g.fs.stat(&path).unwrap_or_default();
+                    let fh = g.new_fh(OpenFile::PassThrough { writer });
+                    reply.created(
+                        &TTL,
+                        &to_attr(ino, &fi),
+                        Generation(0),
+                        FileHandle(fh),
+                        FopenFlags::empty(),
+                    );
+                }
+                Err(_) => reply.error(Errno::EIO),
+            }
+            return;
+        }
+
+        // Governed: nothing touches jfs yet — the file lives only in its buffer
+        // until it validates at the commit barrier. `mode` is advisory for now
+        // (the committed file is written 0o644). NO_CACHE TTL so a rejected
+        // create leaves no phantom dentry.
         let ino = g.intern(&path);
-        let fh = g.new_fh(OpenFile {
+        let fh = g.new_fh(OpenFile::Write {
             path,
             buf: Vec::new(),
             dirty: true,
+            rejected: false,
         });
         reply.created(
-            &TTL,
+            &NO_CACHE,
             &synth_attr(ino, 0),
             Generation(0),
             FileHandle(fh),
@@ -333,8 +399,35 @@ impl Filesystem for TroveFs {
             reply.error(Errno::ENOENT);
             return;
         };
-        // Buffer the current contents so reads are served from memory and the
-        // validator sees the whole file at commit. O_TRUNC starts empty.
+
+        // Read-only opens stream straight from jfs — no buffering, full
+        // coherence. So do writable opens of ungoverned (e.g. binary) files:
+        // there's nothing to validate, so no reason to buffer them.
+        let writable = flags.0 & libc::O_ACCMODE != libc::O_RDONLY;
+        let rel = Path::new(path.strip_prefix('/').unwrap_or(&path));
+        if !writable {
+            match g.fs.open(&path, flags.0) {
+                Ok(reader) => {
+                    let fh = g.new_fh(OpenFile::Read { reader });
+                    reply.opened(FileHandle(fh), FopenFlags::empty());
+                }
+                Err(_) => reply.error(Errno::ENOENT),
+            }
+            return;
+        }
+        if !g.registry.may_govern(rel) {
+            match g.fs.open(&path, flags.0) {
+                Ok(writer) => {
+                    let fh = g.new_fh(OpenFile::PassThrough { writer });
+                    reply.opened(FileHandle(fh), FopenFlags::empty());
+                }
+                Err(_) => reply.error(Errno::ENOENT),
+            }
+            return;
+        }
+
+        // Governed writable: buffer current contents so read-modify-write works
+        // and the validator sees the whole file at commit. O_TRUNC starts empty.
         let truncating = flags.0 & libc::O_TRUNC != 0;
         let buf = if truncating {
             Vec::new()
@@ -347,10 +440,11 @@ impl Filesystem for TroveFs {
                 }
             }
         };
-        let fh = g.new_fh(OpenFile {
+        let fh = g.new_fh(OpenFile::Write {
             path,
             buf,
             dirty: truncating, // truncation is itself a pending change
+            rejected: false,
         });
         reply.opened(FileHandle(fh), FopenFlags::empty());
     }
@@ -367,17 +461,30 @@ impl Filesystem for TroveFs {
         reply: ReplyData,
     ) {
         let g = self.inner.lock().unwrap();
-        let Some(of) = g.open_files.get(&fh.0) else {
-            reply.error(Errno::EBADF);
-            return;
-        };
-        let start = offset as usize;
-        if start >= of.buf.len() {
-            reply.data(&[]);
-            return;
+        match g.open_files.get(&fh.0) {
+            // Read / pass-through handle: pread straight from jfs.
+            Some(OpenFile::Read { reader } | OpenFile::PassThrough { writer: reader }) => {
+                let mut tmp = vec![0u8; size as usize];
+                match reader.read_at(&mut tmp, offset as i64) {
+                    Ok(n) => {
+                        tmp.truncate(n);
+                        reply.data(&tmp);
+                    }
+                    Err(_) => reply.error(Errno::EIO),
+                }
+            }
+            // Write handle: serve from the in-memory buffer (this fd's view).
+            Some(OpenFile::Write { buf, .. }) => {
+                let start = offset as usize;
+                if start >= buf.len() {
+                    reply.data(&[]);
+                    return;
+                }
+                let end = (start + size as usize).min(buf.len());
+                reply.data(&buf[start..end]);
+            }
+            None => reply.error(Errno::EBADF),
         }
-        let end = (start + size as usize).min(of.buf.len());
-        reply.data(&of.buf[start..end]);
     }
 
     fn write(
@@ -393,18 +500,29 @@ impl Filesystem for TroveFs {
         reply: ReplyWrite,
     ) {
         let mut g = self.inner.lock().unwrap();
-        let Some(of) = g.open_files.get_mut(&fh.0) else {
-            reply.error(Errno::EBADF);
-            return;
-        };
-        let start = offset as usize;
-        let end = start + data.len();
-        if of.buf.len() < end {
-            of.buf.resize(end, 0);
+        match g.open_files.get_mut(&fh.0) {
+            // Governed: splice into the buffer; commit/validate happens later.
+            Some(OpenFile::Write { buf, dirty, rejected, .. }) => {
+                let start = offset as usize;
+                let end = start + data.len();
+                if buf.len() < end {
+                    buf.resize(end, 0);
+                }
+                buf[start..end].copy_from_slice(data);
+                *dirty = true;
+                *rejected = false; // fresh bytes — give it another chance at commit
+                reply.written(data.len() as u32);
+            }
+            // Ungoverned: write straight through to jfs.
+            Some(OpenFile::PassThrough { writer }) => match writer.write_at(data, offset as i64) {
+                Ok(n) => reply.written(n as u32),
+                Err(_) => reply.error(Errno::EIO),
+            },
+            // A write on a read-only handle: the kernel shouldn't issue this,
+            // but report the standard error rather than corrupting anything.
+            Some(OpenFile::Read { .. }) => reply.error(Errno::EBADF),
+            None => reply.error(Errno::EBADF),
         }
-        of.buf[start..end].copy_from_slice(data);
-        of.dirty = true;
-        reply.written(data.len() as u32);
     }
 
     /// `flush` runs on every `close()`; its return value reaches the closing
@@ -412,7 +530,7 @@ impl Filesystem for TroveFs {
     /// means a plain `cp`/editor-save persists (or is rejected) on close.
     fn flush(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _lock: LockOwner, reply: ReplyEmpty) {
         let mut g = self.inner.lock().unwrap();
-        match g.commit(fh.0) {
+        match g.barrier(fh.0) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
         }
@@ -420,7 +538,7 @@ impl Filesystem for TroveFs {
 
     fn fsync(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
         let mut g = self.inner.lock().unwrap();
-        match g.commit(fh.0) {
+        match g.barrier(fh.0) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
         }

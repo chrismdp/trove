@@ -116,6 +116,17 @@ impl Registry {
         self.schemas.iter().any(|s| s.has_globs && s.glob_matches(rel))
     }
 
+    /// Could any schema *possibly* claim this path, once its content (and `type`)
+    /// is known? Mirrors the candidacy filter in [`select`]: a glob match, or a
+    /// schema with no globs (which applies on any path). When false, the file can
+    /// never be validated — the mount streams it straight through unbuffered, so
+    /// binary and ungoverned files stay cheap regardless of size.
+    pub fn may_govern(&self, rel: &Path) -> bool {
+        self.schemas
+            .iter()
+            .any(|s| !s.has_globs || s.glob_matches(rel))
+    }
+
     /// Select the schemas that govern a file at `rel` with declared `file_type`.
     ///
     /// 1. Candidates are schemas whose globs match the path (or, for a schema

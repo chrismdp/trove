@@ -18,6 +18,14 @@ pub fn validate_against(
     frontmatter: &serde_json::Value,
     schema: &TypeSchema,
 ) -> Result<(), Vec<Violation>> {
+    // NOTE (composition gotcha): this uses the crate default draft (Draft7). When we add
+    // component composition (`allOf` of `.types/components/*.json` fragments), `allOf` itself
+    // works here, but `unevaluatedProperties: false` — the only way to forbid stray keys ACROSS
+    // an allOf (because `additionalProperties: false` does NOT compose across allOf) — is wired
+    // ONLY for Draft 2019-09/2020-12, which are behind cargo features OFF by default. On Draft7
+    // it's silently ignored (no error). To enable: Cargo.toml `features = ["draft202012"]` +
+    // either a `$schema: .../2020-12/schema` in each schema or `.options().with_draft(Draft202012)`.
+    // Also untested: relative cross-file `$ref` needs a base `$id`/resolver (compile() has no base URI).
     let compiled = match jsonschema::JSONSchema::compile(&schema.schema) {
         Ok(c) => c,
         Err(e) => {

@@ -175,11 +175,11 @@ fn validation_gate_rejects_bad_write_and_commits_good() {
             "schema-violating write must be rejected at the commit barrier"
         );
     }
-    // Rejected content must not persist. Ground truth is the backing store, not
-    // the kernel's dentry cache: a fresh read goes through `open`, which misses
-    // in jfs because nothing was committed. (A stale *positive* dentry can
-    // linger in the kernel cache until its TTL — see the POSIX notes — so we
-    // assert on readback, not on `exists()`.)
+    // Rejected content must not persist. Ground truth is the backing store: a
+    // fresh read goes through `open`, which misses in jfs because nothing was
+    // committed. The `create` reply used a zero TTL, so no phantom positive
+    // dentry lingers either — `exists()` is already false.
+    assert!(!bad.exists(), "a rejected create must leave no phantom dentry");
     match std::fs::read(&bad) {
         Err(e) => assert_eq!(
             e.kind(),
@@ -210,6 +210,13 @@ fn validation_gate_rejects_bad_write_and_commits_good() {
     let free = mountpoint.join("scratch.md");
     std::fs::write(&free, "no frontmatter here").expect("ungoverned write should pass");
     assert_eq!(std::fs::read_to_string(&free).unwrap(), "no frontmatter here");
+
+    // --- binary file: streams straight through, never buffered or validated ---
+    let bin = mountpoint.join("image.png");
+    let bytes: Vec<u8> = (0u16..512).map(|b| (b % 256) as u8).collect(); // non-UTF-8
+    std::fs::write(&bin, &bytes).expect("binary write should pass through");
+    assert_eq!(std::fs::read(&bin).unwrap(), bytes);
+    assert!(!mountpoint.join("image.png.errors").exists());
 
     drop(session);
     let _ = std::fs::remove_dir_all(&dir);
