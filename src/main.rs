@@ -49,14 +49,11 @@ enum Command {
         /// omitted the mount is a plain pass-through.
         #[arg(long)]
         types: Option<PathBuf>,
-        /// Postgres URL for the version DB (Supabase). When set, every validated
-        /// write is recorded (history + embedding metadata) best-effort — bytes
-        /// to R2 (creds from the environment), metadata here. Omit to disable.
+        /// Postgres URL for the version chain (the SAME Supabase Postgres as
+        /// `--meta`). When set, every validated write is versioned best-effort:
+        /// a COW clone into the archive + a chain row. Omit to disable versioning.
         #[arg(long)]
         versions_db: Option<String>,
-        /// Local write-ahead log directory for pending version records.
-        #[arg(long, default_value = "/tmp/trove-wal")]
-        wal: PathBuf,
     },
 }
 
@@ -90,23 +87,16 @@ fn run() -> Result<usize> {
         }
 
         #[cfg(feature = "mount")]
-        Command::Mount { mountpoint, volume, meta, cache, types, versions_db, wal } => {
+        Command::Mount { mountpoint, volume, meta, cache, types, versions_db } => {
             let cache = cache.to_string_lossy();
             let fs = trove::jfs::Fs::init(&volume, &meta, &cache)?;
             let registry = match &types {
                 Some(dir) => trove::types::Registry::load(dir)?,
                 None => trove::types::Registry::empty(),
             };
-            // Optional version recording: connect the DB + R2 and start the
-            // background WAL drainer. Off when --versions-db is omitted.
-            let recorder = match &versions_db {
-                Some(url) => {
-                    let vs = trove::version::VersionStore::connect(url)?;
-                    let bs = trove::blobstore::BlobStore::from_env()?;
-                    let rec = trove::recorder::Recorder::new(vs, bs, wal.clone())?;
-                    rec.start_draining(std::time::Duration::from_secs(2));
-                    Some(rec)
-                }
+            // Optional version capture: connect the chain DB. Off when omitted.
+            let versions = match &versions_db {
+                Some(url) => Some(trove::version::VersionStore::connect(url)?),
                 None => None,
             };
             println!(
@@ -118,9 +108,9 @@ fn run() -> Result<usize> {
                 } else {
                     format!("validating via {}", types.as_ref().unwrap().display())
                 },
-                if recorder.is_some() { "on" } else { "off" },
+                if versions.is_some() { "on" } else { "off" },
             );
-            trove::mount::mount_blocking(fs, registry, recorder, &mountpoint)?;
+            trove::mount::mount_blocking(fs, registry, versions, &mountpoint)?;
             Ok(0)
         }
     }

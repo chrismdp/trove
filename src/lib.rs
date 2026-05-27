@@ -15,13 +15,9 @@ pub mod version;
 #[cfg(feature = "mount")]
 pub mod jfs;
 
-/// Content-addressed version-blob store over Cloudflare R2.
+/// Copy-on-write version capture (clone into JuiceFS) + historical read.
 #[cfg(feature = "mount")]
-pub mod blobstore;
-
-/// Best-effort, eventually-consistent version recorder (WAL + drainer).
-#[cfg(feature = "mount")]
-pub mod recorder;
+pub mod versioning;
 
 /// The `trove mount` FUSE filesystem, backed by `jfs`.
 #[cfg(feature = "mount")]

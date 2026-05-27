@@ -152,6 +152,26 @@ fn rename_moves_a_file() {
 }
 
 #[test]
+fn clone_is_a_copy_on_write_snapshot() {
+    let v = TestVol::new("clone");
+    let fs = v.open();
+    fs.mkdir("/.trove", 0o755).unwrap();
+
+    // Original content, then clone it.
+    let f = fs.create("/live.md", 0o644).unwrap();
+    f.write_at(b"version one", 0).unwrap();
+    f.fsync().unwrap();
+    drop(f);
+    fs.clone_file("/live.md", "/.trove/snap1", true).unwrap();
+
+    // Overwrite the original — the clone must keep the OLD bytes (COW snapshot).
+    fs.write_all("/live.md", b"version two!", 0o644).unwrap();
+
+    assert_eq!(fs.read_all("/.trove/snap1").unwrap(), b"version one");
+    assert_eq!(fs.read_all("/live.md").unwrap(), b"version two!");
+}
+
+#[test]
 fn chmod_truncate_symlink_statvfs() {
     let v = TestVol::new("posix");
     let fs = v.open();

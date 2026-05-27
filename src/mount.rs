@@ -22,7 +22,7 @@ use fuser::{
     ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite,
     RenameFlags, Request, TimeOrNow, WriteFlags,
 };
-use crate::recorder::Recorder;
+use crate::version::VersionStore;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io;
@@ -65,10 +65,10 @@ enum OpenFile {
 struct Inner {
     fs: Fs,
     registry: Registry,
-    /// Best-effort version recorder. `None` = versioning off (plain mount).
-    /// When set, a validated commit also appends the version to its WAL — never
-    /// blocking the write (see `recorder`).
-    recorder: Option<Recorder>,
+    /// Version chain DB. `None` = versioning off (plain mount). When set, a
+    /// validated commit also COW-clones the file into the version archive and
+    /// appends a chain row — best-effort, never blocking the write.
+    versions: Option<VersionStore>,
     ino_to_path: HashMap<u64, String>,
     path_to_ino: HashMap<String, u64>,
     next_ino: u64,
@@ -214,11 +214,13 @@ impl Inner {
             Ok(()) => {
                 self.fs.write_all(&path, &buf, 0o644).map_err(|_| Errno::EIO)?;
                 let _ = self.fs.unlink(&format!("{path}.errors")); // clear stale sidecar
-                // Best-effort version capture: the file is already saved to jfs
-                // (the live source of truth); recording only appends to a local
-                // WAL, so a versioning hiccup must never fail the write.
-                if let Some(rec) = &self.recorder {
-                    if let Err(e) = rec.record(&path, &buf, None) {
+                // Best-effort version capture: the file is already saved (the
+                // live source of truth), so a versioning hiccup must never fail
+                // the write. COW-clones into the version archive + records the
+                // chain row, on the same backend the write just succeeded against.
+                if let Some(vs) = self.versions.as_mut() {
+                    if let Err(e) = crate::versioning::record_version(&self.fs, vs, &path, &buf, None)
+                    {
                         eprintln!("trove: version not recorded for {path}: {e:#}");
                     }
                 }
@@ -262,12 +264,12 @@ pub struct TroveFs {
 impl TroveFs {
     /// A plain mount with no version recording.
     pub fn new(fs: Fs, registry: Registry) -> Self {
-        Self::with_recorder(fs, registry, None)
+        Self::with_versions(fs, registry, None)
     }
 
-    /// A mount that also records each validated commit through `recorder`
-    /// (best-effort; the write is never blocked on it).
-    pub fn with_recorder(fs: Fs, registry: Registry, recorder: Option<Recorder>) -> Self {
+    /// A mount that also captures a version on each validated commit (best-effort
+    /// COW clone + chain row; the write is never blocked on it).
+    pub fn with_versions(fs: Fs, registry: Registry, versions: Option<VersionStore>) -> Self {
         let mut ino_to_path = HashMap::new();
         let mut path_to_ino = HashMap::new();
         ino_to_path.insert(ROOT_INO, "/".to_string());
@@ -276,7 +278,7 @@ impl TroveFs {
             inner: Mutex::new(Inner {
                 fs,
                 registry,
-                recorder,
+                versions,
                 ino_to_path,
                 path_to_ino,
                 next_ino: 2,
@@ -966,25 +968,25 @@ fn config() -> fuser::Config {
 
 /// Mount in the background; the returned session unmounts on drop. For tests.
 pub fn spawn(fs: Fs, registry: Registry, mountpoint: &Path) -> io::Result<BackgroundSession> {
-    spawn_with_recorder(fs, registry, None, mountpoint)
+    spawn_with_versions(fs, registry, None, mountpoint)
 }
 
-/// Background mount with optional version recording. For tests.
-pub fn spawn_with_recorder(
+/// Background mount with optional version capture. For tests.
+pub fn spawn_with_versions(
     fs: Fs,
     registry: Registry,
-    recorder: Option<Recorder>,
+    versions: Option<VersionStore>,
     mountpoint: &Path,
 ) -> io::Result<BackgroundSession> {
-    fuser::spawn_mount2(TroveFs::with_recorder(fs, registry, recorder), mountpoint, &config())
+    fuser::spawn_mount2(TroveFs::with_versions(fs, registry, versions), mountpoint, &config())
 }
 
 /// Mount in the foreground; blocks until unmounted. For the `trove mount` CLI.
 pub fn mount_blocking(
     fs: Fs,
     registry: Registry,
-    recorder: Option<Recorder>,
+    versions: Option<VersionStore>,
     mountpoint: &Path,
 ) -> io::Result<()> {
-    fuser::mount2(TroveFs::with_recorder(fs, registry, recorder), mountpoint, &config())
+    fuser::mount2(TroveFs::with_versions(fs, registry, versions), mountpoint, &config())
 }

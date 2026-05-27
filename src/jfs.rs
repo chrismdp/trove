@@ -81,6 +81,10 @@ extern "C" {
     fn jfs_stat(pid: i64, h: i64, path: *const c_char, info: *mut FileInfo) -> c_int;
     fn jfs_lstat(pid: i64, h: i64, path: *const c_char, info: *mut FileInfo) -> c_int;
     fn jfs_rename(pid: i64, h: i64, oldpath: *const c_char, newpath: *const c_char) -> c_int;
+    // Copy-on-write clone: new metadata sharing src's data blocks (refcount bump,
+    // no byte copy). `preserve` keeps uid/gid/mode/times. This is how Trove
+    // snapshots versions without duplicating content.
+    fn jfs_clone(pid: i64, h: i64, src: *const c_char, dst: *const c_char, preserve: u8) -> c_int;
     fn jfs_chmod(pid: i64, h: i64, path: *const c_char, mode: u32) -> c_int;
     fn jfs_chown(pid: i64, h: i64, path: *const c_char, uid: u32, gid: u32) -> c_int;
     // mtime/atime in milliseconds; -1 leaves a field unchanged.
@@ -265,6 +269,18 @@ impl Fs {
     pub fn rename(&self, oldpath: &str, newpath: &str) -> Result<()> {
         let (old, new) = (cs(oldpath)?, cs(newpath)?);
         check(unsafe { jfs_rename(PID, self.handle, old.as_ptr(), new.as_ptr()) }, "rename")?;
+        Ok(())
+    }
+
+    /// Copy-on-write clone of `src` to `dst` (no data copy — shares blocks via
+    /// refcount). Trove uses this to snapshot a committed file into the version
+    /// archive. `dst`'s parent directory must already exist.
+    pub fn clone_file(&self, src: &str, dst: &str, preserve: bool) -> Result<()> {
+        let (s, d) = (cs(src)?, cs(dst)?);
+        check(
+            unsafe { jfs_clone(PID, self.handle, s.as_ptr(), d.as_ptr(), preserve as u8) },
+            "clone",
+        )?;
         Ok(())
     }
 

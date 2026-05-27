@@ -114,12 +114,15 @@ impl VersionStore {
         Ok(rows.first().map(|r| r.get(0)))
     }
 
-    /// Hashes of blobs still awaiting an embedding — the backstop sweep the
-    /// scheduled Cloudflare Worker runs (it reads each blob's bytes from R2).
-    /// Capped by `limit` so the worker batches.
+    /// Hashes of blobs not yet embedded — i.e. with no `blob_chunks` rows. The
+    /// server-side `trove embed` worker's sweep (it reads each blob's content
+    /// from its JuiceFS clone, chunks it, and inserts the embeddings). Capped by
+    /// `limit` so the worker batches.
     pub fn pending_embedding_hashes(&mut self, limit: i64) -> Result<Vec<String>> {
         let rows = self.client.query(
-            "select hash from blobs where embedding is null order by created_at limit $1",
+            "select b.hash from blobs b \
+             where not exists (select 1 from blob_chunks c where c.blob_hash = b.hash) \
+             order by b.created_at limit $1",
             &[&limit],
         )?;
         Ok(rows.iter().map(|r| r.get(0)).collect())

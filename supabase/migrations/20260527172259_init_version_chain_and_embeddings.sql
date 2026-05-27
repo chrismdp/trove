@@ -1,35 +1,30 @@
 -- Trove's history + search side of the substrate.
 --
--- JuiceFS (R2 blobs + its own Postgres metadata) holds the *live* tree. This
--- schema holds what JuiceFS does not: a per-file version chain (history, diffs,
--- restore) and semantic-search embeddings. Both hang off a content-addressed
--- blob registry, so identical content — across paths or revisions — is stored
--- and embedded exactly once.
+-- This schema lives in the SAME Postgres as JuiceFS's own metadata (its
+-- `jfs_*` tables). JuiceFS holds the live tree; version *bytes* are COW clones
+-- inside JuiceFS at `/.trove/versions/<hash>` (no duplication). This schema
+-- holds only what JuiceFS doesn't: the per-file version chain (history / diff /
+-- restore) and the semantic-search embeddings. Everything hangs off a
+-- content-addressed blob registry, so identical content is recorded once.
 
 -- pgvector for semantic search over file contents.
 create extension if not exists vector;
 
--- Content-addressed blob registry. One row per unique file content (sha256).
--- Dedup falls out free: the same bytes under two paths/revs => one blob row and
--- one embedding. The embedding is filled asynchronously after a commit, so it
--- is nullable; `embedding_model` records which model produced it (so a model
--- change is detectable and re-embeddable).
+-- Content-addressed registry: one row per unique file content (sha256). The
+-- bytes themselves are NOT here — they're a COW clone in JuiceFS keyed by this
+-- hash. This row exists so the version chain can reference content and so
+-- `blob_chunks` can hang embeddings off it. Dedup is free: same bytes => one row.
 create table blobs (
-    hash            text primary key,           -- sha256 hex of the content
-    size            bigint not null,
-    embedding       vector(3072),               -- OpenAI text-embedding-3-large
-    embedding_model text,                        -- model id that produced `embedding`
-    created_at      timestamptz not null default now()
+    hash        text primary key,           -- sha256 hex of the content
+    size        bigint not null,
+    created_at  timestamptz not null default now()
 );
--- Blob BYTES live in R2 (`trove-versions/<hash>`), not here: versioning keeps
--- every revision forever, so an object store is the right home and the metadata
--- DB stays small. This table is the index + the embedding/search side.
 
 -- Per-path version chain. Append-only: every validated write through the
 -- mount's commit barrier appends a row. `rev` is monotonic per path; the head
--- is the row with the largest rev. `parent_rev` links the chain for diffs and
--- restore; null marks a path's first version. The content lives in `blobs`,
--- content-addressed, so a version is just (path, rev) -> blob_hash.
+-- is the largest rev. `parent_rev` links the chain for diffs/restore; null marks
+-- a path's first version. A version is (path, rev) -> blob_hash; its bytes are
+-- the JuiceFS clone `/.trove/versions/<blob_hash>`.
 create table file_versions (
     id          bigint generated always as identity primary key,
     path        text    not null,
@@ -45,16 +40,27 @@ create table file_versions (
 -- Head-of-chain and history lookups: `... where path = $1 order by rev desc`.
 create index file_versions_path_rev_desc on file_versions (path, rev desc);
 
--- ANN index for `trove search`. pgvector's hnsw caps the `vector` type at 2000
--- dimensions, so index the halfvec cast (supported to 4000 dims). Full 3072-dim
--- vectors are still stored on `blobs.embedding`; only the index is halfvec.
--- Cosine distance matches OpenAI embedding similarity.
-create index blobs_embedding_hnsw on blobs
-    using hnsw ((embedding::halfvec(3072)) halfvec_cosine_ops);
+-- Embeddings, one blob -> many chunks. A text file is split (by markdown
+-- heading, etc.) into ordered chunks, each embedded independently so search
+-- matches the relevant *section*, not the whole file. Whole-file embedding is
+-- simply the N=1 case (one chunk, null heading). `start_byte`/`end_byte` locate
+-- the chunk in the blob for deep-linking. Filled out-of-band by the server-side
+-- `trove embed` worker (libjfs read + OpenAI); "needs embedding" = a blob with
+-- no rows here. (Step 7, deferred.)
+create table blob_chunks (
+    id              bigint generated always as identity primary key,
+    blob_hash       text    not null references blobs (hash),
+    ordinal         integer not null,            -- order within the blob (0,1,2…)
+    heading         text,                         -- section heading (null = whole file / preamble)
+    start_byte      integer not null,
+    end_byte        integer not null,
+    embedding       vector(3072),                 -- OpenAI text-embedding-3-large
+    embedding_model text,
+    unique (blob_hash, ordinal)
+);
 
--- Embeddings are filled out-of-band by a Cloudflare Worker: a blob written to
--- R2 (`trove-versions/<hash>`) raises an R2 event -> CF Queue -> the Worker
--- reads the object (native R2 binding), calls OpenAI, and PATCHes
--- `blobs.embedding` here via PostgREST. The R2 write is the trigger, so no
--- database NOTIFY is needed; a scheduled Worker sweeps `where embedding is null`
--- as the at-least-once backstop. (Deferred — search is step 7.)
+-- ANN index for `trove search`. pgvector's hnsw caps the `vector` type at 2000
+-- dimensions, so index the halfvec cast (supported to 4000). Full 3072-dim
+-- vectors are still stored; only the index is halfvec. Cosine matches OpenAI.
+create index blob_chunks_embedding_hnsw on blob_chunks
+    using hnsw ((embedding::halfvec(3072)) halfvec_cosine_ops);

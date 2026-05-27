@@ -445,10 +445,13 @@ fn validation_gate_rejects_bad_write_and_commits_good() {
 }
 
 /// End-to-end versioning: a valid write through the kernel is captured as a
-/// version (best-effort, via the WAL) and is recoverable as history. Exercises
-/// mount -> commit barrier -> recorder -> WAL -> drain -> R2 + Postgres.
+/// version — a COW clone in the archive + a chain row — synchronously at the
+/// commit barrier (no WAL, no drain). Exercises mount -> commit -> jfs_clone +
+/// VersionStore, all on one JuiceFS volume + one Postgres.
 #[test]
 fn a_committed_write_is_recorded_as_a_version() {
+    use trove::version::{sha256_hex, VersionStore};
+
     let (fs, dir) = fresh_fs("ver");
 
     let schema_root = dir.join("schemas");
@@ -456,17 +459,15 @@ fn a_committed_write_is_recorded_as_a_version() {
     std::fs::write(schema_root.join(".types/person.json"), PERSON_SCHEMA).unwrap();
     let registry = Registry::load(&schema_root).unwrap();
 
-    // Recorder over the live backends (local Supabase + real R2).
+    // Same Postgres that (in production) also holds JuiceFS's metadata.
     let db = std::env::var("TROVE_DB_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:54322/postgres".to_string());
-    let vs = trove::version::VersionStore::connect(&db).expect("version DB up? (`supabase start`)");
-    let bs = trove::blobstore::BlobStore::from_env().expect("R2 creds in env");
-    let rec = trove::recorder::Recorder::new(vs, bs, dir.join("wal")).unwrap();
+    let versions = VersionStore::connect(&db).expect("version DB up? (`supabase start`)");
 
     let mountpoint = dir.join("mnt");
     std::fs::create_dir_all(&mountpoint).unwrap();
     let session =
-        mount::spawn_with_recorder(fs, registry, Some(rec.clone()), &mountpoint).expect("mount");
+        mount::spawn_with_versions(fs, registry, Some(versions), &mountpoint).expect("mount");
     wait_mounted(&mountpoint);
 
     std::fs::create_dir(mountpoint.join("people")).expect("mkdir people");
@@ -475,15 +476,26 @@ fn a_committed_write_is_recorded_as_a_version() {
     let body = "---\ntype: person\nage: 30\n---\nrecorded\n";
     std::fs::write(mountpoint.join(&rel), body).expect("valid write commits");
 
-    // The write returned without touching the DB (WAL-only); draining applies it.
-    assert_eq!(rec.drain_once().unwrap().applied, 1, "one version queued for the write");
-
-    // History is now queryable, and the recorded bytes round-trip from R2.
+    // Recorded synchronously at the commit barrier; poll briefly for the async
+    // FUSE release to settle.
     let jfs_path = format!("/{rel}");
-    let log = trove::version::VersionStore::connect(&db).unwrap().log(&jfs_path).unwrap();
+    let mut checker = VersionStore::connect(&db).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let log = loop {
+        let log = checker.log(&jfs_path).unwrap();
+        if !log.is_empty() || Instant::now() >= deadline {
+            break log;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
     assert_eq!(log.len(), 1, "exactly one version (no double-commit on close)");
     assert_eq!(log[0].rev, 1);
-    assert_eq!(rec.cat(&jfs_path, 1).unwrap().as_deref(), Some(body.as_bytes()));
+    assert_eq!(log[0].blob_hash, sha256_hex(body.as_bytes()));
+
+    // The COW clone is a real path in the volume — read it back through the
+    // kernel and confirm it holds the committed bytes.
+    let archived = mountpoint.join(".trove/versions").join(sha256_hex(body.as_bytes()));
+    assert_eq!(std::fs::read(&archived).unwrap(), body.as_bytes(), "clone holds the version bytes");
 
     drop(session);
     let _ = std::fs::remove_dir_all(&dir);
