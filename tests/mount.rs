@@ -500,3 +500,56 @@ fn a_committed_write_is_recorded_as_a_version() {
     drop(session);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `mount --embed`: a committed write self-triggers embedding through the
+/// in-process background thread (no cron, no daemon) — vectors appear in
+/// `blob_chunks` shortly after the write, off the write path.
+#[test]
+fn a_committed_write_self_triggers_embedding() {
+    use trove::version::{sha256_hex, VersionStore};
+
+    let key = std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY (source ~/.secret_env)");
+    let (fs, dir) = fresh_fs("embed-commit");
+
+    let schema_root = dir.join("schemas");
+    std::fs::create_dir_all(schema_root.join(".types")).unwrap();
+    std::fs::write(schema_root.join(".types/person.json"), PERSON_SCHEMA).unwrap();
+    let registry = Registry::load(&schema_root).unwrap();
+
+    let db = std::env::var("TROVE_DB_URL")
+        .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:54322/postgres".to_string());
+    let versions = VersionStore::connect(&db).unwrap();
+    let embed_tx = trove::embed::spawn_embedder(&db, key).unwrap();
+
+    let mountpoint = dir.join("mnt");
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    let session =
+        mount::spawn_with_versions_and_embed(fs, registry, Some(versions), Some(embed_tx), &mountpoint)
+            .expect("mount");
+    wait_mounted(&mountpoint);
+
+    std::fs::create_dir(mountpoint.join("people")).expect("mkdir people");
+    let tag = uniq("embed");
+    // Valid per the schema, with a heading so there's real text to embed.
+    let body = format!("---\ntype: person\nage: 30\n---\n# Notes {tag}\nlikes long walks\n");
+    std::fs::write(mountpoint.join(format!("people/{tag}.md")), &body).expect("valid write commits");
+
+    // The write returned immediately; the background thread embeds. Poll for it.
+    let hash = sha256_hex(body.as_bytes());
+    let mut chk = postgres::Client::connect(&db, postgres::NoTls).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let chunks = loop {
+        let n: i64 = chk
+            .query_one("select count(*) from blob_chunks where blob_hash = $1", &[&hash])
+            .unwrap()
+            .get(0);
+        if n > 0 || Instant::now() >= deadline {
+            break n;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert!(chunks > 0, "the committed write should have been embedded by the background thread");
+
+    drop(session);
+    let _ = std::fs::remove_dir_all(&dir);
+}

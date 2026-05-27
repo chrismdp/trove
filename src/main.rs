@@ -54,6 +54,11 @@ enum Command {
         /// a COW clone into the archive + a chain row. Omit to disable versioning.
         #[arg(long)]
         versions_db: Option<String>,
+        /// Embed each committed file as it's written (self-triggering, no cron):
+        /// a background thread embeds straight from the write buffer. Requires
+        /// --versions-db and OPENAI_API_KEY. Run this on the box that holds the key.
+        #[arg(long)]
+        embed: bool,
     },
 
     /// Embed un-embedded version blobs into `blob_chunks` for search. Reads
@@ -108,7 +113,7 @@ fn run() -> Result<usize> {
         }
 
         #[cfg(feature = "mount")]
-        Command::Mount { mountpoint, volume, meta, cache, types, versions_db } => {
+        Command::Mount { mountpoint, volume, meta, cache, types, versions_db, embed } => {
             let cache = cache.to_string_lossy();
             let fs = trove::jfs::Fs::init(&volume, &meta, &cache)?;
             let registry = match &types {
@@ -120,8 +125,20 @@ fn run() -> Result<usize> {
                 Some(url) => Some(trove::version::VersionStore::connect(url)?),
                 None => None,
             };
+            // Optional self-triggering embedding: spawn the background embed
+            // thread; commit() pushes to it. Needs versioning + the OpenAI key.
+            let embed_tx = if embed {
+                let url = versions_db
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("--embed requires --versions-db"))?;
+                let key = std::env::var("OPENAI_API_KEY")
+                    .map_err(|_| anyhow::anyhow!("--embed requires OPENAI_API_KEY"))?;
+                Some(trove::embed::spawn_embedder(url, key)?)
+            } else {
+                None
+            };
             println!(
-                "{} mounting volume {volume:?} at {} ({}; versioning {})",
+                "{} mounting volume {volume:?} at {} ({}; versioning {}; embed {})",
                 "trove:".bold(),
                 mountpoint.display(),
                 if registry.is_empty() {
@@ -130,8 +147,9 @@ fn run() -> Result<usize> {
                     format!("validating via {}", types.as_ref().unwrap().display())
                 },
                 if versions.is_some() { "on" } else { "off" },
+                if embed_tx.is_some() { "on" } else { "off" },
             );
-            trove::mount::mount_blocking(fs, registry, versions, &mountpoint)?;
+            trove::mount::mount_blocking(fs, registry, versions, embed_tx, &mountpoint)?;
             Ok(0)
         }
 

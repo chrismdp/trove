@@ -22,8 +22,9 @@ use fuser::{
     ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite,
     RenameFlags, Request, TimeOrNow, WriteFlags,
 };
-use crate::version::VersionStore;
+use crate::version::{sha256_hex, VersionStore};
 use std::collections::HashMap;
+use std::sync::mpsc::Sender;
 use std::ffi::OsStr;
 use std::io;
 use std::path::Path;
@@ -69,6 +70,10 @@ struct Inner {
     /// validated commit also COW-clones the file into the version archive and
     /// appends a chain row — best-effort, never blocking the write.
     versions: Option<VersionStore>,
+    /// Optional embed channel. When set (mount `--embed`), a validated commit
+    /// pushes `(hash, content)` to the background embed thread — self-triggering
+    /// embedding off the write path, straight from the write buffer.
+    embed_tx: Option<Sender<(String, Vec<u8>)>>,
     ino_to_path: HashMap<u64, String>,
     path_to_ino: HashMap<String, u64>,
     next_ino: u64,
@@ -219,9 +224,15 @@ impl Inner {
                 // the write. COW-clones into the version archive + records the
                 // chain row, on the same backend the write just succeeded against.
                 if let Some(vs) = self.versions.as_mut() {
-                    if let Err(e) = crate::versioning::record_version(&self.fs, vs, &path, &buf, None)
-                    {
-                        eprintln!("trove: version not recorded for {path}: {e:#}");
+                    match crate::versioning::record_version(&self.fs, vs, &path, &buf, None) {
+                        // Version recorded => the blob row exists, so it's safe to
+                        // queue for embedding. Non-blocking send off the write path.
+                        Ok(_) => {
+                            if let Some(tx) = &self.embed_tx {
+                                let _ = tx.send((sha256_hex(&buf), buf.clone()));
+                            }
+                        }
+                        Err(e) => eprintln!("trove: version not recorded for {path}: {e:#}"),
                     }
                 }
                 if let Some(OpenFile::Write { dirty, rejected, .. }) = self.open_files.get_mut(&fh) {
@@ -270,6 +281,17 @@ impl TroveFs {
     /// A mount that also captures a version on each validated commit (best-effort
     /// COW clone + chain row; the write is never blocked on it).
     pub fn with_versions(fs: Fs, registry: Registry, versions: Option<VersionStore>) -> Self {
+        Self::with_versions_and_embed(fs, registry, versions, None)
+    }
+
+    /// As [`with_versions`], plus an embed channel: a validated commit also
+    /// pushes `(hash, content)` to the background embed thread (mount `--embed`).
+    pub fn with_versions_and_embed(
+        fs: Fs,
+        registry: Registry,
+        versions: Option<VersionStore>,
+        embed_tx: Option<Sender<(String, Vec<u8>)>>,
+    ) -> Self {
         let mut ino_to_path = HashMap::new();
         let mut path_to_ino = HashMap::new();
         ino_to_path.insert(ROOT_INO, "/".to_string());
@@ -279,6 +301,7 @@ impl TroveFs {
                 fs,
                 registry,
                 versions,
+                embed_tx,
                 ino_to_path,
                 path_to_ino,
                 next_ino: 2,
@@ -981,12 +1004,33 @@ pub fn spawn_with_versions(
     fuser::spawn_mount2(TroveFs::with_versions(fs, registry, versions), mountpoint, &config())
 }
 
+/// Background mount with version capture + self-triggering embed. For tests.
+pub fn spawn_with_versions_and_embed(
+    fs: Fs,
+    registry: Registry,
+    versions: Option<VersionStore>,
+    embed_tx: Option<Sender<(String, Vec<u8>)>>,
+    mountpoint: &Path,
+) -> io::Result<BackgroundSession> {
+    fuser::spawn_mount2(
+        TroveFs::with_versions_and_embed(fs, registry, versions, embed_tx),
+        mountpoint,
+        &config(),
+    )
+}
+
 /// Mount in the foreground; blocks until unmounted. For the `trove mount` CLI.
+/// `embed_tx`, when set, makes a validated commit self-trigger embedding.
 pub fn mount_blocking(
     fs: Fs,
     registry: Registry,
     versions: Option<VersionStore>,
+    embed_tx: Option<Sender<(String, Vec<u8>)>>,
     mountpoint: &Path,
 ) -> io::Result<()> {
-    fuser::mount2(TroveFs::with_versions(fs, registry, versions), mountpoint, &config())
+    fuser::mount2(
+        TroveFs::with_versions_and_embed(fs, registry, versions, embed_tx),
+        mountpoint,
+        &config(),
+    )
 }

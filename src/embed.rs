@@ -114,23 +114,25 @@ fn vector_literal(v: &[f32]) -> String {
     s
 }
 
-/// Embed one blob: read its bytes from the version clone, chunk + embed, write
+/// Embed `content` for blob `hash`: chunk by header, embed each, write
 /// `blob_chunks`. Non-UTF-8 or blank content gets a single sentinel row (null
-/// embedding) so it isn't reprocessed every run. Returns the number of embedded
-/// chunks (0 = sentinel).
-pub fn embed_blob(fs: &Fs, versions: &mut VersionStore, api_key: &str, hash: &str) -> Result<usize> {
-    let bytes = fs
-        .read_all(&format!("{VERSIONS_DIR}/{hash}"))
-        .with_context(|| format!("reading version clone for {hash}"))?;
-
-    let text = match std::str::from_utf8(&bytes) {
+/// embedding) so it isn't reprocessed. Returns the number of embedded chunks
+/// (0 = sentinel). No filesystem access — the caller supplies the bytes (the
+/// commit path has them in the write buffer; the cron path reads the clone).
+pub fn embed_content(
+    versions: &mut VersionStore,
+    api_key: &str,
+    hash: &str,
+    content: &[u8],
+) -> Result<usize> {
+    let text = match std::str::from_utf8(content) {
         Ok(t) if !t.trim().is_empty() => t,
-        // Binary or empty: mark processed-but-not-embedded so it stops being pending.
+        // Binary or empty: mark processed-but-not-embedded.
         _ => {
             versions.replace_chunks(
                 hash,
                 MODEL,
-                &[ChunkInsert { ordinal: 0, heading: None, start_byte: 0, end_byte: bytes.len() as i32, embedding: None }],
+                &[ChunkInsert { ordinal: 0, heading: None, start_byte: 0, end_byte: content.len() as i32, embedding: None }],
             )?;
             return Ok(0);
         }
@@ -154,6 +156,36 @@ pub fn embed_blob(fs: &Fs, versions: &mut VersionStore, api_key: &str, hash: &st
         .collect();
     versions.replace_chunks(hash, MODEL, &rows)?;
     Ok(rows.len())
+}
+
+/// Embed one blob by reading its bytes from the version clone via libjfs, then
+/// [`embed_content`]. The cron/backfill path (no write buffer to hand).
+pub fn embed_blob(fs: &Fs, versions: &mut VersionStore, api_key: &str, hash: &str) -> Result<usize> {
+    let bytes = fs
+        .read_all(&format!("{VERSIONS_DIR}/{hash}"))
+        .with_context(|| format!("reading version clone for {hash}"))?;
+    embed_content(versions, api_key, hash, &bytes)
+}
+
+/// Spawn a background thread that embeds `(hash, content)` pairs as they arrive,
+/// owning its own DB connection + key. Returns the sender that the mount's
+/// `commit()` pushes to — so embedding self-triggers on write (no cron, no
+/// daemon), runs off the write path, and reuses the buffer (no libjfs read).
+/// Connects up front so a bad URL fails at mount start, not silently later.
+pub fn spawn_embedder(
+    versions_url: &str,
+    api_key: String,
+) -> Result<std::sync::mpsc::Sender<(String, Vec<u8>)>> {
+    let mut versions = VersionStore::connect(versions_url)?;
+    let (tx, rx) = std::sync::mpsc::channel::<(String, Vec<u8>)>();
+    std::thread::spawn(move || {
+        for (hash, content) in rx {
+            if let Err(e) = embed_content(&mut versions, &api_key, &hash, &content) {
+                eprintln!("trove embed: {hash}: {e:#}");
+            }
+        }
+    });
+    Ok(tx)
 }
 
 /// Drain every pending blob (no chunks yet) and exit. Cron-friendly. Returns the
