@@ -921,6 +921,25 @@ fn config() -> fuser::Config {
     // BackgroundSession unmounts on drop, and the foreground mount unmounts on
     // exit. (Reconsider AutoUnmount + AllowOther for the long-running daemon.)
     cfg.mount_options = vec![MountOption::FSName("trove".to_string())];
+    // Multi-threaded dispatch. fuser defaults to a SINGLE event-loop thread,
+    // which deadlocks under concurrent clients: the lone worker blocks inside a
+    // handler (e.g. a commit doing blocking libjfs I/O) while the kernel needs
+    // it to service a dependent request, and nothing makes progress. Confirmed
+    // empirically — 4 concurrent writers fine, ~30 hung the single worker. With
+    // several workers the kernel can always hand a request to an idle thread.
+    // (Our state is a `Mutex<Inner>`, so concurrent handlers are still
+    // serialised for correctness; libjfs itself is concurrency-safe. Narrowing
+    // that lock around the blocking I/O is a later optimisation, not needed for
+    // deadlock-freedom because commit I/O goes to the backing store, never back
+    // through this mount.) `clone_fd` gives each worker its own /dev/fuse fd
+    // (Linux 4.5+) for parallel request reads.
+    cfg.n_threads = Some(
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(4, 16),
+    );
+    cfg.clone_fd = true;
     cfg
 }
 

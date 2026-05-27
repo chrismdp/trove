@@ -12,7 +12,10 @@ path = "src/main.rs"
 [features]
 # `mount` pulls in the JuiceFS-backed FUSE filesystem (links libjfs). Kept
 # behind a feature so `trove check` and the validator build with no native deps.
-mount = ["dep:fuser", "dep:libc"]
+# `mount` pulls the substrate runtime: JuiceFS-backed FUSE (libjfs) plus the R2
+# blob store + version recorder. Kept behind a feature so `trove check` and the
+# validator build with no native deps (TLS/HTTP/FFI).
+mount = ["dep:fuser", "dep:libc", "dep:rusty-s3", "dep:ureq", "dep:url"]
 
 [dependencies]
 fuser = { version = "0.17", optional = true }
@@ -29,3 +32,6 @@ colored = "2"
 postgres = "0.19"
 sha2 = "0.10"
 hex = "0.4"
+rusty-s3 = { version = "0.9", optional = true }
+ureq = { version = "2", default-features = false, features = ["tls"], optional = true }
+url = { version = "2", optional = true }

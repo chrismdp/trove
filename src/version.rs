@@ -42,27 +42,31 @@ impl VersionStore {
         Ok(Self { client })
     }
 
-    /// Record a validated commit of `path` carrying `content`.
+    /// Record the metadata for a validated commit of `path`. The bytes
+    /// themselves are stored content-addressed in R2 by the caller (the
+    /// [`crate::recorder::Recorder`]); `blob_hash` is their sha256.
     ///
-    /// 1. Content-address the blob (sha256) and upsert it — a no-op if the hash
-    ///    already exists, which is how dedup falls out.
+    /// 1. Upsert the blob row (`hash`, `size`) — a no-op if the hash already
+    ///    exists, which is how dedup falls out.
     /// 2. Append a `file_versions` row at the next rev for `path`, linking
     ///    `parent_rev` to the previous head (null for a path's first version).
     ///
     /// Returns the new rev. Runs in one transaction so a crash can't leave a
-    /// blob without its version row or a gap in the chain. Same-path callers
+    /// blob row without its version row or a gap in the chain. Same-path callers
     /// are serialised upstream by the mount's per-inode lock (see the
     /// concurrency spike), so the `(path, rev)` unique constraint is a backstop,
     /// not the primary coordination.
-    pub fn record(&mut self, path: &str, content: &[u8], author: Option<&str>) -> Result<i32> {
-        let hash = sha256_hex(content);
-        let size = content.len() as i64;
-
+    pub fn record_meta(
+        &mut self,
+        path: &str,
+        blob_hash: &str,
+        size: i64,
+        author: Option<&str>,
+    ) -> Result<i32> {
         let mut tx = self.client.transaction()?;
         tx.execute(
-            "insert into blobs (hash, size, content) values ($1, $2, $3) \
-             on conflict (hash) do nothing",
-            &[&hash, &size, &content],
+            "insert into blobs (hash, size) values ($1, $2) on conflict (hash) do nothing",
+            &[&blob_hash, &size],
         )?;
         let head: i32 = tx
             .query_one(
@@ -74,7 +78,7 @@ impl VersionStore {
         tx.execute(
             "insert into file_versions (path, rev, blob_hash, parent_rev, author, size) \
              values ($1, $2, $3, $4, $5, $6)",
-            &[&path, &rev, &hash, &parent, &author, &size],
+            &[&path, &rev, &blob_hash, &parent, &author, &size],
         )?;
         tx.commit()?;
         Ok(rev)
@@ -99,27 +103,26 @@ impl VersionStore {
             .collect())
     }
 
-    /// The content of `path` at revision `rev` (for `trove cat <path>@<rev>` /
-    /// `diff` / `restore`). `None` if that (path, rev) has no version.
-    pub fn cat(&mut self, path: &str, rev: i32) -> Result<Option<Vec<u8>>> {
+    /// The blob hash of `path` at revision `rev` — the R2 key for its bytes
+    /// (`trove cat <path>@<rev>` reads PG for this, then R2 for the content).
+    /// `None` if that (path, rev) has no version.
+    pub fn blob_hash_at(&mut self, path: &str, rev: i32) -> Result<Option<String>> {
         let rows = self.client.query(
-            "select b.content from file_versions v join blobs b on b.hash = v.blob_hash \
-             where v.path = $1 and v.rev = $2",
+            "select blob_hash from file_versions where path = $1 and rev = $2",
             &[&path, &rev],
         )?;
-        Ok(rows.first().map(|r| r.get::<_, Vec<u8>>(0)))
+        Ok(rows.first().map(|r| r.get(0)))
     }
 
-    /// Blobs still awaiting an embedding, with their content — the embed
-    /// worker's sweep (the backstop behind the `blob_needs_embedding` NOTIFY).
-    /// Capped by `limit` so the worker batches. Returns `(hash, content)`.
-    pub fn pending_embeddings(&mut self, limit: i64) -> Result<Vec<(String, Vec<u8>)>> {
+    /// Hashes of blobs still awaiting an embedding — the backstop sweep the
+    /// scheduled Cloudflare Worker runs (it reads each blob's bytes from R2).
+    /// Capped by `limit` so the worker batches.
+    pub fn pending_embedding_hashes(&mut self, limit: i64) -> Result<Vec<String>> {
         let rows = self.client.query(
-            "select hash, content from blobs where embedding is null \
-             order by created_at limit $1",
+            "select hash from blobs where embedding is null order by created_at limit $1",
             &[&limit],
         )?;
-        Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+        Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 }
 

@@ -17,14 +17,13 @@ create extension if not exists vector;
 create table blobs (
     hash            text primary key,           -- sha256 hex of the content
     size            bigint not null,
-    content         bytea  not null,            -- the bytes (content-addressed, deduped)
     embedding       vector(3072),               -- OpenAI text-embedding-3-large
     embedding_model text,                        -- model id that produced `embedding`
     created_at      timestamptz not null default now()
 );
--- v1 stores blob bytes here (markdown is tiny; Postgres TOASTs `content`
--- out-of-line, so the embedding/search rows stay narrow). Offloading bytes to a
--- content-addressed R2 prefix is a later, reversible swap if blobs ever grow.
+-- Blob BYTES live in R2 (`trove-versions/<hash>`), not here: versioning keeps
+-- every revision forever, so an object store is the right home and the metadata
+-- DB stays small. This table is the index + the embedding/search side.
 
 -- Per-path version chain. Append-only: every validated write through the
 -- mount's commit barrier appends a row. `rev` is monotonic per path; the head
@@ -53,22 +52,9 @@ create index file_versions_path_rev_desc on file_versions (path, rev desc);
 create index blobs_embedding_hnsw on blobs
     using hnsw ((embedding::halfvec(3072)) halfvec_cosine_ops);
 
--- Embedding trigger. A newly-inserted blob has no embedding yet; notify Trove's
--- embed worker so it fetches `content` and fills `embedding` via OpenAI. The
--- worker ALSO sweeps `where embedding is null` on startup, so a notification
--- missed while the worker was down is still caught — at-least-once, eventually
--- consistent. (Trove owns the OpenAI call, not Postgres: the key stays in the
--- Trove process, and the fleet runs Trove anyway.)
-create function notify_blob_needs_embedding() returns trigger
-    language plpgsql as $$
-begin
-    if new.embedding is null then
-        perform pg_notify('blob_needs_embedding', new.hash);
-    end if;
-    return new;
-end;
-$$;
-
-create trigger blobs_needs_embedding
-    after insert on blobs
-    for each row execute function notify_blob_needs_embedding();
+-- Embeddings are filled out-of-band by a Cloudflare Worker: a blob written to
+-- R2 (`trove-versions/<hash>`) raises an R2 event -> CF Queue -> the Worker
+-- reads the object (native R2 binding), calls OpenAI, and PATCHes
+-- `blobs.embedding` here via PostgREST. The R2 write is the trigger, so no
+-- database NOTIFY is needed; a scheduled Worker sweeps `where embedding is null`
+-- as the at-least-once backstop. (Deferred — search is step 7.)

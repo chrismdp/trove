@@ -15,6 +15,10 @@ pub mod version;
 #[cfg(feature = "mount")]
 pub mod jfs;
 
+/// Content-addressed version-blob store over Cloudflare R2.
+#[cfg(feature = "mount")]
+pub mod blobstore;
+
 /// The `trove mount` FUSE filesystem, backed by `jfs`.
 #[cfg(feature = "mount")]
 pub mod mount;

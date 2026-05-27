@@ -314,6 +314,46 @@ fn truncate_on_governed_file_is_gated() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Concurrency regression: many writers at once must not deadlock the mount.
+/// With fuser's default single event-loop thread this hung indefinitely (the
+/// lone worker blocks in a handler while the kernel needs it for a dependent
+/// request). Multi-threaded dispatch (see `mount::config`) fixes it. The
+/// channel + `recv_timeout` makes a regression FAIL cleanly instead of hanging
+/// the whole test binary.
+#[test]
+fn concurrent_writers_do_not_deadlock() {
+    let (fs, dir) = fresh_fs("concurrent");
+    let mountpoint = dir.join("mnt");
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    let session = mount::spawn(fs, Registry::empty(), &mountpoint).expect("mount");
+    wait_mounted(&mountpoint);
+    std::fs::create_dir(mountpoint.join("d")).unwrap();
+
+    const N: usize = 24;
+    let handles: Vec<_> = (0..N)
+        .map(|i| {
+            let p = mountpoint.join(format!("d/f{i}.md"));
+            std::thread::spawn(move || std::fs::write(&p, format!("file {i}\n")).expect("write"))
+        })
+        .collect();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for h in handles {
+            h.join().expect("a writer thread panicked");
+        }
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(Duration::from_secs(30))
+        .expect("concurrent writers deadlocked — is the mount single-threaded again?");
+
+    let count = std::fs::read_dir(mountpoint.join("d")).unwrap().count();
+    assert_eq!(count, N, "every concurrent write should have committed");
+
+    drop(session);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 const PERSON_SCHEMA: &str = r#"{
     "globs": ["people/*.md"],
     "type": "object",
