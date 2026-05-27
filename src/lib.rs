@@ -26,3 +26,7 @@ pub mod embed;
 /// The `trove mount` FUSE filesystem, backed by `jfs`.
 #[cfg(feature = "mount")]
 pub mod mount;
+
+/// `trove demo-seed`: plant a fixed, reproducible corpus for search demos.
+#[cfg(feature = "mount")]
+pub mod demo;

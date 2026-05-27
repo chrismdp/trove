@@ -96,6 +96,15 @@ enum Command {
         #[arg(short = 'k', long, default_value_t = 10)]
         top_k: i64,
     },
+
+    /// Plant a fixed demo corpus (5 single-topic docs) so `trove search`
+    /// returns clean, reproducible results. Needs the DB + OPENAI_API_KEY only.
+    #[cfg(feature = "mount")]
+    DemoSeed {
+        /// Postgres URL for the embeddings DB (the version chain DB).
+        #[arg(long)]
+        versions_db: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -213,6 +222,16 @@ fn run() -> Result<usize> {
                 };
                 println!("  {}  {} {where_}", score.green(), h.path.bold());
             }
+            Ok(0)
+        }
+
+        #[cfg(feature = "mount")]
+        Command::DemoSeed { versions_db } => {
+            let api_key = std::env::var("OPENAI_API_KEY")
+                .map_err(|_| anyhow::anyhow!("OPENAI_API_KEY not set"))?;
+            let mut versions = trove::version::VersionStore::connect(&versions_db)?;
+            let n = trove::demo::seed(&mut versions, &api_key)?;
+            println!("{} seeded {n} demo doc(s) under /demo/", "trove:".bold());
             Ok(0)
         }
     }
