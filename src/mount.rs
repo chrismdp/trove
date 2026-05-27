@@ -48,7 +48,7 @@ enum OpenFile {
     /// Ungoverned writable file (binary, or any path no schema can claim):
     /// writes stream straight to jfs. No buffering — keeps large/binary files
     /// cheap — and nothing to validate, so no gate.
-    PassThrough { writer: File },
+    PassThrough { path: String, writer: File },
     /// Governed writable file: the whole proposed file is buffered so it can be
     /// validated as a unit at the commit barrier. `dirty` means uncommitted
     /// changes (or a fresh create / truncate) are pending. `rejected` means the
@@ -203,6 +203,56 @@ impl Inner {
         }
     }
 
+    /// Version a pass-through file (ungoverned text or binary) after its
+    /// streaming write has committed to JuiceFS. Reads the content back from
+    /// the live tree (the sync above it made it durable), hashes it, COW-clones
+    /// it into the version archive, and records the chain row — best-effort,
+    /// same as the governed path. If an embed channel is live, text content
+    /// (valid UTF-8) is pushed for embedding; binary content gets a sentinel
+    /// (empty vec → null embedding in `blob_chunks`). No-op when versioning is
+    /// disabled (no `VersionStore`).
+    fn version_pass_through(&mut self, path: &str) {
+        if self.versions.is_none() {
+            return;
+        }
+        // Binary files (by extension) are NEVER embedded and can be huge, so we
+        // must not read them whole just to version them: stream-hash + COW-clone,
+        // then a sentinel embed row (empty vec → null embedding) so the blob
+        // stops showing as "needs embedding". Text files we DO read back — we
+        // need the bytes to embed them anyway, so a single read serves both
+        // versioning and embedding. (A misnamed binary that slips through as
+        // "text" is still caught by embed_content's UTF-8 check → sentinel.)
+        if is_binary_path(path) {
+            let vs = self.versions.as_mut().unwrap();
+            match crate::versioning::record_version_from_fs(&self.fs, vs, path, None) {
+                Ok((_, hash)) => {
+                    if let Some(tx) = &self.embed_tx {
+                        let _ = tx.send((hash, vec![]));
+                    }
+                }
+                Err(e) => eprintln!("trove: version not recorded for {path}: {e:#}"),
+            }
+            return;
+        }
+
+        let content = match self.fs.read_all(path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("trove: couldn't read {path} for versioning: {e:#}");
+                return;
+            }
+        };
+        let hash = crate::version::sha256_hex(&content);
+        let vs = self.versions.as_mut().unwrap();
+        if let Err(e) = crate::versioning::record_version(&self.fs, vs, path, &content, None) {
+            eprintln!("trove: version not recorded for {path}: {e:#}");
+        }
+        if let Some(tx) = &self.embed_tx {
+            // Push the bytes for embedding; embed_content sentinels empty/binary.
+            let _ = tx.send((hash, content));
+        }
+    }
+
     /// Validate + persist the buffer for `fh` (the commit barrier). A clean
     /// (non-dirty) handle is a no-op. On rejection nothing is written to `jfs`,
     /// a `.errors` sidecar is (re)written, and `EINVAL` is returned so the
@@ -255,14 +305,25 @@ impl Inner {
         }
     }
 
-    /// The commit barrier (`flush`/`fsync`): pass-through handles sync their jfs
-    /// writer directly; governed handles validate + commit their buffer.
+    /// The commit barrier (`flush`/`fsync`): pass-through handles sync their
+    /// jfs writer directly then version (same best-effort path as governed
+    /// files); governed handles validate + commit their buffer.
     fn barrier(&mut self, fh: u64) -> Result<(), Errno> {
-        if let Some(OpenFile::PassThrough { writer }) = self.open_files.get(&fh) {
-            return writer
-                .flush()
-                .and_then(|_| writer.fsync())
-                .map_err(|_| Errno::EIO);
+        let pt_path = match self.open_files.get(&fh) {
+            Some(OpenFile::PassThrough { path, .. }) => Some(path.clone()),
+            _ => None,
+        };
+        if let Some(path) = pt_path {
+            // Sync the streaming writes first.
+            if let Some(OpenFile::PassThrough { writer, .. }) = self.open_files.get(&fh) {
+                writer
+                    .flush()
+                    .and_then(|_| writer.fsync())
+                    .map_err(|_| Errno::EIO)?;
+            }
+            // Version the now-durable bytes (best-effort; file is already safe).
+            self.version_pass_through(&path);
+            return Ok(());
         }
         self.commit(fh)
     }
@@ -377,6 +438,27 @@ fn to_attr(ino: u64, fi: &FileInfo) -> FileAttr {
     }
 }
 
+/// File extensions treated as binary: streamed straight through, versioned by
+/// stream-hash (never buffered whole), and never embedded. Everything else
+/// (markdown, code, config, extensionless) is treated as text — read back at
+/// commit so it can be embedded. The split only affects *how* a file is
+/// versioned (stream vs read), not *whether*: all files are versioned.
+fn is_binary_path(path: &str) -> bool {
+    const BINARY_EXTS: &[&str] = &[
+        "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "tiff", "heic", "avif",
+        "pdf", "mp4", "mov", "avi", "mkv", "webm", "mp3", "wav", "flac", "ogg", "m4a", "aac",
+        "zip", "gz", "tar", "bz2", "xz", "7z", "rar", "zst",
+        "exe", "dll", "so", "dylib", "bin", "dat", "wasm", "o", "a",
+        "woff", "woff2", "ttf", "otf", "eot",
+        "jar", "class", "parquet", "sqlite", "db", "pyc",
+    ];
+    Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| BINARY_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
 impl Filesystem for TroveFs {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let mut g = self.inner.lock().unwrap();
@@ -438,7 +520,7 @@ impl Filesystem for TroveFs {
                 Ok(writer) => {
                     let ino = g.intern(&path);
                     let fi = g.fs.stat(&path).unwrap_or_default();
-                    let fh = g.new_fh(OpenFile::PassThrough { writer });
+                    let fh = g.new_fh(OpenFile::PassThrough { path: path.clone(), writer });
                     reply.created(
                         &TTL,
                         &to_attr(ino, &fi),
@@ -497,7 +579,7 @@ impl Filesystem for TroveFs {
         if !g.registry.may_govern(rel) {
             match g.fs.open(&path, flags.0) {
                 Ok(writer) => {
-                    let fh = g.new_fh(OpenFile::PassThrough { writer });
+                    let fh = g.new_fh(OpenFile::PassThrough { path: path.clone(), writer });
                     reply.opened(FileHandle(fh), FopenFlags::empty());
                 }
                 Err(_) => reply.error(Errno::ENOENT),
@@ -542,7 +624,7 @@ impl Filesystem for TroveFs {
         let g = self.inner.lock().unwrap();
         match g.open_files.get(&fh.0) {
             // Read / pass-through handle: pread straight from jfs.
-            Some(OpenFile::Read { reader } | OpenFile::PassThrough { writer: reader }) => {
+            Some(OpenFile::Read { reader } | OpenFile::PassThrough { writer: reader, .. }) => {
                 let mut tmp = vec![0u8; size as usize];
                 match reader.read_at(&mut tmp, offset as i64) {
                     Ok(n) => {
@@ -593,7 +675,7 @@ impl Filesystem for TroveFs {
                 reply.written(data.len() as u32);
             }
             // Ungoverned: write straight through to jfs.
-            Some(OpenFile::PassThrough { writer }) => match writer.write_at(data, offset as i64) {
+            Some(OpenFile::PassThrough { writer, .. }) => match writer.write_at(data, offset as i64) {
                 Ok(n) => reply.written(n as u32),
                 Err(_) => reply.error(Errno::EIO),
             },
@@ -634,9 +716,20 @@ impl Filesystem for TroveFs {
         reply: ReplyEmpty,
     ) {
         let mut g = self.inner.lock().unwrap();
-        // Best-effort final commit. The kernel ignores release's return value,
-        // so a still-dirty buffer here (never flushed) gets one last attempt;
-        // an invalid one leaves its .errors sidecar and is dropped.
+        // Version a pass-through file on close if it hasn't been versioned yet
+        // (a caller that never flush/fsync'd). The kernel ignores release's
+        // return, so this is best-effort.
+        let pt_path = match g.open_files.get(&fh.0) {
+            Some(OpenFile::PassThrough { path, .. }) => Some(path.clone()),
+            _ => None,
+        };
+        if let Some(path) = pt_path {
+            g.version_pass_through(&path);
+        }
+        // Best-effort final commit for governed handles. The kernel ignores
+        // release's return value, so a still-dirty buffer here (never flushed)
+        // gets one last attempt; an invalid one leaves its .errors sidecar and
+        // is dropped.
         let _ = g.commit(fh.0);
         g.open_files.remove(&fh.0);
         reply.ok();

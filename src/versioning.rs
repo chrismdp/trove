@@ -13,6 +13,7 @@
 use crate::jfs::Fs;
 use crate::version::{sha256_hex, VersionStore};
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -43,10 +44,59 @@ pub fn record_version(
     content: &[u8],
     author: Option<&str>,
 ) -> Result<i32> {
-    let hash = sha256_hex(content);
-    let size = content.len() as i64;
-    let dst = version_path(&hash);
+    snapshot(fs, versions, path, &sha256_hex(content), content.len() as i64, author)
+}
 
+/// Version a file already written to the live tree **without holding its bytes
+/// in memory** — stream-hash it from the volume (1 MiB chunks, never buffering
+/// the whole file) so a multi-GB binary can be versioned cheaply. Returns
+/// `(rev, content hash)`. This is what the mount uses for ungoverned *binary*
+/// files (which stream straight through and are never embedded, so there's no
+/// reason to ever hold them whole); governed/text files use [`record_version`]
+/// with the bytes they already have buffered for validation/embedding.
+pub fn record_version_from_fs(
+    fs: &Fs,
+    versions: &mut VersionStore,
+    path: &str,
+    author: Option<&str>,
+) -> Result<(i32, String)> {
+    let size = fs.stat(path)?.length as i64;
+    let hash = stream_hash(fs, path)?;
+    let rev = snapshot(fs, versions, path, &hash, size, author)?;
+    Ok((rev, hash))
+}
+
+/// sha256 of a file's contents read in 1 MiB chunks — never holds the whole
+/// file, so content-addressing a large binary stays cheap.
+fn stream_hash(fs: &Fs, path: &str) -> Result<String> {
+    let f = fs.open(path, 0).context("opening file to hash")?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut off = 0i64;
+    loop {
+        let n = f.read_at(&mut buf, off).context("reading file to hash")?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        off += n as i64;
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Clone the live file at `path` into the content-addressed archive and append
+/// the chain row, with light retry. Shared by the buffered ([`record_version`])
+/// and streamed ([`record_version_from_fs`]) entry points. Best-effort: a final
+/// error is non-fatal to the caller (the live file is already safely written).
+fn snapshot(
+    fs: &Fs,
+    versions: &mut VersionStore,
+    path: &str,
+    hash: &str,
+    size: i64,
+    author: Option<&str>,
+) -> Result<i32> {
+    let dst = version_path(hash);
     let mut last_err = None;
     for attempt in 0..RETRIES {
         let result = (|| -> Result<i32> {
@@ -56,7 +106,7 @@ pub fn record_version(
             if !fs.exists(&dst) {
                 fs.clone_file(path, &dst, true).context("cloning version snapshot")?;
             }
-            versions.record_meta(path, &hash, size, author)
+            versions.record_meta(path, hash, size, author)
         })();
         match result {
             Ok(rev) => return Ok(rev),

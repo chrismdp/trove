@@ -501,6 +501,110 @@ fn a_committed_write_is_recorded_as_a_version() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Every committed write — governed text, ungoverned text, AND binary — is
+/// versioned. Governed files already had this; this test proves the other two
+/// paths (the `PassThrough` handle that streams writes straight to jfs) also
+/// get a COW clone in the archive + a chain row. The text file additionally gets
+/// embed chunks; the binary file does not — but both appear in `file_versions`.
+#[test]
+fn ungoverned_text_and_binary_are_both_versioned() {
+    use trove::version::{sha256_hex, VersionStore};
+
+    let (fs, dir) = fresh_fs("verall");
+    let registry = Registry::empty(); // no governance — everything is pass-through
+
+    let db = std::env::var("TROVE_DB_URL")
+        .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:54322/postgres".to_string());
+    let versions = VersionStore::connect(&db).expect("version DB up? (`supabase start`)");
+
+    let key = std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY");
+    let embed_tx = trove::embed::spawn_embedder(&db, key).unwrap();
+
+    let mountpoint = dir.join("mnt");
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    let session =
+        mount::spawn_with_versions_and_embed(fs, registry, Some(versions), Some(embed_tx), &mountpoint)
+            .expect("mount");
+    wait_mounted(&mountpoint);
+
+    // (a) Ungoverned markdown: pass-through write, but still versioned.
+    let tag = uniq("allo");
+    let md_rel = format!("scratch-{tag}.md");
+    let md_body = format!("# {tag}\nthis file has no type — it's ungoverned\n");
+    std::fs::write(mountpoint.join(&md_rel), &md_body).expect("ungoverned md write");
+
+    // (b) Binary blob: pass-through, non-UTF-8 — should version (no embedding).
+    let bin_rel = format!("data-{tag}.bin");
+    let bin_body: Vec<u8> = (0u8..=255).collect();
+    std::fs::write(mountpoint.join(&bin_rel), &bin_body).expect("binary write");
+
+    // Poll: both files should appear in file_versions.
+    let md_path = format!("/{md_rel}");
+    let bin_path = format!("/{bin_rel}");
+    let mut checker = VersionStore::connect(&db).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (md_log, bin_log) = loop {
+        let a = checker.log(&md_path).unwrap();
+        let b = checker.log(&bin_path).unwrap();
+        if (!a.is_empty() && !b.is_empty()) || Instant::now() >= deadline {
+            break (a, b);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
+    assert!(!md_log.is_empty(), "ungoverned .md should be versioned");
+    assert_eq!(md_log[0].blob_hash, sha256_hex(md_body.as_bytes()));
+
+    assert!(!bin_log.is_empty(), "binary should be versioned");
+    assert_eq!(bin_log[0].blob_hash, sha256_hex(&bin_body));
+
+    // Text file: COW clone in the archive.
+    let md_hash = sha256_hex(md_body.as_bytes());
+    let archived = mountpoint.join(".trove/versions").join(&md_hash);
+    assert_eq!(std::fs::read(&archived).unwrap(), md_body.as_bytes(), "clone holds md bytes");
+
+    // Binary: also in the archive.
+    let bin_hash = sha256_hex(&bin_body);
+    let archived_bin = mountpoint.join(".trove/versions").join(&bin_hash);
+    assert_eq!(std::fs::read(&archived_bin).unwrap(), bin_body, "clone holds binary bytes");
+
+    // Embedding is async (background thread + OpenAI round-trip), so poll for it
+    // — versioning above is synchronous, embedding is not. The text file gets
+    // real chunks; the binary gets a sentinel row with a null embedding.
+    let mut pg = postgres::Client::connect(&db, postgres::NoTls).unwrap();
+    let embed_deadline = Instant::now() + Duration::from_secs(20);
+    let (md_chunks, bin_chunks, bin_null) = loop {
+        let md: i64 = pg
+            .query_one(
+                "select count(*) from blob_chunks where blob_hash = $1 and embedding is not null",
+                &[&md_hash],
+            )
+            .unwrap()
+            .get(0);
+        let bin: i64 = pg
+            .query_one("select count(*) from blob_chunks where blob_hash = $1", &[&bin_hash])
+            .unwrap()
+            .get(0);
+        let bin_null: bool = pg
+            .query_one(
+                "select coalesce(bool_or(embedding is null), false) from blob_chunks where blob_hash = $1",
+                &[&bin_hash],
+            )
+            .unwrap()
+            .get(0);
+        if (md > 0 && bin > 0) || Instant::now() >= embed_deadline {
+            break (md, bin, bin_null);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert!(md_chunks > 0, "ungoverned text should be embedded");
+    assert!(bin_chunks > 0, "binary should get a sentinel chunk row");
+    assert!(bin_null, "binary's chunk row should have null embedding");
+
+    drop(session);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `mount --embed`: a committed write self-triggers embedding through the
 /// in-process background thread (no cron, no daemon) — vectors appear in
 /// `blob_chunks` shortly after the write, off the write path.
