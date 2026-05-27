@@ -215,14 +215,15 @@ impl Inner {
         if self.versions.is_none() {
             return;
         }
-        // Binary files (by extension) are NEVER embedded and can be huge, so we
-        // must not read them whole just to version them: stream-hash + COW-clone,
-        // then a sentinel embed row (empty vec → null embedding) so the blob
-        // stops showing as "needs embedding". Text files we DO read back — we
-        // need the bytes to embed them anyway, so a single read serves both
-        // versioning and embedding. (A misnamed binary that slips through as
-        // "text" is still caught by embed_content's UTF-8 check → sentinel.)
-        if is_binary_path(path) {
+        // Binary files (detected by content sniff) are NEVER embedded and can be
+        // huge, so we must not read them whole just to version them: stream-hash
+        // + COW-clone, then a sentinel embed row (empty vec → null embedding) so
+        // the blob stops showing as "needs embedding". Text files we DO read back
+        // — we need the bytes to embed them anyway, so a single read serves both
+        // versioning and embedding. (Anything the sniff misclassifies as text but
+        // that isn't UTF-8 is still caught by embed_content's UTF-8 check →
+        // sentinel, so it's never embedded as garbage.)
+        if sniff_binary(&self.fs, path) {
             let vs = self.versions.as_mut().unwrap();
             match crate::versioning::record_version_from_fs(&self.fs, vs, path, None) {
                 Ok((_, hash)) => {
@@ -438,25 +439,21 @@ fn to_attr(ino: u64, fi: &FileInfo) -> FileAttr {
     }
 }
 
-/// File extensions treated as binary: streamed straight through, versioned by
-/// stream-hash (never buffered whole), and never embedded. Everything else
-/// (markdown, code, config, extensionless) is treated as text — read back at
-/// commit so it can be embedded. The split only affects *how* a file is
-/// versioned (stream vs read), not *whether*: all files are versioned.
-fn is_binary_path(path: &str) -> bool {
-    const BINARY_EXTS: &[&str] = &[
-        "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "tiff", "heic", "avif",
-        "pdf", "mp4", "mov", "avi", "mkv", "webm", "mp3", "wav", "flac", "ogg", "m4a", "aac",
-        "zip", "gz", "tar", "bz2", "xz", "7z", "rar", "zst",
-        "exe", "dll", "so", "dylib", "bin", "dat", "wasm", "o", "a",
-        "woff", "woff2", "ttf", "otf", "eot",
-        "jar", "class", "parquet", "sqlite", "db", "pyc",
-    ];
-    Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| BINARY_EXTS.contains(&e.to_ascii_lowercase().as_str()))
-        .unwrap_or(false)
+/// Content-based binary detection — extensions are unreliable, so we sniff like
+/// `file`/git do: read up to the first 8 KiB and treat the file as binary if it
+/// contains a NUL byte (UTF-8 text never does; real binaries almost always do
+/// early). Only the prefix is read, so a large binary is never buffered whole.
+/// A read error falls through to "not binary" (the text path's `read_all` then
+/// surfaces the real error). The split only affects *how* a file is versioned
+/// (stream-hash vs read-back-to-embed), never *whether*: all files are versioned.
+fn sniff_binary(fs: &Fs, path: &str) -> bool {
+    const SNIFF: usize = 8192;
+    let Ok(f) = fs.open(path, 0) else { return false };
+    let mut buf = vec![0u8; SNIFF];
+    match f.read_at(&mut buf, 0) {
+        Ok(n) => buf[..n].contains(&0u8),
+        Err(_) => false,
+    }
 }
 
 impl Filesystem for TroveFs {
