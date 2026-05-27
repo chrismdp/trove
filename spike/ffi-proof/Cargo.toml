@@ -1,0 +1,11 @@
+[package]
+name = "ffi-proof"
+version = "0.1.0"
+edition = "2021"
+
+# Spike: prove Rust can FFI into JuiceFS's libjfs-amd64.so and do
+# init/create/write/read/close against a real (Postgres meta + object store)
+# JuiceFS volume — no kernel FUSE mount. If this runs green, the single-mount
+# Trove architecture (Rust fuser handlers -> libjfs in-process) is viable.
+
+[dependencies]
