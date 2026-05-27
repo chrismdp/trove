@@ -1,6 +1,7 @@
-//! `trove check <store>` — walk a store, validate every typed markdown file
-//! against the type registry, and report violations. Exit code is non-zero
-//! when anything failed, so it slots straight into a pre-commit hook or CI.
+//! `trove check <store>` — walk a store, select the governing schema(s) for
+//! each markdown file by path glob (+ type-field disambiguation), validate, and
+//! report violations. Exit code is non-zero on any failure, so it drops into a
+//! pre-commit hook or CI.
 
 use crate::{frontmatter, types::Registry, validate};
 use anyhow::{Context, Result};
@@ -19,8 +20,7 @@ pub fn run(store: &Path, quiet: bool) -> Result<Summary> {
     let registry = Registry::load(store).context("loading type registry")?;
     if registry.is_empty() {
         eprintln!(
-            "{}: no schemas found in {}/.types — nothing to validate.\n  \
-             Add a schema, e.g. .types/person.json, to start enforcing shape.",
+            "{}: no schemas found in {}/.types — nothing to validate.",
             "warning".yellow().bold(),
             store.display()
         );
@@ -40,8 +40,8 @@ pub fn run(store: &Path, quiet: bool) -> Result<Summary> {
         s.checked += 1;
         let rel = path.strip_prefix(store).unwrap_or(path);
 
-        // Read as bytes first: a non-UTF-8 file is itself a finding (a note
-        // should be text), never a reason to abort the whole sweep.
+        // Read as bytes first: a non-UTF-8 file is itself a finding, never a
+        // reason to abort the whole sweep.
         let bytes = std::fs::read(path)
             .with_context(|| format!("reading {}", path.display()))?;
         let raw = match String::from_utf8(bytes) {
@@ -52,43 +52,47 @@ pub fn run(store: &Path, quiet: bool) -> Result<Summary> {
                 continue;
             }
         };
+
         let doc = match frontmatter::parse(&raw) {
             Ok(d) => d,
             Err(e) => {
-                // Template files (Obsidian/Jekyll) carry {{placeholder}} syntax
-                // that is deliberately not valid YAML — skip, don't fail.
-                if raw.contains("{{") {
+                // Can't read the type of an unparseable file, so decide on the
+                // path glob alone: a finding only if some schema governs this
+                // path. Templates / vendored dirs nothing globs are skipped.
+                if !registry.path_is_governed(rel) {
                     s.untyped += 1;
-                    continue;
+                } else {
+                    s.failed += 1;
+                    report_fail(rel, &[format!("{e}")]);
                 }
-                s.failed += 1;
-                report_fail(rel, &[format!("{e}")]);
                 continue;
             }
         };
 
-        match validate::validate(&doc, &registry) {
-            validate::Verdict::Valid => {
-                s.valid += 1;
-                if !quiet {
-                    println!("{} {}", "ok  ".green(), rel.display());
+        let file_type = doc.frontmatter.get("type").and_then(|v| v.as_str());
+        let schemas = registry.select(rel, file_type);
+        if schemas.is_empty() {
+            s.untyped += 1;
+            continue;
+        }
+
+        let mut violations: Vec<String> = Vec::new();
+        for schema in schemas {
+            if let Err(errs) = validate::validate_against(&doc.frontmatter, schema) {
+                for v in errs {
+                    violations.push(format!("[{}] {}: {}", schema.name, v.instance_path, v.message));
                 }
             }
-            validate::Verdict::Untyped => {
-                s.untyped += 1;
+        }
+
+        if violations.is_empty() {
+            s.valid += 1;
+            if !quiet {
+                println!("{} {}", "ok  ".green(), rel.display());
             }
-            validate::Verdict::Unparseable(msg) => {
-                s.failed += 1;
-                report_fail(rel, &[msg]);
-            }
-            validate::Verdict::Invalid(violations) => {
-                s.failed += 1;
-                let msgs: Vec<String> = violations
-                    .iter()
-                    .map(|v| format!("{}: {}", v.instance_path, v.message))
-                    .collect();
-                report_fail(rel, &msgs);
-            }
+        } else {
+            s.failed += 1;
+            report_fail(rel, &violations);
         }
     }
 
@@ -102,8 +106,8 @@ fn report_fail(rel: &Path, msgs: &[String]) {
     }
 }
 
-/// Skip dotfiles/dotdirs (`.git`, `.obsidian`, `.types`) — the registry itself
-/// is loaded explicitly, and we don't validate plumbing.
+/// Skip dotfiles/dotdirs (`.git`, `.obsidian`, `.types`) — the registry is
+/// loaded explicitly and we don't validate plumbing.
 fn is_hidden_dir(path: &Path, store: &Path) -> bool {
     if path == store {
         return false;

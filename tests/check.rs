@@ -1,12 +1,12 @@
 //! End-to-end tests for `trove check` against a real on-disk store.
 //! Each test builds an isolated temp store, writes schemas + notes, and asserts
-//! on the Summary the sweep returns.
+//! on the Summary the sweep returns. Selection is glob-based (Cursor-rules
+//! style), with the `type` field disambiguating co-located types.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use trove::commands::check;
 
-/// A throwaway store under the OS temp dir, cleaned up on drop.
 struct TempStore {
     root: PathBuf,
 }
@@ -17,7 +17,6 @@ impl TempStore {
             "trove-it-{}-{}-{}",
             tag,
             std::process::id(),
-            // nanosecond tag so parallel tests never collide
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -54,7 +53,9 @@ impl Drop for TempStore {
     }
 }
 
+// Person governs root-level *.md (not subdirs), pinned to type=person.
 const PERSON_SCHEMA: &str = r#"{
+  "globs": ["*.md"],
   "type": "object",
   "required": ["type"],
   "properties": {
@@ -65,96 +66,158 @@ const PERSON_SCHEMA: &str = r#"{
   "additionalProperties": true
 }"#;
 
+// Concept also lives at root — co-located with person, disambiguated by type.
+const CONCEPT_SCHEMA: &str = r#"{
+  "globs": ["*.md"],
+  "type": "object",
+  "required": ["type"],
+  "properties": { "type": { "const": "concept" } },
+  "additionalProperties": true
+}"#;
+
+// Project governs projects/<slug>/PROJECT.md only.
+const PROJECT_SCHEMA: &str = r#"{
+  "globs": ["projects/**/PROJECT.md"],
+  "type": "object",
+  "required": ["type", "status"],
+  "properties": {
+    "type": { "const": "project" },
+    "status": { "enum": ["todo", "doing", "done", "someday"] }
+  },
+  "additionalProperties": true
+}"#;
+
 #[test]
-fn valid_typed_note_passes() {
+fn valid_person_at_root_passes() {
     let store = TempStore::new("valid");
     store
         .schema("person", PERSON_SCHEMA)
         .note("Rebekah.md", "---\ntype: person\ndob: \"2010-06-23\"\n---\nbody");
 
     let s = check::run(store.path(), true).unwrap();
-    assert_eq!(s.checked, 1);
-    assert_eq!(s.valid, 1);
-    assert_eq!(s.failed, 0);
-    assert_eq!(s.untyped, 0);
+    assert_eq!((s.checked, s.valid, s.failed, s.untyped), (1, 1, 0, 0));
 }
 
 #[test]
 fn wrong_field_type_fails() {
-    // The real-world bug class: `dob` written as a bare number, not a string.
     let store = TempStore::new("wrongtype");
     store
         .schema("person", PERSON_SCHEMA)
         .note("Bad.md", "---\ntype: person\ndob: 42\n---\n");
-
-    let s = check::run(store.path(), true).unwrap();
-    assert_eq!(s.failed, 1);
-    assert_eq!(s.valid, 0);
+    assert_eq!(check::run(store.path(), true).unwrap().failed, 1);
 }
 
 #[test]
-fn missing_required_field_fails() {
-    let store = TempStore::new("required");
-    store
-        // require an `aliases` field to prove required-enforcement works
-        .schema(
-            "person",
-            r#"{"type":"object","required":["type","aliases"],"properties":{"type":{"const":"person"}}}"#,
-        )
-        .note("NoAliases.md", "---\ntype: person\n---\n");
-
-    let s = check::run(store.path(), true).unwrap();
-    assert_eq!(s.failed, 1);
-}
-
-#[test]
-fn untyped_note_is_skipped_not_failed() {
-    let store = TempStore::new("untyped");
+fn co_located_types_disambiguate_by_type_field() {
+    // person + concept both glob *.md; the type field decides which claims.
+    let store = TempStore::new("colocated");
     store
         .schema("person", PERSON_SCHEMA)
-        .note("Daily.md", "# just a daily note\n\nno frontmatter here");
-
+        .schema("concept", CONCEPT_SCHEMA)
+        .note("Rebekah.md", "---\ntype: person\n---\n")          // -> person, valid
+        .note("Some Idea.md", "---\ntype: concept\n---\n")        // -> concept, valid
+        .note("Bad Person.md", "---\ntype: person\ndob: 9\n---\n"); // -> person, fail
     let s = check::run(store.path(), true).unwrap();
-    assert_eq!(s.checked, 1);
-    assert_eq!(s.untyped, 1);
-    assert_eq!(s.failed, 0);
+    assert_eq!((s.valid, s.failed), (2, 1));
 }
 
 #[test]
-fn type_with_no_schema_is_untyped() {
-    // `type: project` declared, but no project.json registered → nothing to
-    // validate against, so it's untyped, not a failure.
+fn project_glob_governs_only_project_files() {
+    let store = TempStore::new("project");
+    store
+        .schema("project", PROJECT_SCHEMA)
+        .note("projects/Foo/PROJECT.md", "---\ntype: project\nstatus: todo\n---\n")     // valid
+        .note("projects/Bar/PROJECT.md", "---\ntype: project\nstatus: bogus\n---\n");   // bad status
+    let s = check::run(store.path(), true).unwrap();
+    assert_eq!((s.valid, s.failed), (1, 1));
+}
+
+#[test]
+fn file_outside_any_glob_is_untyped() {
+    // A subdir note doesn't match the root-only *.md glob -> untyped, not failed.
+    let store = TempStore::new("outside");
+    store
+        .schema("person", PERSON_SCHEMA)
+        .note("subdir/Note.md", "---\ntype: person\ndob: 42\n---\n"); // would fail IF claimed
+    let s = check::run(store.path(), true).unwrap();
+    assert_eq!((s.untyped, s.failed), (1, 0));
+}
+
+#[test]
+fn template_files_skipped_via_globs() {
+    // templates/ doesn't match person's root-only *.md glob, so the {{...}}
+    // placeholder file is simply untyped — no special-casing needed.
+    let store = TempStore::new("template");
+    store
+        .schema("person", PERSON_SCHEMA)
+        .note("templates/person.md", "---\ntype: person\nname: {{title}}\n---\n");
+    let s = check::run(store.path(), true).unwrap();
+    assert_eq!((s.failed, s.untyped), (0, 1));
+}
+
+#[test]
+fn type_with_no_matching_schema_is_untyped() {
     let store = TempStore::new("noschema");
     store
         .schema("person", PERSON_SCHEMA)
         .note("Some Project.md", "---\ntype: project\nstatus: doing\n---\n");
-
     let s = check::run(store.path(), true).unwrap();
-    assert_eq!(s.untyped, 1);
-    assert_eq!(s.failed, 0);
+    assert_eq!((s.untyped, s.failed), (1, 0));
 }
 
 #[test]
-fn unclosed_frontmatter_fence_fails() {
+fn type_const_schema_does_not_claim_typeless_files() {
+    // A broad/shared glob must not force-validate a typeless file. project.json
+    // pins type=project, so a PROJECT.md with no type field is left untyped
+    // rather than wrongly claimed — the type field gates type-const schemas.
+    let store = TempStore::new("notypefield");
+    store
+        .schema("project", PROJECT_SCHEMA)
+        .note("projects/Foo/PROJECT.md", "---\nstatus: bogus\n---\n");
+    let s = check::run(store.path(), true).unwrap();
+    assert_eq!((s.untyped, s.failed), (1, 0));
+}
+
+#[test]
+fn typeless_files_under_broad_root_glob_are_untyped() {
+    // The real-vault failure mode: person globs *.md (root) but the root holds
+    // daily notes, untyped concepts, etc. None of those should be claimed.
+    let store = TempStore::new("rootbroad");
+    store
+        .schema("person", PERSON_SCHEMA)
+        .note("2024-04-09.md", "## a daily note, no frontmatter")
+        .note("Some Concept.md", "---\nsome: value\n---\n") // typeless frontmatter
+        .note("Rebekah.md", "---\ntype: person\n---\n");      // the only real person
+    let s = check::run(store.path(), true).unwrap();
+    assert_eq!((s.valid, s.failed, s.untyped), (1, 0, 2));
+}
+
+#[test]
+fn unclosed_fence_fails_when_governed() {
     let store = TempStore::new("unclosed");
     store
         .schema("person", PERSON_SCHEMA)
         .note("Broken.md", "---\ntype: person\nno closing fence here");
-
-    let s = check::run(store.path(), true).unwrap();
-    assert_eq!(s.failed, 1);
+    assert_eq!(check::run(store.path(), true).unwrap().failed, 1);
 }
 
 #[test]
-fn malformed_yaml_fails() {
-    let store = TempStore::new("badyaml");
+fn unclosed_fence_skipped_when_not_governed() {
+    // A parse-broken file no schema governs is untyped, not a failure.
+    let store = TempStore::new("unclosed-ungoverned");
     store
-        .schema("person", PERSON_SCHEMA)
-        // tab indentation + broken mapping → YAML parse error
-        .note("BadYaml.md", "---\ntype: person\n  - this: is\n bad: yaml: here\n---\n");
-
+        .schema("project", PROJECT_SCHEMA) // only governs projects/**
+        .note("Random.md", "---\ntype: person\nno closing fence");
     let s = check::run(store.path(), true).unwrap();
-    assert_eq!(s.failed, 1);
+    assert_eq!((s.untyped, s.failed), (1, 0));
+}
+
+#[test]
+fn empty_registry_checks_nothing() {
+    let store = TempStore::new("empty");
+    store.note("Lonely.md", "---\ntype: person\n---\n");
+    let s = check::run(store.path(), true).unwrap();
+    assert_eq!((s.untyped, s.failed), (1, 0));
 }
 
 #[test]
@@ -163,51 +226,8 @@ fn dotdirs_and_non_md_ignored() {
     store
         .schema("person", PERSON_SCHEMA)
         .note("Good.md", "---\ntype: person\n---\n")
-        .note(".obsidian/workspace.md", "---\ntype: person\ndob: 99\n---\n") // would fail if scanned
+        .note(".obsidian/workspace.md", "---\ntype: person\ndob: 9\n---\n")
         .note("notes.txt", "not markdown");
-
     let s = check::run(store.path(), true).unwrap();
-    // Only Good.md should be checked; the dotdir note and the .txt are skipped.
-    assert_eq!(s.checked, 1);
-    assert_eq!(s.valid, 1);
-    assert_eq!(s.failed, 0);
-}
-
-#[test]
-fn empty_store_with_no_types_checks_nothing() {
-    let store = TempStore::new("empty");
-    store.note("Lonely.md", "---\ntype: person\n---\n");
-    // No .types dir at all → registry empty → everything untyped, nothing fails.
-    let s = check::run(store.path(), true).unwrap();
-    assert_eq!(s.untyped, 1);
-    assert_eq!(s.failed, 0);
-}
-
-#[test]
-fn template_placeholder_files_are_skipped_not_failed() {
-    let store = TempStore::new("template");
-    store
-        .schema("person", PERSON_SCHEMA)
-        // a template: {{placeholder}} is not valid YAML, but it's not corruption
-        .note("templates/person.md", "---\ntype: person\nname: {{title}}\ndob: {{date}}\n---\n");
-
-    let s = check::run(store.path(), true).unwrap();
-    assert_eq!(s.failed, 0, "template files must not count as failures");
-}
-
-#[test]
-fn mixed_store_counts_each_bucket() {
-    let store = TempStore::new("mixed");
-    store
-        .schema("person", PERSON_SCHEMA)
-        .note("A.md", "---\ntype: person\ndob: \"2010-01-01\"\n---\n") // valid
-        .note("B.md", "---\ntype: person\ndob: 7\n---\n") // fail
-        .note("C.md", "# daily, no frontmatter") // untyped
-        .note("D.md", "---\ntype: project\n---\n"); // untyped (no schema)
-
-    let s = check::run(store.path(), true).unwrap();
-    assert_eq!(s.checked, 4);
-    assert_eq!(s.valid, 1);
-    assert_eq!(s.failed, 1);
-    assert_eq!(s.untyped, 2);
+    assert_eq!((s.checked, s.valid, s.failed), (1, 1, 0));
 }

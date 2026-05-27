@@ -1,20 +1,10 @@
-//! Validate one document against the type registry. This is the core of "a
-//! filesystem that talks back": a write is only well-formed if its frontmatter
-//! satisfies the schema its `type` selects. The same check runs here on a
-//! `trove check` sweep and, later, on the FUSE write path.
+//! Validate a document's frontmatter against a specific schema. Schema
+//! *selection* lives in the registry (glob + type-const); this module just
+//! runs the chosen schema. This is the core of "a filesystem that talks back":
+//! a write is well-formed only if its frontmatter satisfies the schema its
+//! path (and type) select.
 
-use crate::frontmatter::Document;
-use crate::types::Registry;
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum Verdict {
-    /// No `type` field, or a type with no registered schema — nothing to check.
-    Untyped,
-    Valid,
-    Invalid(Vec<Violation>),
-    /// File couldn't even be parsed (e.g. unclosed fence, broken YAML).
-    Unparseable(String),
-}
+use crate::types::TypeSchema;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Violation {
@@ -23,35 +13,26 @@ pub struct Violation {
     pub message: String,
 }
 
-/// Resolve a document's declared type and validate against its schema.
-pub fn validate(doc: &Document, registry: &Registry) -> Verdict {
-    let type_name = doc
-        .frontmatter
-        .get("type")
-        .and_then(|v| v.as_str());
-
-    let Some(type_name) = type_name else {
-        return Verdict::Untyped;
-    };
-    let Some(schema) = registry.get(type_name) else {
-        return Verdict::Untyped;
-    };
-
-    let compiled = match jsonschema::JSONSchema::compile(schema) {
+/// Validate parsed frontmatter against one schema.
+pub fn validate_against(
+    frontmatter: &serde_json::Value,
+    schema: &TypeSchema,
+) -> Result<(), Vec<Violation>> {
+    let compiled = match jsonschema::JSONSchema::compile(&schema.schema) {
         Ok(c) => c,
         Err(e) => {
-            return Verdict::Invalid(vec![Violation {
+            return Err(vec![Violation {
                 instance_path: String::new(),
-                message: format!("schema for `{type_name}` is itself invalid: {e}"),
+                message: format!("schema `{}` is itself invalid: {e}", schema.name),
             }])
         }
     };
 
-    let result = compiled.validate(&doc.frontmatter);
+    let result = compiled.validate(frontmatter);
     match result {
-        Ok(()) => Verdict::Valid,
+        Ok(()) => Ok(()),
         Err(errors) => {
-            let violations = errors
+            let violations: Vec<Violation> = errors
                 .map(|e| Violation {
                     instance_path: {
                         let p = e.instance_path.to_string();
@@ -60,7 +41,7 @@ pub fn validate(doc: &Document, registry: &Registry) -> Verdict {
                     message: e.to_string(),
                 })
                 .collect();
-            Verdict::Invalid(violations)
+            Err(violations)
         }
     }
 }
@@ -69,15 +50,13 @@ pub fn validate(doc: &Document, registry: &Registry) -> Verdict {
 mod tests {
     use super::*;
     use crate::frontmatter;
+    use crate::types::Registry;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn registry_with(name: &str, schema: serde_json::Value) -> Registry {
-        // Unique dir per call — tests run in parallel, so a shared path races
-        // (one test's remove_dir_all vs another's read).
-        use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir()
-            .join(format!("trove-test-{}-{}", std::process::id(), n));
+        let dir = std::env::temp_dir().join(format!("trove-vtest-{}-{}", std::process::id(), n));
         let types = dir.join(".types");
         std::fs::create_dir_all(&types).unwrap();
         std::fs::write(
@@ -95,13 +74,16 @@ mod tests {
         let reg = registry_with(
             "person",
             serde_json::json!({
+                "globs": ["*.md"],
                 "type": "object",
                 "required": ["type"],
-                "properties": { "dob": { "type": "string" } }
+                "properties": { "type": {"const": "person"}, "dob": { "type": "string" } }
             }),
         );
         let doc = frontmatter::parse("---\ntype: person\ndob: \"2010-06-23\"\n---\n").unwrap();
-        assert_eq!(validate(&doc, &reg), Verdict::Valid);
+        let schemas = reg.select(std::path::Path::new("Rebekah.md"), Some("person"));
+        assert_eq!(schemas.len(), 1);
+        assert!(validate_against(&doc.frontmatter, schemas[0]).is_ok());
     }
 
     #[test]
@@ -109,12 +91,13 @@ mod tests {
         let reg = registry_with(
             "person",
             serde_json::json!({
+                "globs": ["*.md"],
                 "type": "object",
-                "properties": { "dob": { "type": "string" } }
+                "properties": { "type": {"const": "person"}, "dob": { "type": "string" } }
             }),
         );
-        // dob parses as an integer-ish scalar, not a string.
         let doc = frontmatter::parse("---\ntype: person\ndob: 42\n---\n").unwrap();
-        assert!(matches!(validate(&doc, &reg), Verdict::Invalid(_)));
+        let schemas = reg.select(std::path::Path::new("Bad.md"), Some("person"));
+        assert!(validate_against(&doc.frontmatter, schemas[0]).is_err());
     }
 }

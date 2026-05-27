@@ -15,6 +15,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 jsonschema = "0.18"
+globset = "0.4"
 walkdir = "2"
 anyhow = "1"
 colored = "2"
