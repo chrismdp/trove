@@ -81,6 +81,21 @@ enum Command {
         #[arg(long)]
         watch: Option<u64>,
     },
+
+    /// Semantic search over file contents: embed the query, then rank chunks by
+    /// cosine similarity. Needs only the embeddings DB + OPENAI_API_KEY — no
+    /// libjfs, no mount (search reads Postgres, not the filesystem).
+    #[cfg(feature = "mount")]
+    Search {
+        /// The natural-language query.
+        query: String,
+        /// Postgres URL for the embeddings DB (the version chain DB).
+        #[arg(long)]
+        versions_db: String,
+        /// How many results to return.
+        #[arg(short = 'k', long, default_value_t = 10)]
+        top_k: i64,
+    },
 }
 
 fn main() -> ExitCode {
@@ -171,6 +186,34 @@ fn run() -> Result<usize> {
                     Ok(0)
                 }
             }
+        }
+
+        #[cfg(feature = "mount")]
+        Command::Search { query, versions_db, top_k } => {
+            let api_key = std::env::var("OPENAI_API_KEY")
+                .map_err(|_| anyhow::anyhow!("OPENAI_API_KEY not set"))?;
+            let literal = trove::embed::embed_query_literal(&api_key, &query)?;
+            let mut versions = trove::version::VersionStore::connect(&versions_db)?;
+            let hits = versions.search_chunks(&literal, top_k)?;
+            if hits.is_empty() {
+                println!("{} no matches for {query:?}", "trove:".bold());
+                return Ok(0);
+            }
+            println!(
+                "{} {} result(s) for {query:?}",
+                "trove:".bold(),
+                hits.len()
+            );
+            for h in &hits {
+                // cosine similarity reads better than distance for a human.
+                let score = format!("{:.3}", 1.0 - h.distance);
+                let where_ = match &h.heading {
+                    Some(h) => format!("{} {}", "›".dimmed(), h),
+                    None => String::new(),
+                };
+                println!("  {}  {} {where_}", score.green(), h.path.bold());
+            }
+            Ok(0)
         }
     }
 }

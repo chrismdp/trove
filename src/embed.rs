@@ -158,6 +158,16 @@ pub fn embed_content(
     Ok(rows.len())
 }
 
+/// Embed a search query into a pgvector text literal, ready to hand straight to
+/// [`crate::version::VersionStore::search_chunks`]. Uses the SAME model as the
+/// stored chunks — search only works if query and corpus share a vector space.
+/// A query is one short text, so this is a single one-element OpenAI request.
+pub fn embed_query_literal(api_key: &str, query: &str) -> Result<String> {
+    let mut v = embed_texts(api_key, &[query.to_string()])?;
+    let emb = v.pop().context("OpenAI returned no embedding for the query")?;
+    Ok(vector_literal(&emb))
+}
+
 /// Embed one blob by reading its bytes from the version clone via libjfs, then
 /// [`embed_content`]. The cron/backfill path (no write buffer to hand).
 pub fn embed_blob(fs: &Fs, versions: &mut VersionStore, api_key: &str, hash: &str) -> Result<usize> {

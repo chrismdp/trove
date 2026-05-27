@@ -169,6 +169,59 @@ impl VersionStore {
     }
 }
 
+/// One semantic-search hit: the best-matching chunk of a file, with where it
+/// sits in the file (heading + byte range, for deep-linking) and how close it
+/// is to the query. `distance` is pgvector cosine distance in `[0, 2]` — lower
+/// is nearer; `1 - distance` is cosine similarity.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchHit {
+    pub path: String,
+    pub heading: Option<String>,
+    pub start_byte: i32,
+    pub end_byte: i32,
+    pub distance: f64,
+}
+
+impl VersionStore {
+    /// Semantic search over embedded chunks: the `top_k` chunks nearest to a
+    /// query vector by cosine distance, each resolved to the file that holds it.
+    ///
+    /// `query_literal` is the query embedding as a pgvector text literal
+    /// (`"[0.1,0.2,…]"`), built by [`crate::embed::embed_query_literal`]. The
+    /// ORDER BY casts both sides to `halfvec(3072)` to match the
+    /// `blob_chunks_embedding_hnsw` index expression, so the ANN index is used.
+    ///
+    /// A blob is content-addressed and can back several paths (dedup); the
+    /// lateral picks the highest-rev path that references it — i.e. the most
+    /// recent file to hold that exact content. Sentinel rows (null embedding,
+    /// from binary/blank blobs) are skipped.
+    pub fn search_chunks(&mut self, query_literal: &str, top_k: i64) -> Result<Vec<SearchHit>> {
+        let rows = self.client.query(
+            "select fv.path, c.heading, c.start_byte, c.end_byte, \
+                    c.embedding::halfvec(3072) <=> $1::text::halfvec(3072) as distance \
+             from blob_chunks c \
+             join lateral ( \
+                 select path from file_versions where blob_hash = c.blob_hash \
+                 order by rev desc limit 1 \
+             ) fv on true \
+             where c.embedding is not null \
+             order by c.embedding::halfvec(3072) <=> $1::text::halfvec(3072) \
+             limit $2",
+            &[&query_literal, &top_k],
+        )?;
+        Ok(rows
+            .iter()
+            .map(|r| SearchHit {
+                path: r.get(0),
+                heading: r.get(1),
+                start_byte: r.get(2),
+                end_byte: r.get(3),
+                distance: r.get(4),
+            })
+            .collect())
+    }
+}
+
 /// Lowercase hex sha256 — the blob content-address.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
