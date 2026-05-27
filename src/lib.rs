@@ -8,6 +8,7 @@ pub mod commands;
 pub mod frontmatter;
 pub mod types;
 pub mod validate;
+pub mod version;
 
 /// JuiceFS storage binding (libjfs FFI). Behind the `mount` feature so the
 /// core crate has no native dependency.
