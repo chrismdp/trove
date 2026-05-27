@@ -28,6 +28,3 @@ pub mod embed;
 #[cfg(feature = "mount")]
 pub mod mount;
 
-/// `trove demo-seed`: plant a fixed, reproducible corpus for search demos.
-#[cfg(feature = "mount")]
-pub mod demo;

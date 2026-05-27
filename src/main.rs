@@ -102,14 +102,6 @@ enum Command {
         top_k: i64,
     },
 
-    /// Plant a fixed demo corpus (5 single-topic docs) so `trove search`
-    /// returns clean, reproducible results. Needs the DB + OPENAI_API_KEY only.
-    #[cfg(feature = "mount")]
-    DemoSeed {
-        #[arg(long)]
-        versions_db: Option<String>,
-    },
-
     /// Serve a single-tenant, read-only HTTP view of the store (file list +
     /// semantic search + raw file content). Binds 127.0.0.1 only; front with
     /// nginx for external access. Needs the version DB, libjfs, and OPENAI_API_KEY.
@@ -387,15 +379,6 @@ fn run() -> Result<usize> {
                 };
                 println!("  {}  {} {where_}", score.green(), h.path.bold());
             }
-            Ok(0)
-        }
-
-        #[cfg(feature = "mount")]
-        Command::DemoSeed { versions_db } => {
-            let api_key = openai_key()?;
-            let mut versions = connect_versions(versions_db, &cfg)?;
-            let n = trove::demo::seed(&mut versions, &api_key)?;
-            println!("{} seeded {n} demo doc(s) under /demo/", "trove:".bold());
             Ok(0)
         }
 
