@@ -9,6 +9,11 @@ license-file = "LICENSE.md"
 name = "trove"
 path = "src/main.rs"
 
+[features]
+# `mount` pulls in the JuiceFS-backed FUSE filesystem (links libjfs). Kept
+# behind a feature so `trove check` and the validator build with no native deps.
+mount = []
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
