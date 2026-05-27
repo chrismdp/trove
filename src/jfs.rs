@@ -34,6 +34,10 @@ impl FileInfo {
     pub fn is_dir(&self) -> bool {
         self.mode & 0o170000 == 0o040000
     }
+    /// POSIX `S_ISLNK` on the mode bits.
+    pub fn is_symlink(&self) -> bool {
+        self.mode & 0o170000 == 0o120000
+    }
 }
 
 /// One directory entry from `readdir` — enough for FUSE `readdir` to report a
@@ -46,6 +50,9 @@ pub struct DirEntry {
 impl DirEntry {
     pub fn is_dir(&self) -> bool {
         self.mode & 0o170000 == 0o040000
+    }
+    pub fn is_symlink(&self) -> bool {
+        self.mode & 0o170000 == 0o120000
     }
 }
 
@@ -72,7 +79,19 @@ extern "C" {
     fn jfs_rmdir(pid: i64, h: i64, path: *const c_char) -> c_int;
     fn jfs_unlink(pid: i64, h: i64, path: *const c_char) -> c_int;
     fn jfs_stat(pid: i64, h: i64, path: *const c_char, info: *mut FileInfo) -> c_int;
+    fn jfs_lstat(pid: i64, h: i64, path: *const c_char, info: *mut FileInfo) -> c_int;
     fn jfs_rename(pid: i64, h: i64, oldpath: *const c_char, newpath: *const c_char) -> c_int;
+    fn jfs_chmod(pid: i64, h: i64, path: *const c_char, mode: u32) -> c_int;
+    fn jfs_chown(pid: i64, h: i64, path: *const c_char, uid: u32, gid: u32) -> c_int;
+    // mtime/atime in milliseconds; -1 leaves a field unchanged.
+    fn jfs_utime(pid: i64, h: i64, path: *const c_char, mtime: i64, atime: i64) -> c_int;
+    fn jfs_truncate(pid: i64, h: i64, path: *const c_char, length: u64) -> c_int;
+    fn jfs_access(pid: i64, h: i64, path: *const c_char, flags: i64) -> c_int;
+    fn jfs_symlink(pid: i64, h: i64, target: *const c_char, link: *const c_char) -> c_int;
+    fn jfs_readlink(pid: i64, h: i64, link: *const c_char, buf: usize, bufsize: c_int) -> c_int;
+    fn jfs_link(pid: i64, h: i64, src: *const c_char, dst: *const c_char) -> c_int;
+    // Writes a 16-byte native-endian buffer: u64 total, u64 avail (bytes).
+    fn jfs_statvfs(pid: i64, h: i64, buf: usize) -> c_int;
     // Allocates `*buf` with C `malloc` (caller frees). Per entry, big-endian:
     // u16 name_len, name bytes, then 44 bytes of stat beginning with u32 mode.
     fn jfs_listdir2(
@@ -187,6 +206,16 @@ impl Fs {
         Ok(info)
     }
 
+    /// Like `stat`, but does NOT follow a final symlink (POSIX `lstat`). The
+    /// FUSE layer reports attributes with this so a symlink shows as `S_IFLNK`
+    /// (the kernel resolves links itself via `readlink`).
+    pub fn lstat(&self, path: &str) -> Result<FileInfo> {
+        let cpath = cs(path)?;
+        let mut info = FileInfo::default();
+        check(unsafe { jfs_lstat(PID, self.handle, cpath.as_ptr(), &mut info) }, "lstat")?;
+        Ok(info)
+    }
+
     /// Does a path exist in the volume?
     pub fn exists(&self, path: &str) -> bool {
         self.stat(path).is_ok()
@@ -237,6 +266,71 @@ impl Fs {
         let (old, new) = (cs(oldpath)?, cs(newpath)?);
         check(unsafe { jfs_rename(PID, self.handle, old.as_ptr(), new.as_ptr()) }, "rename")?;
         Ok(())
+    }
+
+    pub fn chmod(&self, path: &str, mode: u32) -> Result<()> {
+        let cpath = cs(path)?;
+        check(unsafe { jfs_chmod(PID, self.handle, cpath.as_ptr(), mode) }, "chmod")?;
+        Ok(())
+    }
+
+    pub fn chown(&self, path: &str, uid: u32, gid: u32) -> Result<()> {
+        let cpath = cs(path)?;
+        check(unsafe { jfs_chown(PID, self.handle, cpath.as_ptr(), uid, gid) }, "chown")?;
+        Ok(())
+    }
+
+    /// Set mtime/atime in milliseconds; pass `-1` to leave a field unchanged.
+    pub fn utime(&self, path: &str, mtime_ms: i64, atime_ms: i64) -> Result<()> {
+        let cpath = cs(path)?;
+        check(unsafe { jfs_utime(PID, self.handle, cpath.as_ptr(), mtime_ms, atime_ms) }, "utime")?;
+        Ok(())
+    }
+
+    pub fn truncate(&self, path: &str, length: u64) -> Result<()> {
+        let cpath = cs(path)?;
+        check(unsafe { jfs_truncate(PID, self.handle, cpath.as_ptr(), length) }, "truncate")?;
+        Ok(())
+    }
+
+    pub fn access(&self, path: &str, mask: i64) -> Result<()> {
+        let cpath = cs(path)?;
+        check(unsafe { jfs_access(PID, self.handle, cpath.as_ptr(), mask) }, "access")?;
+        Ok(())
+    }
+
+    pub fn symlink(&self, target: &str, link: &str) -> Result<()> {
+        let (t, l) = (cs(target)?, cs(link)?);
+        check(unsafe { jfs_symlink(PID, self.handle, t.as_ptr(), l.as_ptr()) }, "symlink")?;
+        Ok(())
+    }
+
+    pub fn link(&self, src: &str, dst: &str) -> Result<()> {
+        let (s, d) = (cs(src)?, cs(dst)?);
+        check(unsafe { jfs_link(PID, self.handle, s.as_ptr(), d.as_ptr()) }, "link")?;
+        Ok(())
+    }
+
+    /// Read a symlink's target.
+    pub fn readlink(&self, path: &str) -> Result<String> {
+        let cpath = cs(path)?;
+        let mut buf = vec![0u8; 4096];
+        let n = check(
+            unsafe { jfs_readlink(PID, self.handle, cpath.as_ptr(), buf.as_mut_ptr() as usize, buf.len() as c_int) },
+            "readlink",
+        )? as usize;
+        buf.truncate(n);
+        Ok(String::from_utf8_lossy(&buf).into_owned())
+    }
+
+    /// `(total, available)` bytes for the volume.
+    pub fn statvfs(&self) -> Result<(u64, u64)> {
+        let mut buf = [0u8; 16];
+        check(unsafe { jfs_statvfs(PID, self.handle, buf.as_mut_ptr() as usize) }, "statvfs")?;
+        // Native-endian (little-endian on our target).
+        let total = u64::from_ne_bytes(buf[0..8].try_into().unwrap());
+        let avail = u64::from_ne_bytes(buf[8..16].try_into().unwrap());
+        Ok((total, avail))
     }
 
     /// List a directory's entries (excludes `.`/`..`). Uses `jfs_listdir2`,

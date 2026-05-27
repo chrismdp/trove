@@ -235,6 +235,85 @@ fn rename_onto_governed_path_is_gated() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn posix_passthrough_chmod_truncate_symlink_rmdir() {
+    use std::os::unix::fs::PermissionsExt;
+    let (fs, dir) = fresh_fs("posix");
+    let mountpoint = dir.join("mnt");
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    let session = mount::spawn(fs, Registry::empty(), &mountpoint).expect("mount");
+    wait_mounted(&mountpoint);
+
+    // chmod
+    let f = mountpoint.join("f.md");
+    std::fs::write(&f, "data").unwrap();
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    assert_eq!(
+        std::fs::metadata(&f).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    // truncate (ungoverned → straight through)
+    let fh = std::fs::OpenOptions::new().write(true).open(&f).unwrap();
+    fh.set_len(2).expect("truncate");
+    drop(fh);
+    assert_eq!(std::fs::read(&f).unwrap(), b"da");
+
+    // rmdir
+    std::fs::create_dir(mountpoint.join("d")).unwrap();
+    std::fs::remove_dir(mountpoint.join("d")).expect("rmdir");
+    assert!(!mountpoint.join("d").exists());
+
+    // symlink + readlink (lstat reports S_IFLNK; the kernel resolves the link)
+    std::os::unix::fs::symlink("f.md", mountpoint.join("link")).expect("symlink");
+    let lmeta = std::fs::symlink_metadata(mountpoint.join("link")).unwrap();
+    assert!(lmeta.file_type().is_symlink(), "entry must report as a symlink");
+    assert_eq!(
+        std::fs::read_link(mountpoint.join("link")).expect("readlink"),
+        std::path::Path::new("f.md")
+    );
+    // following the link reads the target's content
+    assert_eq!(std::fs::read(mountpoint.join("link")).unwrap(), b"da");
+
+    drop(session);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `truncate` on a governed file is a write in disguise — if the truncated
+/// content no longer validates, it must be rejected like any other bad write.
+#[test]
+fn truncate_on_governed_file_is_gated() {
+    let (fs, dir) = fresh_fs("trunc");
+    let schema_root = dir.join("schemas");
+    std::fs::create_dir_all(schema_root.join(".types")).unwrap();
+    std::fs::write(schema_root.join(".types/person.json"), PERSON_SCHEMA).unwrap();
+    let registry = Registry::load(&schema_root).unwrap();
+
+    let mountpoint = dir.join("mnt");
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    let session = mount::spawn(fs, registry, &mountpoint).expect("mount");
+    wait_mounted(&mountpoint);
+    std::fs::create_dir(mountpoint.join("people")).unwrap();
+
+    let p = mountpoint.join("people/p.md");
+    std::fs::write(&p, "---\ntype: person\nage: 30\n---\nbody\n").unwrap();
+
+    // Truncating mid-frontmatter leaves an unclosed `---` fence — a parse error
+    // on a governed path, i.e. invalid. Must be rejected. (Truncating to 0 would
+    // be *allowed*: an empty file is merely untyped, not an invalid person.)
+    let fh = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+    assert!(
+        fh.set_len(20).is_err(),
+        "a truncate that invalidates a governed file must be rejected"
+    );
+    drop(fh);
+    // Original content survives the rejected truncate.
+    assert!(std::fs::read_to_string(&p).unwrap().contains("age: 30"));
+
+    drop(session);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 const PERSON_SCHEMA: &str = r#"{
     "globs": ["people/*.md"],
     "type": "object",

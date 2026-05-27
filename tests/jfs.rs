@@ -152,6 +152,30 @@ fn rename_moves_a_file() {
 }
 
 #[test]
+fn chmod_truncate_symlink_statvfs() {
+    let v = TestVol::new("posix");
+    let fs = v.open();
+    let f = fs.create("/x.md", 0o644).unwrap();
+    f.write_at(b"hello world", 0).unwrap();
+    f.fsync().unwrap();
+    drop(f);
+
+    fs.chmod("/x.md", 0o600).unwrap();
+    assert_eq!(fs.stat("/x.md").unwrap().mode & 0o777, 0o600);
+
+    fs.truncate("/x.md", 5).unwrap();
+    assert_eq!(fs.stat("/x.md").unwrap().length, 5);
+
+    fs.symlink("/x.md", "/lnk").unwrap();
+    // JuiceFS normalises the stored target (drops the leading slash).
+    assert!(fs.readlink("/lnk").unwrap().ends_with("x.md"));
+
+    let (total, avail) = fs.statvfs().unwrap();
+    assert!(total > 0, "statvfs total should be positive, got {total}");
+    let _ = avail;
+}
+
+#[test]
 fn readdir_lists_entries_with_types() {
     let v = TestVol::new("readdir");
     let fs = v.open();

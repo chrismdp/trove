@@ -19,8 +19,8 @@ use crate::types::Registry;
 use fuser::{
     BackgroundSession, BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem,
     FopenFlags, Generation, INodeNo, LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyCreate,
-    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, RenameFlags, Request,
-    TimeOrNow, WriteFlags,
+    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite,
+    RenameFlags, Request, TimeOrNow, WriteFlags,
 };
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -266,6 +266,17 @@ impl TroveFs {
     }
 }
 
+/// Epoch milliseconds for a FUSE time-set request (`libjfs` wants millis).
+fn to_millis(t: TimeOrNow) -> i64 {
+    let st = match t {
+        TimeOrNow::SpecificTime(s) => s,
+        TimeOrNow::Now => SystemTime::now(),
+    };
+    st.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// Synthesise attributes for a regular file of `size` bytes that exists only in
 /// a handle buffer (created but not yet committed to `jfs`).
 fn synth_attr(ino: u64, size: u64) -> FileAttr {
@@ -305,6 +316,8 @@ fn to_attr(ino: u64, fi: &FileInfo) -> FileAttr {
         crtime: when(fi.ctime),
         kind: if fi.is_dir() {
             FileType::Directory
+        } else if fi.is_symlink() {
+            FileType::Symlink
         } else {
             FileType::RegularFile
         },
@@ -325,7 +338,8 @@ impl Filesystem for TroveFs {
             reply.error(Errno::EINVAL);
             return;
         };
-        match g.fs.stat(&path) {
+        // lstat, not stat: report a symlink as a symlink (the kernel follows it).
+        match g.fs.lstat(&path) {
             Ok(fi) => {
                 let ino = g.intern(&path);
                 reply.entry(&TTL, &to_attr(ino, &fi), Generation(0));
@@ -346,7 +360,7 @@ impl Filesystem for TroveFs {
             reply.error(Errno::ENOENT);
             return;
         };
-        match g.fs.stat(&path) {
+        match g.fs.lstat(&path) {
             Ok(fi) => reply.attr(&TTL, &to_attr(ino.0, &fi)),
             Err(_) => match g.inflight_size(&path) {
                 Some(size) => reply.attr(&TTL, &synth_attr(ino.0, size)),
@@ -653,6 +667,8 @@ impl Filesystem for TroveFs {
         for d in des {
             let kind = if d.is_dir() {
                 FileType::Directory
+            } else if d.is_symlink() {
+                FileType::Symlink
             } else {
                 FileType::RegularFile
             };
@@ -729,19 +745,22 @@ impl Filesystem for TroveFs {
         }
     }
 
-    /// Minimal setattr: we don't yet apply mode/size changes; report current
-    /// attrs so tools that probe attributes don't fail.
+    /// Apply attribute changes by delegating to `jfs` — `chmod`, `chown`,
+    /// `utimens`, and `truncate`. The one gate concern: **`truncate` on a
+    /// governed file is a write in disguise**, so the resulting (shrunk/extended)
+    /// content is validated first; invalid → `EINVAL` + `.errors` sidecar, no
+    /// change. Everything else is a faithful pass-through.
     #[allow(clippy::too_many_arguments)]
     fn setattr(
         &self,
         _req: &Request,
         ino: INodeNo,
-        _mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
-        _size: Option<u64>,
-        _atime: Option<TimeOrNow>,
-        _mtime: Option<TimeOrNow>,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
         _fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
@@ -755,13 +774,142 @@ impl Filesystem for TroveFs {
             reply.error(Errno::ENOENT);
             return;
         };
-        match g.fs.stat(&path) {
+
+        if let Some(mode) = mode {
+            if g.fs.chmod(&path, mode & 0o7777).is_err() {
+                reply.error(Errno::EIO);
+                return;
+            }
+        }
+        if uid.is_some() || gid.is_some() {
+            // jfs_chown sets both; fill the unspecified half from current attrs.
+            let cur = g.fs.lstat(&path).ok();
+            let u = uid.or(cur.map(|f| f.uid)).unwrap_or(0);
+            let gg = gid.or(cur.map(|f| f.gid)).unwrap_or(0);
+            let _ = g.fs.chown(&path, u, gg);
+        }
+        if atime.is_some() || mtime.is_some() {
+            let m = mtime.map(to_millis).unwrap_or(-1);
+            let a = atime.map(to_millis).unwrap_or(-1);
+            let _ = g.fs.utime(&path, m, a);
+        }
+        if let Some(new_len) = size {
+            let rel = Path::new(path.strip_prefix('/').unwrap_or(&path));
+            if g.registry.may_govern(rel) {
+                let mut content = g.fs.read_all(&path).unwrap_or_default();
+                content.resize(new_len as usize, 0); // shrink or zero-extend
+                if let Err(report) = g.validate(&path, &content) {
+                    let _ = g
+                        .fs
+                        .write_all(&format!("{path}.errors"), report.as_bytes(), 0o644);
+                    reply.error(Errno::EINVAL);
+                    return;
+                }
+            }
+            if g.fs.truncate(&path, new_len).is_err() {
+                reply.error(Errno::EIO);
+                return;
+            }
+        }
+
+        match g.fs.lstat(&path) {
             Ok(fi) => reply.attr(&TTL, &to_attr(ino.0, &fi)),
             Err(_) => match g.inflight_size(&path) {
-                Some(size) => reply.attr(&TTL, &synth_attr(ino.0, size)),
+                Some(sz) => reply.attr(&TTL, &synth_attr(ino.0, sz)),
                 None => reply.error(Errno::ENOENT),
             },
         }
+    }
+
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let mut g = self.inner.lock().unwrap();
+        let Some(path) = g.child_path(parent.0, name) else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        match g.fs.rmdir(&path) {
+            Ok(()) => {
+                g.forget_path(&path);
+                reply.ok();
+            }
+            // Likely ENOTEMPTY or ENOENT; errno fidelity is a follow-up (the
+            // jfs wrapper currently flattens the code).
+            Err(_) => reply.error(Errno::ENOTEMPTY),
+        }
+    }
+
+    fn symlink(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        link_name: &OsStr,
+        target: &Path,
+        reply: ReplyEntry,
+    ) {
+        let mut g = self.inner.lock().unwrap();
+        let (Some(link), Some(target)) = (g.child_path(parent.0, link_name), target.to_str())
+        else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        match g.fs.symlink(target, &link) {
+            Ok(()) => {
+                let ino = g.intern(&link);
+                // lstat so the new entry is reported as a symlink, not its target.
+                match g.fs.lstat(&link) {
+                    Ok(fi) => reply.entry(&TTL, &to_attr(ino, &fi), Generation(0)),
+                    Err(_) => reply.error(Errno::EIO),
+                }
+            }
+            Err(_) => reply.error(Errno::EIO),
+        }
+    }
+
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        let g = self.inner.lock().unwrap();
+        let Some(path) = g.path_of(ino.0) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        match g.fs.readlink(&path) {
+            Ok(target) => reply.data(target.as_bytes()),
+            Err(_) => reply.error(Errno::EINVAL),
+        }
+    }
+
+    fn link(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        newparent: INodeNo,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        let mut g = self.inner.lock().unwrap();
+        let (Some(src), Some(dst)) = (g.path_of(ino.0), g.child_path(newparent.0, newname)) else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        match g.fs.link(&src, &dst) {
+            Ok(()) => {
+                let new_ino = g.intern(&dst);
+                match g.fs.lstat(&dst) {
+                    Ok(fi) => reply.entry(&TTL, &to_attr(new_ino, &fi), Generation(0)),
+                    Err(_) => reply.error(Errno::EIO),
+                }
+            }
+            Err(_) => reply.error(Errno::EIO),
+        }
+    }
+
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
+        let g = self.inner.lock().unwrap();
+        let (total, avail) = g.fs.statvfs().unwrap_or((0, 0));
+        const BSIZE: u64 = 4096;
+        let blocks = total / BSIZE;
+        let free = avail / BSIZE;
+        // files/ffree are unknown for an object-backed FS — report 0.
+        reply.statfs(blocks, free, free, 0, 0, BSIZE as u32, 255, BSIZE as u32);
     }
 }
 
