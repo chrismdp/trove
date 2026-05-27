@@ -175,6 +175,143 @@ fn chmod_truncate_symlink_statvfs() {
     let _ = avail;
 }
 
+// --- Concurrency spike (step 5) -------------------------------------------
+//
+// The `mount` layer currently serialises every libjfs call behind one global
+// `Mutex`, holding it across the whole commit (validate + write). Before
+// versioning piles more work onto that same barrier, we need to know whether
+// the lock is load-bearing or can drop to per-inode. libjfs is the same C ABI
+// the Java/Python SDKs drive concurrently, so it *should* be safe under
+// parallel callers — these tests prove it against the real volume and lock in
+// the property `mount` will rely on: parallel ops on DISTINCT files are safe
+// and data-correct from many OS threads sharing one `Fs` handle.
+
+use std::sync::Arc;
+use std::thread;
+
+#[test]
+fn concurrent_distinct_files_are_safe_and_correct() {
+    let v = TestVol::new("conc-distinct");
+    let fs = Arc::new(v.open());
+
+    // Many threads, each hammering its own files for several iterations. If
+    // libjfs were unsafe under parallel callers this crashes (process abort)
+    // or returns corrupt/short data; if data is correct on every round-trip,
+    // distinct-file parallelism is safe.
+    const THREADS: usize = 16;
+    const ITERS: usize = 25;
+
+    let handles: Vec<_> = (0..THREADS)
+        .map(|t| {
+            let fs = Arc::clone(&fs);
+            thread::spawn(move || {
+                for i in 0..ITERS {
+                    let path = format!("/t{t}-{i}.md");
+                    // Distinct payload per (thread, iter) so a cross-file leak
+                    // or torn write would show as a mismatch.
+                    let payload = format!("thread {t} iter {i} {}", "x".repeat(t * 7 + i));
+                    let bytes = payload.as_bytes();
+
+                    let f = fs.create(&path, 0o644).unwrap();
+                    let mut off = 0i64;
+                    while (off as usize) < bytes.len() {
+                        off += f.write_at(&bytes[off as usize..], off).unwrap() as i64;
+                    }
+                    f.fsync().unwrap();
+                    drop(f);
+
+                    let got = fs.read_all(&path).unwrap();
+                    assert_eq!(got, bytes, "round-trip mismatch on {path}");
+                    fs.unlink(&path).unwrap();
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().expect("worker thread panicked — libjfs not safe under parallel callers");
+    }
+}
+
+#[test]
+fn concurrent_readers_of_one_file_see_consistent_data() {
+    let v = TestVol::new("conc-readers");
+    let fs = Arc::new(v.open());
+
+    let payload = b"the same bytes seen by every concurrent reader".to_vec();
+    let f = fs.create("/shared.md", 0o644).unwrap();
+    f.write_at(&payload, 0).unwrap();
+    f.fsync().unwrap();
+    drop(f);
+
+    // Many threads reading the same committed file in parallel must each see
+    // the full, identical contents (read-only sharing — what `mount` does for
+    // ungoverned/read opens with no lock).
+    let handles: Vec<_> = (0..24)
+        .map(|_| {
+            let fs = Arc::clone(&fs);
+            let expect = payload.clone();
+            thread::spawn(move || {
+                for _ in 0..50 {
+                    assert_eq!(fs.read_all("/shared.md").unwrap(), expect);
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().expect("reader thread panicked");
+    }
+}
+
+#[test]
+fn same_file_writers_need_per_inode_serialisation_then_last_writer_wins() {
+    // SPIKE FINDING (pinned here): `Fs::write_all` is NOT internally safe for
+    // concurrent writers to the SAME path. Its unlink-then-create sequence
+    // races — two unlocked writers interleave as unlink/unlink/create/create
+    // and the second `create` fails with EEXIST (errno 17). The `mount`
+    // layer's global `Mutex` currently masks this; once that lock relaxes to
+    // per-inode (justified by `concurrent_distinct_files_*`), the per-inode
+    // lock STILL serialises same-path writers, so the race cannot occur and
+    // the commit barrier remains correct. This test models that per-inode lock
+    // and asserts the property mount then guarantees: clean last-writer-wins,
+    // never a torn interleave.
+    let v = TestVol::new("conc-samefile");
+    let fs = Arc::new(v.open());
+    // Stands in for mount's per-inode lock: one lock per path.
+    let inode_lock = Arc::new(std::sync::Mutex::new(()));
+
+    const THREADS: usize = 8;
+    // Equal-length payloads so a torn write would still be utf-8 but fail the
+    // exact-membership check below.
+    let payloads: Vec<String> = (0..THREADS).map(|t| format!("writer-{t:03}-payload-body")).collect();
+
+    let handles: Vec<_> = payloads
+        .iter()
+        .cloned()
+        .map(|p| {
+            let fs = Arc::clone(&fs);
+            let lock = Arc::clone(&inode_lock);
+            thread::spawn(move || {
+                for _ in 0..30 {
+                    let _g = lock.lock().unwrap(); // per-inode serialisation
+                    fs.write_all("/contended.md", p.as_bytes(), 0o644).unwrap();
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().expect("writer thread panicked under per-inode serialisation");
+    }
+
+    // Whatever survived must be exactly one writer's payload — not a splice.
+    let final_bytes = fs.read_all("/contended.md").unwrap();
+    let final_str = String::from_utf8(final_bytes).expect("committed file is valid utf-8");
+    assert!(
+        payloads.contains(&final_str),
+        "committed file is a torn interleave, not a single writer's payload: {final_str:?}"
+    );
+}
+
 #[test]
 fn readdir_lists_entries_with_types() {
     let v = TestVol::new("readdir");
