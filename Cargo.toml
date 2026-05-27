@@ -1,0 +1,20 @@
+[package]
+name = "trove"
+version = "0.1.0"
+edition = "2021"
+description = "A filesystem that talks back — schema-on-write validation for markdown+frontmatter knowledge stores"
+license-file = "LICENSE.md"
+
+[[bin]]
+name = "trove"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+jsonschema = "0.18"
+walkdir = "2"
+anyhow = "1"
+colored = "2"

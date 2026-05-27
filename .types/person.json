@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Person",
+  "description": "A person note. Lenient by design — only the shape we actually rely on is enforced, so the messy real vault validates and we tighten over time.",
+  "type": "object",
+  "required": ["type"],
+  "properties": {
+    "type": { "const": "person" },
+    "aliases": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "dob": {
+      "type": "string",
+      "description": "ISO date YYYY-MM-DD. Quote it in YAML so it stays a string."
+    }
+  },
+  "additionalProperties": true
+}
