@@ -13,7 +13,7 @@ path = "src/main.rs"
 # `mount` pulls the substrate runtime: JuiceFS-backed FUSE (libjfs) + COW
 # version capture + the `trove embed` worker (ureq for the OpenAI call). Kept
 # behind a feature so `trove check` and the validator build with no native deps.
-mount = ["dep:fuser", "dep:libc", "dep:ureq"]
+mount = ["dep:fuser", "dep:libc", "dep:ureq", "dep:similar"]
 
 [dependencies]
 fuser = { version = "0.17", optional = true }
@@ -31,3 +31,4 @@ postgres = "0.19"
 sha2 = "0.10"
 hex = "0.4"
 ureq = { version = "2", features = ["json"], optional = true }
+similar = { version = "2", optional = true }

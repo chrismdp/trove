@@ -105,6 +105,65 @@ enum Command {
         #[arg(long)]
         versions_db: String,
     },
+
+    /// Show a path's version history, newest first. Needs only the version DB.
+    #[cfg(feature = "mount")]
+    Log {
+        /// Path within the volume (e.g. /people/alice.md).
+        path: String,
+        #[arg(long)]
+        versions_db: String,
+    },
+
+    /// Print a path's content at revision <rev> to stdout.
+    #[cfg(feature = "mount")]
+    Cat {
+        /// Path within the volume.
+        path: String,
+        /// Revision number (see `trove log`).
+        #[arg(long)]
+        rev: i32,
+        #[arg(long)]
+        volume: String,
+        #[arg(long)]
+        meta: String,
+        #[arg(long, default_value = "/tmp/trove-cache")]
+        cache: PathBuf,
+        #[arg(long)]
+        versions_db: String,
+    },
+
+    /// Unified line diff between two revisions of a path (rev_a -> rev_b).
+    #[cfg(feature = "mount")]
+    Diff {
+        path: String,
+        rev_a: i32,
+        rev_b: i32,
+        #[arg(long)]
+        volume: String,
+        #[arg(long)]
+        meta: String,
+        #[arg(long, default_value = "/tmp/trove-cache")]
+        cache: PathBuf,
+        #[arg(long)]
+        versions_db: String,
+    },
+
+    /// Restore a path to an earlier revision (recorded as a new revision, never
+    /// a silent overwrite).
+    #[cfg(feature = "mount")]
+    Restore {
+        path: String,
+        rev: i32,
+        #[arg(long)]
+        volume: String,
+        #[arg(long)]
+        meta: String,
+        #[arg(long, default_value = "/tmp/trove-cache")]
+        cache: PathBuf,
+        #[arg(long)]
+        versions_db: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -232,6 +291,60 @@ fn run() -> Result<usize> {
             let mut versions = trove::version::VersionStore::connect(&versions_db)?;
             let n = trove::demo::seed(&mut versions, &api_key)?;
             println!("{} seeded {n} demo doc(s) under /demo/", "trove:".bold());
+            Ok(0)
+        }
+
+        #[cfg(feature = "mount")]
+        Command::Log { path, versions_db } => {
+            let mut versions = trove::version::VersionStore::connect(&versions_db)?;
+            let entries = trove::commands::history::log(&mut versions, &path)?;
+            if entries.is_empty() {
+                println!("{} no versions for {path}", "trove:".bold());
+                return Ok(0);
+            }
+            println!("{} {} ({} revision(s))", "trove:".bold(), path, entries.len());
+            for v in &entries {
+                let author = v.author.as_deref().unwrap_or("—");
+                println!(
+                    "  {} {}  {} bytes  {}  {}",
+                    "rev".dimmed(),
+                    v.rev.to_string().bold(),
+                    v.size,
+                    author,
+                    &v.blob_hash[..12.min(v.blob_hash.len())].dimmed()
+                );
+            }
+            Ok(0)
+        }
+
+        #[cfg(feature = "mount")]
+        Command::Cat { path, rev, volume, meta, cache, versions_db } => {
+            use std::io::Write;
+            let fs = trove::jfs::Fs::init(&volume, &meta, &cache.to_string_lossy())?;
+            let mut versions = trove::version::VersionStore::connect(&versions_db)?;
+            let bytes = trove::commands::history::cat(&fs, &mut versions, &path, rev)?;
+            std::io::stdout().write_all(&bytes)?;
+            Ok(0)
+        }
+
+        #[cfg(feature = "mount")]
+        Command::Diff { path, rev_a, rev_b, volume, meta, cache, versions_db } => {
+            let fs = trove::jfs::Fs::init(&volume, &meta, &cache.to_string_lossy())?;
+            let mut versions = trove::version::VersionStore::connect(&versions_db)?;
+            let out = trove::commands::history::diff(&fs, &mut versions, &path, rev_a, rev_b)?;
+            print!("{out}");
+            Ok(0)
+        }
+
+        #[cfg(feature = "mount")]
+        Command::Restore { path, rev, volume, meta, cache, versions_db } => {
+            let fs = trove::jfs::Fs::init(&volume, &meta, &cache.to_string_lossy())?;
+            let mut versions = trove::version::VersionStore::connect(&versions_db)?;
+            let new_rev = trove::commands::history::restore(&fs, &mut versions, &path, rev)?;
+            println!(
+                "{} restored {path} to rev {rev} (recorded as new rev {new_rev})",
+                "trove:".bold()
+            );
             Ok(0)
         }
     }
