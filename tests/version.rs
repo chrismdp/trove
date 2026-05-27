@@ -68,6 +68,35 @@ fn identical_content_dedups_the_blob() {
 }
 
 #[test]
+fn cat_returns_the_content_at_each_revision() {
+    let mut s = store();
+    let path = unique_path("cat");
+    s.record(&path, b"first version body", None).unwrap();
+    s.record(&path, b"second version body", None).unwrap();
+
+    assert_eq!(s.cat(&path, 1).unwrap().as_deref(), Some(&b"first version body"[..]));
+    assert_eq!(s.cat(&path, 2).unwrap().as_deref(), Some(&b"second version body"[..]));
+    assert_eq!(s.cat(&path, 99).unwrap(), None);
+}
+
+#[test]
+fn pending_embeddings_surfaces_unembedded_blobs_with_content() {
+    let mut s = store();
+    let path = unique_path("embed");
+    // Unique content so this blob is distinguishable in the shared DB.
+    let content = format!("embed-me-{}", unique_path("c")).into_bytes();
+    let hash = sha256_hex(&content);
+    s.record(&path, &content, None).unwrap();
+
+    // Newly recorded blob has no embedding, so it must appear in the sweep with
+    // its bytes (what the worker feeds to OpenAI).
+    let pending = s.pending_embeddings(1000).unwrap();
+    let found = pending.iter().find(|(h, _)| h == &hash);
+    assert!(found.is_some(), "new blob should be pending embedding");
+    assert_eq!(found.unwrap().1, content);
+}
+
+#[test]
 fn log_of_unknown_path_is_empty() {
     let mut s = store();
     assert!(s.log(&unique_path("never-written")).unwrap().is_empty());

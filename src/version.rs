@@ -60,8 +60,9 @@ impl VersionStore {
 
         let mut tx = self.client.transaction()?;
         tx.execute(
-            "insert into blobs (hash, size) values ($1, $2) on conflict (hash) do nothing",
-            &[&hash, &size],
+            "insert into blobs (hash, size, content) values ($1, $2, $3) \
+             on conflict (hash) do nothing",
+            &[&hash, &size, &content],
         )?;
         let head: i32 = tx
             .query_one(
@@ -96,6 +97,29 @@ impl VersionStore {
                 author: r.get(4),
             })
             .collect())
+    }
+
+    /// The content of `path` at revision `rev` (for `trove cat <path>@<rev>` /
+    /// `diff` / `restore`). `None` if that (path, rev) has no version.
+    pub fn cat(&mut self, path: &str, rev: i32) -> Result<Option<Vec<u8>>> {
+        let rows = self.client.query(
+            "select b.content from file_versions v join blobs b on b.hash = v.blob_hash \
+             where v.path = $1 and v.rev = $2",
+            &[&path, &rev],
+        )?;
+        Ok(rows.first().map(|r| r.get::<_, Vec<u8>>(0)))
+    }
+
+    /// Blobs still awaiting an embedding, with their content — the embed
+    /// worker's sweep (the backstop behind the `blob_needs_embedding` NOTIFY).
+    /// Capped by `limit` so the worker batches. Returns `(hash, content)`.
+    pub fn pending_embeddings(&mut self, limit: i64) -> Result<Vec<(String, Vec<u8>)>> {
+        let rows = self.client.query(
+            "select hash, content from blobs where embedding is null \
+             order by created_at limit $1",
+            &[&limit],
+        )?;
+        Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
     }
 }
 
