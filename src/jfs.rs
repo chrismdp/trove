@@ -36,6 +36,19 @@ impl FileInfo {
     }
 }
 
+/// One directory entry from `readdir` — enough for FUSE `readdir` to report a
+/// name and whether it's a directory.
+pub struct DirEntry {
+    pub name: String,
+    pub mode: u32,
+}
+
+impl DirEntry {
+    pub fn is_dir(&self) -> bool {
+        self.mode & 0o170000 == 0o040000
+    }
+}
+
 #[link(name = "jfs-amd64")]
 extern "C" {
     fn jfs_init(
@@ -59,6 +72,17 @@ extern "C" {
     fn jfs_rmdir(pid: i64, h: i64, path: *const c_char) -> c_int;
     fn jfs_unlink(pid: i64, h: i64, path: *const c_char) -> c_int;
     fn jfs_stat(pid: i64, h: i64, path: *const c_char, info: *mut FileInfo) -> c_int;
+    fn jfs_rename(pid: i64, h: i64, oldpath: *const c_char, newpath: *const c_char) -> c_int;
+    // Allocates `*buf` with C `malloc` (caller frees). Per entry, big-endian:
+    // u16 name_len, name bytes, then 44 bytes of stat beginning with u32 mode.
+    fn jfs_listdir2(
+        pid: i64,
+        h: i64,
+        cpath: *const c_char,
+        plus: u8,
+        buf: *mut *mut u8,
+        size: *mut i64,
+    ) -> c_int;
 }
 
 /// libjfs takes a per-call pid for permission context; 0 is fine for our
@@ -207,6 +231,57 @@ impl Fs {
         f.fsync()?;
         Ok(())
     }
+
+    /// Rename/move within the volume.
+    pub fn rename(&self, oldpath: &str, newpath: &str) -> Result<()> {
+        let (old, new) = (cs(oldpath)?, cs(newpath)?);
+        check(unsafe { jfs_rename(PID, self.handle, old.as_ptr(), new.as_ptr()) }, "rename")?;
+        Ok(())
+    }
+
+    /// List a directory's entries (excludes `.`/`..`). Uses `jfs_listdir2`,
+    /// which mallocs the result buffer; we copy what we need and free it.
+    pub fn readdir(&self, path: &str) -> Result<Vec<DirEntry>> {
+        let cpath = cs(path)?;
+        let mut buf: *mut u8 = std::ptr::null_mut();
+        let mut size: i64 = 0;
+        let ret = unsafe { jfs_listdir2(PID, self.handle, cpath.as_ptr(), 1, &mut buf, &mut size) };
+        if ret < 0 {
+            bail!("readdir {path}: errno {}", -ret);
+        }
+        if buf.is_null() || size <= 0 {
+            return Ok(Vec::new());
+        }
+        let entries = {
+            let bytes = unsafe { std::slice::from_raw_parts(buf, size as usize) };
+            parse_listdir2(bytes)
+        };
+        unsafe { libc::free(buf as *mut std::ffi::c_void) };
+        Ok(entries)
+    }
+}
+
+/// Parse the big-endian `jfs_listdir2(plus=1)` buffer. Per entry: u16 name_len,
+/// name bytes, then a 44-byte stat block whose first field is the u32 mode.
+fn parse_listdir2(b: &[u8]) -> Vec<DirEntry> {
+    const STAT_LEN: usize = 44; // mode(4)+inode(8)+nlink(4)+uid(4)+gid(4)+length(8)+atime+mtime+ctime(4*3)
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + 2 <= b.len() {
+        let name_len = u16::from_be_bytes([b[i], b[i + 1]]) as usize;
+        i += 2;
+        if i + name_len + STAT_LEN > b.len() {
+            break; // truncated / malformed — stop rather than read OOB
+        }
+        let name = String::from_utf8_lossy(&b[i..i + name_len]).into_owned();
+        i += name_len;
+        let mode = u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+        i += STAT_LEN;
+        if name != "." && name != ".." {
+            out.push(DirEntry { name, mode });
+        }
+    }
+    out
 }
 
 /// An open file handle. Closes on drop. Must not outlive its `Fs` (the libjfs

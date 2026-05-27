@@ -19,8 +19,8 @@ use crate::types::Registry;
 use fuser::{
     BackgroundSession, BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem,
     FopenFlags, Generation, INodeNo, LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyCreate,
-    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
-    WriteFlags,
+    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, RenameFlags, Request,
+    TimeOrNow, WriteFlags,
 };
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -100,6 +100,25 @@ impl Inner {
     fn forget_path(&mut self, path: &str) {
         if let Some(ino) = self.path_to_ino.remove(path) {
             self.ino_to_path.remove(&ino);
+        }
+    }
+
+    /// Remap `old`'s inode to `new` after a rename. The kernel keeps using the
+    /// source's inode for the destination, so we must preserve that inode→path
+    /// mapping (POSIX semantics) — forgetting it would make the next op on the
+    /// renamed file fail to resolve a path. Any inode `new` previously held is
+    /// dropped.
+    fn rename_path(&mut self, old: &str, new: &str) {
+        match self.path_to_ino.remove(old) {
+            Some(ino) => {
+                self.ino_to_path.insert(ino, new.to_string());
+                if let Some(stale) = self.path_to_ino.insert(new.to_string(), ino) {
+                    if stale != ino {
+                        self.ino_to_path.remove(&stale);
+                    }
+                }
+            }
+            None => self.forget_path(new),
         }
     }
 
@@ -602,8 +621,9 @@ impl Filesystem for TroveFs {
         }
     }
 
-    /// Minimal: report `.` and `..` so the mount is navigable. Full directory
-    /// listing (jfs_listdir buffer protocol) is the next increment.
+    /// List a directory: `.`, `..`, then the real entries from jfs. `offset` is
+    /// a resume cookie — the kernel re-calls with the last value we handed back
+    /// when its buffer fills, so we emit `(index + 1)` as each entry's cookie.
     fn readdir(
         &self,
         _req: &Request,
@@ -612,11 +632,101 @@ impl Filesystem for TroveFs {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        if offset == 0 {
-            let _ = reply.add(ino, 1, FileType::Directory, ".");
-            let _ = reply.add(ino, 2, FileType::Directory, "..");
+        let mut g = self.inner.lock().unwrap();
+        let Some(path) = g.path_of(ino.0) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let des = match g.fs.readdir(&path) {
+            Ok(d) => d,
+            Err(_) => {
+                reply.error(Errno::ENOENT);
+                return;
+            }
+        };
+
+        // Build the full listing first (interning child inodes), then emit from
+        // `offset`. `..` reuses this inode since we don't track parents — benign.
+        let mut listing: Vec<(u64, FileType, String)> = Vec::with_capacity(des.len() + 2);
+        listing.push((ino.0, FileType::Directory, ".".to_string()));
+        listing.push((ino.0, FileType::Directory, "..".to_string()));
+        for d in des {
+            let kind = if d.is_dir() {
+                FileType::Directory
+            } else {
+                FileType::RegularFile
+            };
+            let child = if path == "/" {
+                format!("/{}", d.name)
+            } else {
+                format!("{}/{}", path, d.name)
+            };
+            let child_ino = g.intern(&child);
+            listing.push((child_ino, kind, d.name));
+        }
+
+        for (i, (e_ino, kind, name)) in listing.iter().enumerate().skip(offset as usize) {
+            // add() returns true when the reply buffer is full.
+            if reply.add(INodeNo(*e_ino), (i + 1) as u64, *kind, name) {
+                break;
+            }
         }
         reply.ok();
+    }
+
+    /// Rename within the volume. **This is a gate boundary:** if the destination
+    /// is a governed path, the *moved content* is validated against the
+    /// destination's schema before the move — otherwise atomic-save-via-rename
+    /// (vim, `sed -i`, …) would smuggle invalid content past the write gate.
+    /// Invalid → the rename is rejected (`EINVAL`) and a `.errors` sidecar is
+    /// written at the destination; the source is left untouched.
+    fn rename(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        _flags: RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        let mut g = self.inner.lock().unwrap();
+        let (Some(oldpath), Some(newpath)) =
+            (g.child_path(parent.0, name), g.child_path(newparent.0, newname))
+        else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+
+        let new_rel = Path::new(newpath.strip_prefix('/').unwrap_or(&newpath));
+        if g.registry.may_govern(new_rel) {
+            // Validate the bytes being moved against the destination schema.
+            let content = match g.fs.read_all(&oldpath) {
+                Ok(c) => c,
+                Err(_) => {
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
+            };
+            if let Err(report) = g.validate(&newpath, &content) {
+                let _ = g
+                    .fs
+                    .write_all(&format!("{newpath}.errors"), report.as_bytes(), 0o644);
+                reply.error(Errno::EINVAL);
+                return;
+            }
+        }
+
+        match g.fs.rename(&oldpath, &newpath) {
+            Ok(()) => {
+                // Preserve the source inode at the destination (the kernel keeps
+                // using it), then clear any stale sidecar at the destination.
+                g.rename_path(&oldpath, &newpath);
+                let _ = g.fs.unlink(&format!("{newpath}.errors"));
+                reply.ok();
+            }
+            Err(_) => reply.error(Errno::EIO),
+        }
     }
 
     /// Minimal setattr: we don't yet apply mode/size changes; report current

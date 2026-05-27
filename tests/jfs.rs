@@ -137,3 +137,38 @@ fn open_missing_file_errors() {
     let fs = v.open();
     assert!(fs.open("/does-not-exist.md", 0).is_err());
 }
+
+#[test]
+fn rename_moves_a_file() {
+    let v = TestVol::new("rename");
+    let fs = v.open();
+    let f = fs.create("/from.md", 0o644).unwrap();
+    f.write_at(b"movable", 0).unwrap();
+    f.fsync().unwrap();
+    drop(f);
+    fs.rename("/from.md", "/to.md").unwrap();
+    assert!(fs.stat("/from.md").is_err(), "source gone after rename");
+    assert_eq!(fs.stat("/to.md").unwrap().length, 7);
+}
+
+#[test]
+fn readdir_lists_entries_with_types() {
+    let v = TestVol::new("readdir");
+    let fs = v.open();
+    fs.mkdir("/people", 0o755).unwrap();
+    let f = fs.create("/a.md", 0o644).unwrap();
+    f.write_at(b"x", 0).unwrap();
+    drop(f);
+
+    let mut names: Vec<(String, bool)> = fs
+        .readdir("/")
+        .unwrap()
+        .into_iter()
+        .map(|d| (d.name.clone(), d.is_dir()))
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![("a.md".to_string(), false), ("people".to_string(), true)]
+    );
+}

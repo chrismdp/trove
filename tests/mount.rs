@@ -132,6 +132,109 @@ fn unlink_through_the_kernel() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn readdir_lists_real_entries() {
+    let (fs, dir) = fresh_fs("ls");
+    let mountpoint = dir.join("mnt");
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    let session = mount::spawn(fs, Registry::empty(), &mountpoint).expect("mount");
+    wait_mounted(&mountpoint);
+
+    std::fs::write(mountpoint.join("a.md"), "alpha").unwrap();
+    std::fs::write(mountpoint.join("b.md"), "bravo").unwrap();
+    std::fs::create_dir(mountpoint.join("sub")).unwrap();
+    std::fs::write(mountpoint.join("sub/c.md"), "charlie").unwrap();
+
+    let mut names: Vec<String> = std::fs::read_dir(&mountpoint)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["a.md", "b.md", "sub"]);
+
+    // The directory entry is reported as a directory (file_type comes from readdir).
+    let sub_entry = std::fs::read_dir(&mountpoint)
+        .unwrap()
+        .map(|e| e.unwrap())
+        .find(|e| e.file_name() == "sub")
+        .unwrap();
+    assert!(sub_entry.file_type().unwrap().is_dir());
+
+    // Nested listing works.
+    let nested: Vec<String> = std::fs::read_dir(mountpoint.join("sub"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(nested, vec!["c.md"]);
+
+    drop(session);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn rename_moves_a_file() {
+    let (fs, dir) = fresh_fs("mv");
+    let mountpoint = dir.join("mnt");
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    let session = mount::spawn(fs, Registry::empty(), &mountpoint).expect("mount");
+    wait_mounted(&mountpoint);
+
+    let src = mountpoint.join("from.md");
+    let dst = mountpoint.join("to.md");
+    std::fs::write(&src, "movable").unwrap();
+    std::fs::rename(&src, &dst).expect("rename via kernel");
+
+    assert!(!src.exists());
+    assert_eq!(std::fs::read_to_string(&dst).unwrap(), "movable");
+
+    drop(session);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Atomic-save-via-rename must not smuggle invalid content past the gate: a
+/// rename whose destination is governed validates the *moved bytes* first.
+#[test]
+fn rename_onto_governed_path_is_gated() {
+    let (fs, dir) = fresh_fs("mvgate");
+    let schema_root = dir.join("schemas");
+    std::fs::create_dir_all(schema_root.join(".types")).unwrap();
+    std::fs::write(schema_root.join(".types/person.json"), PERSON_SCHEMA).unwrap();
+    let registry = Registry::load(&schema_root).unwrap();
+
+    let mountpoint = dir.join("mnt");
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    let session = mount::spawn(fs, registry, &mountpoint).expect("mount");
+    wait_mounted(&mountpoint);
+    std::fs::create_dir(mountpoint.join("people")).unwrap();
+
+    let dst = mountpoint.join("people/p.md");
+
+    // A temp file at an ungoverned name (no validation on write) holding BAD
+    // content — the shape an editor's atomic save produces.
+    let tmp_bad = mountpoint.join("people/.tmp-bad");
+    std::fs::write(&tmp_bad, "---\ntype: person\nage: nope\n---\n").unwrap();
+    assert!(
+        std::fs::rename(&tmp_bad, &dst).is_err(),
+        "renaming invalid content onto a governed path must be rejected"
+    );
+    assert!(!dst.exists(), "rejected rename must not create the destination");
+    assert!(std::fs::read_to_string(mountpoint.join("people/p.md.errors"))
+        .unwrap()
+        .contains("age"));
+    assert!(tmp_bad.exists(), "the source survives a rejected rename");
+
+    // Valid content renames through cleanly and clears the stale sidecar.
+    let tmp_good = mountpoint.join("people/.tmp-good");
+    let body = "---\ntype: person\nage: 41\n---\n";
+    std::fs::write(&tmp_good, body).unwrap();
+    std::fs::rename(&tmp_good, &dst).expect("valid content should rename onto a governed path");
+    assert_eq!(std::fs::read_to_string(&dst).unwrap(), body);
+    assert!(!mountpoint.join("people/p.md.errors").exists());
+
+    drop(session);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 const PERSON_SCHEMA: &str = r#"{
     "globs": ["people/*.md"],
     "type": "object",
