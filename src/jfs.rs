@@ -127,7 +127,37 @@ extern "C" {
         buf: *mut *mut u8,
         size: *mut i64,
     ) -> c_int;
+
+    // --- Extended attributes ---
+    // Caller-allocated buffer: positive return = bytes written, -ERANGE = need bigger.
+    fn jfs_setXattr(
+        pid: i64,
+        h: i64,
+        path: *const c_char,
+        name: *const c_char,
+        value: usize,
+        vlen: c_int,
+        mode: c_int,
+    ) -> c_int;
+    fn jfs_getXattr(
+        pid: i64,
+        h: i64,
+        path: *const c_char,
+        name: *const c_char,
+        buf: usize,
+        bufsize: c_int,
+    ) -> c_int;
+    fn jfs_listXattr(pid: i64, h: i64, path: *const c_char, buf: usize, bufsize: c_int) -> c_int;
+    fn jfs_removeXattr(pid: i64, h: i64, path: *const c_char, name: *const c_char) -> c_int;
 }
+
+// setXattr mode constants (libjfs follows Linux semantics).
+/// Default — create if absent, replace if present.
+pub const XATTR_CREATE_OR_REPLACE: c_int = 0;
+/// Fail with EEXIST if the attribute already exists.
+pub const XATTR_CREATE: c_int = 1;
+/// Fail with ENODATA if the attribute does not already exist.
+pub const XATTR_REPLACE: c_int = 2;
 
 /// libjfs takes a per-call pid for permission context; 0 is fine for our
 /// single-identity use.
@@ -296,10 +326,24 @@ impl Fs {
     /// Write a whole file, replacing any existing contents (truncate semantics).
     /// This is the commit step on the write path: once a buffer has passed
     /// validation, its bytes land here atomically from the agent's point of view
-    /// (a single close/fsync). Unlink-then-create guarantees a clean truncate.
+    /// (a single close/fsync).
+    ///
+    /// **Mode preservation**: if the file already exists, we truncate + overwrite
+    /// it in place, which keeps its inode and therefore its mode, uid, gid, and
+    /// xattrs untouched. The `mode` argument is only used when creating a fresh
+    /// file (where there's no existing metadata to preserve). This matters because
+    /// validated writes through the mount mustn't reset `chmod +x` on an edit
+    /// (commits, `trove restore`, etc.).
     pub fn write_all(&self, path: &str, bytes: &[u8], mode: u16) -> Result<()> {
-        let _ = self.unlink(path); // ignore ENOENT — new file
-        let f = self.create(path, mode)?;
+        let f = if self.exists(path) {
+            self.truncate(path, 0)?;
+            // O_WRONLY = 1 on Linux + macOS. We use the literal because libjfs
+            // takes a c_int and we don't want a libc dep just for the constant
+            // in the core API.
+            self.open(path, 1)?
+        } else {
+            self.create(path, mode)?
+        };
         let mut off = 0i64;
         while (off as usize) < bytes.len() {
             let n = f.write_at(&bytes[off as usize..], off)?;
@@ -311,6 +355,132 @@ impl Fs {
         f.flush()?;
         f.fsync()?;
         Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Extended attributes
+    //
+    // libjfs / JuiceFS support xattrs natively (one row per (inode, name) in
+    // Postgres), so we surface them as plain pass-through. Trove's substrate
+    // doesn't touch xattrs — they're outside the validated file content, so
+    // they sit alongside it the way they would on any POSIX filesystem.
+
+    /// Set an extended attribute on `path`. `mode` controls create/replace
+    /// semantics — see [`XATTR_CREATE_OR_REPLACE`], [`XATTR_CREATE`],
+    /// [`XATTR_REPLACE`].
+    pub fn set_xattr(&self, path: &str, name: &str, value: &[u8], mode: c_int) -> Result<()> {
+        let (cpath, cname) = (cs(path)?, cs(name)?);
+        let ret = unsafe {
+            jfs_setXattr(
+                PID,
+                self.handle,
+                cpath.as_ptr(),
+                cname.as_ptr(),
+                value.as_ptr() as usize,
+                value.len() as c_int,
+                mode,
+            )
+        };
+        check(ret, "setxattr")?;
+        Ok(())
+    }
+
+    /// Get an extended attribute's value. Returns `None` if the attribute is
+    /// absent (-ENODATA, errno 61 on Linux / 93 on macOS — we treat any "no such
+    /// attribute" return as `None` rather than an error, matching the POSIX shape
+    /// callers expect).
+    pub fn get_xattr(&self, path: &str, name: &str) -> Result<Option<Vec<u8>>> {
+        let (cpath, cname) = (cs(path)?, cs(name)?);
+        // libjfs's jfs_getXattr doesn't follow the POSIX "size=0 returns
+        // needed length" convention reliably — passing bufsize=0 returned 0
+        // here (not the needed size). So we grow on -ERANGE instead. Starts
+        // at 256 (covers most metadata) and doubles to a sane cap.
+        let mut cap = 256usize;
+        loop {
+            let mut buf = vec![0u8; cap];
+            let got = unsafe {
+                jfs_getXattr(
+                    PID,
+                    self.handle,
+                    cpath.as_ptr(),
+                    cname.as_ptr(),
+                    buf.as_mut_ptr() as usize,
+                    buf.len() as c_int,
+                )
+            };
+            if got == -61 || got == -93 {
+                // ENODATA on Linux / ENOATTR on macOS = attribute missing.
+                return Ok(None);
+            }
+            if got == -34 {
+                // ERANGE — buffer too small; grow and retry.
+                if cap >= 1 << 22 {
+                    bail!("getxattr value too large (> 4 MiB)");
+                }
+                cap *= 2;
+                continue;
+            }
+            let n = check(got, "getxattr")? as usize;
+            buf.truncate(n);
+            return Ok(Some(buf));
+        }
+    }
+
+    /// List the extended attribute names on `path`. The buffer is a sequence of
+    /// NUL-terminated names (the POSIX format `listxattr` returns); we split it
+    /// into a `Vec<String>` for convenience.
+    pub fn list_xattr(&self, path: &str) -> Result<Vec<String>> {
+        let buf = self.list_xattr_raw(path)?;
+        Ok(buf
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect())
+    }
+
+    /// Returns the raw NUL-separated bytes that POSIX `listxattr(2)` would
+    /// produce — the FUSE layer needs them in this exact form so it can hand
+    /// them back to the kernel without re-encoding. Includes a trailing NUL
+    /// after each name; an empty list returns an empty Vec.
+    pub fn list_xattr_raw(&self, path: &str) -> Result<Vec<u8>> {
+        let cpath = cs(path)?;
+        // Same libjfs quirk as get_xattr: size probe with bufsize=0 isn't
+        // reliable, so grow on -ERANGE instead.
+        let mut cap = 256usize;
+        loop {
+            let mut buf = vec![0u8; cap];
+            let got = unsafe {
+                jfs_listXattr(
+                    PID,
+                    self.handle,
+                    cpath.as_ptr(),
+                    buf.as_mut_ptr() as usize,
+                    buf.len() as c_int,
+                )
+            };
+            if got == -34 {
+                if cap >= 1 << 22 {
+                    bail!("listxattr buffer would exceed 4 MiB");
+                }
+                cap *= 2;
+                continue;
+            }
+            let n = check(got, "listxattr")? as usize;
+            buf.truncate(n);
+            return Ok(buf);
+        }
+    }
+
+    /// Remove an extended attribute. Returns `Ok(false)` if the attribute was
+    /// already absent; `Ok(true)` if it was removed.
+    pub fn remove_xattr(&self, path: &str, name: &str) -> Result<bool> {
+        let (cpath, cname) = (cs(path)?, cs(name)?);
+        let ret = unsafe { jfs_removeXattr(PID, self.handle, cpath.as_ptr(), cname.as_ptr()) };
+        if ret == -61 || ret == -93 {
+            return Ok(false);
+        }
+        check(ret, "removexattr")?;
+        Ok(true)
     }
 
     /// Rename/move within the volume.

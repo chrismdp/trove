@@ -382,3 +382,75 @@ fn readdir_lists_entries_with_types() {
         vec![("a.md".to_string(), false), ("people".to_string(), true)]
     );
 }
+
+#[test]
+fn write_all_preserves_mode_on_existing_file() {
+    // The validation gate (and `trove restore`) use `fs.write_all` to commit
+    // the bytes. An edit must preserve a `chmod +x` — and any other mode bits.
+    // Regression test for the 0o644-hardcoded-on-every-write bug.
+    let v = TestVol::new("mode-pres");
+    let fs = v.open();
+
+    // Create a 0o755 executable file, then write_all over it with mode 0o644.
+    // Mode must remain 0o755 because write_all should truncate in place.
+    let f = fs.create("/hook.sh", 0o755).unwrap();
+    f.write_at(b"#!/bin/sh\necho v1\n", 0).unwrap();
+    drop(f);
+    assert_eq!(fs.lstat("/hook.sh").unwrap().mode & 0o777, 0o755);
+
+    fs.write_all("/hook.sh", b"#!/bin/sh\necho v2\n", 0o644).unwrap();
+    assert_eq!(
+        fs.lstat("/hook.sh").unwrap().mode & 0o777,
+        0o755,
+        "edit through write_all must NOT reset mode"
+    );
+    assert_eq!(fs.read_all("/hook.sh").unwrap(), b"#!/bin/sh\necho v2\n");
+}
+
+#[test]
+fn write_all_uses_passed_mode_for_fresh_file() {
+    // The other side of the contract: on a fresh file, the mode argument IS
+    // honoured (because there is no existing inode to preserve).
+    let v = TestVol::new("mode-fresh");
+    let fs = v.open();
+    fs.write_all("/new.md", b"hi\n", 0o600).unwrap();
+    assert_eq!(fs.lstat("/new.md").unwrap().mode & 0o777, 0o600);
+}
+
+#[test]
+fn xattrs_round_trip() {
+    // Set / get / list / remove an extended attribute end-to-end through
+    // libjfs. Pure POSIX-compat — no Trove substrate involvement.
+    let v = TestVol::new("xattr");
+    let fs = v.open();
+    let f = fs.create("/note.md", 0o644).unwrap();
+    f.write_at(b"hello\n", 0).unwrap();
+    drop(f);
+
+    let key = "user.trove.example";
+    let val = b"the answer is 42";
+
+    // Initially: no attribute.
+    assert_eq!(fs.get_xattr("/note.md", key).unwrap(), None);
+    assert!(!fs.list_xattr("/note.md").unwrap().contains(&key.to_string()));
+
+    // Set, then read it back.
+    fs.set_xattr("/note.md", key, val, trove::jfs::XATTR_CREATE_OR_REPLACE).unwrap();
+    let got = fs.get_xattr("/note.md", key).unwrap();
+    assert_eq!(got.as_deref(), Some(&val[..]));
+    assert!(fs.list_xattr("/note.md").unwrap().contains(&key.to_string()));
+
+    // Replace it.
+    fs.set_xattr("/note.md", key, b"updated", trove::jfs::XATTR_REPLACE).unwrap();
+    assert_eq!(
+        fs.get_xattr("/note.md", key).unwrap().as_deref(),
+        Some(&b"updated"[..])
+    );
+
+    // Remove.
+    assert!(fs.remove_xattr("/note.md", key).unwrap());
+    assert_eq!(fs.get_xattr("/note.md", key).unwrap(), None);
+    // Removing again returns false, not error.
+    assert!(!fs.remove_xattr("/note.md", key).unwrap());
+}
+

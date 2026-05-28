@@ -61,7 +61,15 @@ pub fn diff(fs: &Fs, versions: &mut VersionStore, path: &str, a: i32, b: i32) ->
 /// only a new chain row is appended).
 pub fn restore(fs: &Fs, versions: &mut VersionStore, path: &str, rev: i32) -> Result<i32> {
     let content = cat(fs, versions, path, rev)?;
-    fs.write_all(path, &content, 0o644)
+    // Mode is informational: write_all truncates the existing file in place,
+    // preserving its current mode/uid/gid/xattrs. Only used if the file has
+    // since been deleted (we recreate it with the historical mode if we have
+    // it, falling back to 0o644).
+    let mode = fs
+        .lstat(path)
+        .map(|i| (i.mode & 0o7777) as u16)
+        .unwrap_or(0o644);
+    fs.write_all(path, &content, mode)
         .with_context(|| format!("writing restored content to {path}"))?;
     let new_rev = record_version(fs, versions, path, &content, Some("restore"))
         .with_context(|| format!("recording restore of {path}"))?;

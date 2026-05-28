@@ -54,12 +54,16 @@ enum OpenFile {
     /// changes (or a fresh create / truncate) are pending. `rejected` means the
     /// last commit attempt failed validation — the buffer won't persist, so it's
     /// hidden from `lookup`/`getattr` immediately (FUSE `release` is async, so we
-    /// can't wait for the handle to drop to stop reporting a phantom).
+    /// can't wait for the handle to drop to stop reporting a phantom). `mode` is
+    /// the mode the *creator* asked for — used only when committing a fresh file
+    /// to jfs (for an edit, `write_all` overwrites in place and preserves the
+    /// existing inode's mode/uid/gid/xattrs).
     Write {
         path: String,
         buf: Vec<u8>,
         dirty: bool,
         rejected: bool,
+        mode: u16,
     },
 }
 
@@ -145,7 +149,7 @@ impl Inner {
     fn inflight_size(&self, path: &str) -> Option<u64> {
         self.open_files.values().find_map(|of| match of {
             // A rejected buffer won't persist, so it must not look like it exists.
-            OpenFile::Write { path: p, buf, dirty, rejected }
+            OpenFile::Write { path: p, buf, dirty, rejected, .. }
                 if *dirty && !*rejected && p == path =>
             {
                 Some(buf.len() as u64)
@@ -259,8 +263,10 @@ impl Inner {
     /// a `.errors` sidecar is (re)written, and `EINVAL` is returned so the
     /// failing close/fsync surfaces the rejection to the agent.
     fn commit(&mut self, fh: u64) -> Result<(), Errno> {
-        let (path, buf) = match self.open_files.get(&fh) {
-            Some(OpenFile::Write { path, buf, dirty: true, .. }) => (path.clone(), buf.clone()),
+        let (path, buf, mode) = match self.open_files.get(&fh) {
+            Some(OpenFile::Write { path, buf, dirty: true, mode, .. }) => {
+                (path.clone(), buf.clone(), *mode)
+            }
             // read / pass-through handle, or a clean write handle: nothing to commit
             Some(_) => return Ok(()),
             None => return Err(Errno::EBADF),
@@ -268,7 +274,11 @@ impl Inner {
 
         match self.validate(&path, &buf) {
             Ok(()) => {
-                self.fs.write_all(&path, &buf, 0o644).map_err(|_| Errno::EIO)?;
+                // For a fresh file, `mode` is what the FUSE create handler was
+                // told to use (the agent's `open(O_CREAT, mode)`). For an
+                // existing file `write_all` truncates in place so the existing
+                // inode keeps its mode, uid, gid, and xattrs.
+                self.fs.write_all(&path, &buf, mode).map_err(|_| Errno::EIO)?;
                 let _ = self.fs.unlink(&format!("{path}.errors")); // clear stale sidecar
                 // Best-effort version capture: the file is already saved (the
                 // live source of truth), so a versioning hiccup must never fail
@@ -532,15 +542,16 @@ impl Filesystem for TroveFs {
         }
 
         // Governed: nothing touches jfs yet — the file lives only in its buffer
-        // until it validates at the commit barrier. `mode` is advisory for now
-        // (the committed file is written 0o644). NO_CACHE TTL so a rejected
-        // create leaves no phantom dentry.
+        // until it validates at the commit barrier. `mode` is remembered on the
+        // handle so the eventual `commit` honours what the agent asked for.
+        // NO_CACHE TTL so a rejected create leaves no phantom dentry.
         let ino = g.intern(&path);
         let fh = g.new_fh(OpenFile::Write {
             path,
             buf: Vec::new(),
             dirty: true,
             rejected: false,
+            mode: (mode & 0o7777) as u16,
         });
         reply.created(
             &NO_CACHE,
@@ -598,11 +609,17 @@ impl Filesystem for TroveFs {
                 }
             }
         };
+        // Existing file: remember its current mode so a commit that goes
+        // through write_all's create-path (only on a fresh-file race) still
+        // gets the right mode. The normal path takes write_all's truncate
+        // branch and preserves mode structurally.
+        let mode = g.fs.lstat(&path).map(|i| (i.mode & 0o7777) as u16).unwrap_or(0o644);
         let fh = g.new_fh(OpenFile::Write {
             path,
             buf,
             dirty: truncating, // truncation is itself a pending change
             rejected: false,
+            mode,
         });
         reply.opened(FileHandle(fh), FopenFlags::empty());
     }
@@ -1047,6 +1064,116 @@ impl Filesystem for TroveFs {
         // files/ffree are unknown for an object-backed FS — report 0.
         reply.statfs(blocks, free, free, 0, 0, BSIZE as u32, 255, BSIZE as u32);
     }
+
+    // --- Extended attributes: pass-through to libjfs ---
+    //
+    // Xattrs are orthogonal to Trove's schema validation (they don't live in
+    // the file content, so they don't affect schemas), versioning (the COW
+    // clone copies them across via `jfs_clone(preserve=true)`), or embedding
+    // (we embed content, not metadata). Pure POSIX compat.
+
+    fn setxattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        _position: u32, // macOS-only; ignored for portability with libjfs
+        reply: ReplyEmpty,
+    ) {
+        let g = self.inner.lock().unwrap();
+        let Some(path) = g.path_of(ino.0) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let Some(name_str) = name.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        // FUSE passes XATTR_CREATE / XATTR_REPLACE as Linux flag values; libjfs
+        // takes the same numeric semantics. Pass straight through.
+        let mode = flags as std::os::raw::c_int;
+        match g.fs.set_xattr(&path, name_str, value, mode) {
+            Ok(()) => reply.ok(),
+            Err(_) => reply.error(Errno::EIO),
+        }
+    }
+
+    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: fuser::ReplyXattr) {
+        let g = self.inner.lock().unwrap();
+        let Some(path) = g.path_of(ino.0) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let Some(name_str) = name.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        match g.fs.get_xattr(&path, name_str) {
+            Ok(Some(bytes)) => {
+                // FUSE protocol: if `size == 0` the kernel just wants the
+                // length; otherwise return the bytes (ERANGE if too small).
+                if size == 0 {
+                    reply.size(bytes.len() as u32);
+                } else if (bytes.len() as u32) > size {
+                    reply.error(Errno::ERANGE);
+                } else {
+                    reply.data(&bytes);
+                }
+            }
+            Ok(None) => reply.error(no_attr_errno()),
+            Err(_) => reply.error(Errno::EIO),
+        }
+    }
+
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: fuser::ReplyXattr) {
+        let g = self.inner.lock().unwrap();
+        let Some(path) = g.path_of(ino.0) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        match g.fs.list_xattr_raw(&path) {
+            Ok(bytes) => {
+                if size == 0 {
+                    reply.size(bytes.len() as u32);
+                } else if (bytes.len() as u32) > size {
+                    reply.error(Errno::ERANGE);
+                } else {
+                    reply.data(&bytes);
+                }
+            }
+            Err(_) => reply.error(Errno::EIO),
+        }
+    }
+
+    fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let g = self.inner.lock().unwrap();
+        let Some(path) = g.path_of(ino.0) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let Some(name_str) = name.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        match g.fs.remove_xattr(&path, name_str) {
+            Ok(true) => reply.ok(),
+            Ok(false) => reply.error(no_attr_errno()),
+            Err(_) => reply.error(Errno::EIO),
+        }
+    }
+}
+
+/// The errno for "no such xattr" varies by OS: ENODATA on Linux, ENOATTR on
+/// macOS. fuser doesn't expose either by name; we use the raw values.
+#[cfg(target_os = "linux")]
+fn no_attr_errno() -> Errno {
+    Errno::from_i32(61) // ENODATA
+}
+#[cfg(target_os = "macos")]
+fn no_attr_errno() -> Errno {
+    Errno::from_i32(93) // ENOATTR
 }
 
 fn config() -> fuser::Config {
