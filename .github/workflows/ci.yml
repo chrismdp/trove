@@ -65,34 +65,44 @@ jobs:
 
       - name: Install platform deps (macos)
         if: matrix.os_label == 'macos'
-        # Diagnostic cycle — see release.yml for full rationale.
+        # See release.yml for full rationale. `--no-quarantine` is no longer
+        # accepted by Homebrew and aborts the cask install when present.
         run: |
           set -x
-          echo "::group::pkg-config baseline"
-          which pkg-config && pkg-config --version
-          echo "PKG_CONFIG_PATH default: $(pkg-config --variable=pc_path pkg-config)"
-          echo "::endgroup::"
-
-          echo "::group::brew install pkg-config"
+          echo "::group::brew install pkg-config + macfuse"
           brew install pkg-config
-          echo "::endgroup::"
-
-          echo "::group::brew install --cask macfuse"
-          brew install --cask --no-quarantine macfuse 2>&1 || echo "EXIT=$?"
+          brew install --cask macfuse 2>&1 | tail -50 || { echo "EXIT=$?"; exit 1; }
           echo "::endgroup::"
 
           echo "::group::find macFUSE artefacts"
           find /usr/local /opt/homebrew /Library/Frameworks /Library/Filesystems -maxdepth 8 \( -name 'osxfuse.pc' -o -name 'fuse.pc' -o -name 'libfuse*.dylib' -o -name 'libosxfuse*.dylib' -o -name 'fuse.h' -o -name 'osxfuse.h' \) 2>/dev/null || true
           echo "::endgroup::"
 
-          echo "::group::macFUSE framework contents"
-          ls -la /Library/Frameworks/macFUSE.framework/ 2>&1 || echo "no macFUSE.framework"
-          ls -la /Library/Frameworks/macFUSE.framework/Versions/A/ 2>&1 || true
-          ls -la /Library/Frameworks/macFUSE.framework/Versions/A/Headers/ 2>&1 || true
+          echo "::group::link fuse.pc into pkg-config path"
+          osxfuse_pc=$(find /usr/local /opt/homebrew /Library/Frameworks/macFUSE.framework -name 'osxfuse.pc' 2>/dev/null | head -1)
+          if [ -n "$osxfuse_pc" ]; then
+            target_dir="$(dirname "$osxfuse_pc")"
+            sudo ln -sf "$osxfuse_pc" "$target_dir/fuse.pc"
+            echo "Symlinked $target_dir/fuse.pc -> $osxfuse_pc"
+          elif [ -d /Library/Frameworks/macFUSE.framework ]; then
+            echo "No osxfuse.pc found — synthesising fuse.pc against framework"
+            sudo mkdir -p /usr/local/lib/pkgconfig
+            sudo tee /usr/local/lib/pkgconfig/fuse.pc >/dev/null <<'PC'
+Name: fuse
+Description: macFUSE userland (synthesised against /Library/Frameworks/macFUSE.framework)
+Version: 4.8.3
+Libs: -F/Library/Frameworks -framework macFUSE
+Cflags: -I/Library/Frameworks/macFUSE.framework/Versions/A/Headers -D_FILE_OFFSET_BITS=64 -DFUSE_USE_VERSION=29
+PC
+            echo "Wrote /usr/local/lib/pkgconfig/fuse.pc"
+          else
+            echo "ERROR: macFUSE not installed anywhere we can find"
+            exit 1
+          fi
           echo "::endgroup::"
 
-          echo "::group::pkg-config lookup"
-          pkg-config --cflags --libs fuse 2>&1 || echo "fuse lookup failed (expected on first cycle)"
+          echo "::group::verify pkg-config fuse"
+          pkg-config --cflags --libs fuse
           echo "::endgroup::"
 
       - name: Build libjfs
