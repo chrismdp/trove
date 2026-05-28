@@ -60,7 +60,19 @@ jobs:
 
       - name: Install platform deps (macos)
         if: matrix.os_label == 'macos'
-        run: brew install pkg-config || true
+        # macFUSE userland (headers + dylib + pkg-config) is required for
+        # `fuser` to link. The KEXT half of macFUSE needs kernel-extension
+        # consent — not possible in headless GHA — but we don't need to
+        # actually mount, only to compile/link. `brew install --cask
+        # macfuse` stages the userland files without loading the KEXT.
+        run: |
+          brew install pkg-config || true
+          brew install --cask --no-quarantine macfuse || true
+          pkg-config --cflags fuse 2>/dev/null \
+            || pkg-config --cflags osxfuse 2>/dev/null \
+            || echo "warning: neither fuse nor osxfuse pkg-config found"
+          ls /usr/local/include/fuse 2>/dev/null || true
+          ls /usr/local/lib/libfuse.dylib /usr/local/lib/libosxfuse.dylib 2>/dev/null || true
 
       - name: Build libjfs
         run: |

@@ -199,6 +199,25 @@ case ":${PATH}:" in
         ;;
 esac
 
+# ---------- macOS: warn if macFUSE is missing ----------
+# `trove mount` requires macFUSE at runtime. Install/link don't need it,
+# but the user should know before they try to mount.
+if [ "$OS" = "macos" ]; then
+    if ! [ -e /Library/Filesystems/macfuse.fs ] && ! [ -e /Library/Filesystems/osxfuse.fs ]; then
+        info ""
+        info "Note: macFUSE is not installed on this machine. \`trove mount\` will fail"
+        info "until you install it:"
+        info ""
+        info "  brew install --cask macfuse"
+        info ""
+        info "(macFUSE requires a one-time approval in System Settings → Privacy & Security"
+        info "after installing. Restart required.)"
+        info ""
+        info "The other trove commands (check, docs, install, search, server, log, cat,"
+        info "backup) work without macFUSE."
+    fi
+fi
+
 info ""
 info "Smoke test:   trove --version"
 info "Next step:    trove install   (writes config + provisions the substrate)"

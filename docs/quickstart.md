@@ -13,6 +13,11 @@ Linux + macOS, amd64 + arm64. Drops `trove` into `~/.local/bin/` and
 the matching `libjfs` shared library beside it under
 `~/.local/share/trove/<version>/`.
 
+On macOS, `trove mount` additionally needs macFUSE
+(`brew install --cask macfuse`, with a one-time KEXT approval in System
+Settings — see [packaging — macOS runtime requirements](/docs/packaging#macos-runtime-requirements)).
+Every other trove command works without it.
+
 Building from source is the alternative (needs Rust + Go ≥ 1.22 for
 `libjfs`):
 

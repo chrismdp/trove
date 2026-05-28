@@ -135,6 +135,31 @@ loader finds libjfs alongside the binary — no `LD_LIBRARY_PATH` /
 directory. The install script puts both under
 `~/.local/share/trove/<version>/`.
 
+## macOS runtime requirements
+
+The macOS tarballs ship with `trove` linked against macFUSE's userland.
+**All trove commands except `trove mount` work without macFUSE installed**
+— `check`, `docs`, `install`, `search`, `server`, `log`, `cat`, `backup`
+have no FUSE dependency at runtime.
+
+For `trove mount`, you need macFUSE on the machine:
+
+```bash
+brew install --cask macfuse
+```
+
+macFUSE bundles a kernel extension which requires KEXT consent — a
+one-time approval in **System Settings → Privacy & Security** after the
+install, plus a restart. This is a fundamental Mac FUSE constraint, not
+a Trove choice: macOS won't let any userland mount a FUSE filesystem
+without an approved KEXT. (It's also why the macOS release builds in
+CI install macFUSE's *userland* only, never the KEXT — kernel-extension
+consent isn't possible on a headless runner, but the userland headers
+and dylib are enough to link.)
+
+The Linux tarballs use `libfuse3` instead and have no equivalent
+approval step.
+
 ## The future state — single self-contained binary
 
 Today every release archive is binary + dylib. The next iteration will
