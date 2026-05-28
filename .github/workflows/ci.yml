@@ -87,14 +87,15 @@ jobs:
           elif [ -d /Library/Frameworks/macFUSE.framework ]; then
             echo "No osxfuse.pc found — synthesising fuse.pc against framework"
             sudo mkdir -p /usr/local/lib/pkgconfig
-            sudo tee /usr/local/lib/pkgconfig/fuse.pc >/dev/null <<'PC'
-Name: fuse
-Description: macFUSE userland (synthesised against /Library/Frameworks/macFUSE.framework)
-Version: 4.8.3
-Libs: -F/Library/Frameworks -framework macFUSE
-Cflags: -I/Library/Frameworks/macFUSE.framework/Versions/A/Headers -D_FILE_OFFSET_BITS=64 -DFUSE_USE_VERSION=29
-PC
-            echo "Wrote /usr/local/lib/pkgconfig/fuse.pc"
+            sudo bash -c 'printf "%s\n" \
+              "Name: fuse" \
+              "Description: macFUSE userland (synthesised against framework)" \
+              "Version: 4.8.3" \
+              "Libs: -F/Library/Frameworks -framework macFUSE" \
+              "Cflags: -I/Library/Frameworks/macFUSE.framework/Versions/A/Headers -D_FILE_OFFSET_BITS=64 -DFUSE_USE_VERSION=29" \
+              > /usr/local/lib/pkgconfig/fuse.pc'
+            echo "Wrote /usr/local/lib/pkgconfig/fuse.pc:"
+            cat /usr/local/lib/pkgconfig/fuse.pc
           else
             echo "ERROR: macFUSE not installed anywhere we can find"
             exit 1
