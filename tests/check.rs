@@ -231,3 +231,45 @@ fn dotdirs_and_non_md_ignored() {
     let s = check::run(store.path(), true).unwrap();
     assert_eq!((s.checked, s.valid, s.failed), (1, 1, 0));
 }
+
+#[test]
+fn broken_schema_aborts_before_walking() {
+    // A `.types/*.json` that doesn't parse must abort the sweep — there's no
+    // safe way to validate files when the registry is malformed. Importantly,
+    // we should NOT walk markdown (so `checked` stays 0).
+    let store = TempStore::new("broken-schema");
+    store
+        .schema("broken", "this is not json {")
+        .note("Alice.md", "---\ntype: person\n---\n");
+    let s = check::run(store.path(), true).unwrap();
+    assert_eq!(s.checked, 0, "broken schema must prevent the file sweep");
+    assert!(s.failed > 0, "broken schema must surface as a failure");
+    assert_eq!(s.schemas_with_errors, 1);
+}
+
+#[test]
+fn schema_that_doesnt_compile_aborts() {
+    // Valid JSON, invalid JSON Schema — same abort behaviour.
+    let store = TempStore::new("uncompilable");
+    store
+        .schema("bad", r#"{"globs":["*.md"], "type": 42}"#)
+        .note("Alice.md", "---\ntype: person\n---\n");
+    let s = check::run(store.path(), true).unwrap();
+    assert_eq!(s.checked, 0);
+    assert!(s.failed > 0);
+}
+
+#[test]
+fn warning_only_schema_still_walks_files() {
+    // A schema with no globs and no type-const is a warning, not an error —
+    // the sweep should still run.
+    let store = TempStore::new("warn-only");
+    store
+        .schema("person", PERSON_SCHEMA)
+        .schema("loose", r#"{"type":"object", "properties":{"x":{"type":"string"}}}"#)
+        .note("Alice.md", "---\ntype: person\n---\n");
+    let s = check::run(store.path(), true).unwrap();
+    assert_eq!(s.checked, 1, "warning-only schema must NOT block the sweep");
+    assert_eq!(s.failed, 0);
+    assert_eq!(s.schemas_with_errors, 0);
+}

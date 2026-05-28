@@ -3,7 +3,11 @@
 //! report violations. Exit code is non-zero on any failure, so it drops into a
 //! pre-commit hook or CI.
 
-use crate::{frontmatter, types::Registry, validate};
+use crate::{
+    frontmatter,
+    types::{self, Registry},
+    validate,
+};
 use anyhow::{Context, Result};
 use colored::Colorize;
 use std::path::Path;
@@ -14,19 +18,58 @@ pub struct Summary {
     pub valid: usize,
     pub untyped: usize,
     pub failed: usize,
+    /// How many `.types/*.json` schemas were found in the store.
+    pub schemas_present: usize,
+    /// How many of those schemas had errors (unparseable, invalid, bad globs).
+    /// When non-zero, the file sweep is skipped entirely.
+    pub schemas_with_errors: usize,
 }
 
 pub fn run(store: &Path, quiet: bool) -> Result<Summary> {
+    // Lint first: a broken schema can't be loaded, so there's no point walking
+    // markdown files if any are malformed. Errors abort; warnings are surfaced
+    // but don't fail the sweep.
+    let lint = types::lint(store);
+    let mut s = Summary {
+        checked: 0,
+        valid: 0,
+        untyped: 0,
+        failed: 0,
+        schemas_present: lint.schemas_present,
+        schemas_with_errors: lint.errors().count(),
+    };
+    if lint.has_errors() {
+        for f in lint.errors() {
+            println!("{} {}.json", "LINT".red().bold(), f.schema_name);
+            println!("      {} {}", "↳".red(), f.message);
+        }
+        eprintln!(
+            "\n{}: schema lint failed — fix {} before validating files.",
+            "trove".bold(),
+            lint.schemas_dir.display()
+        );
+        s.failed = s.schemas_with_errors;
+        return Ok(s);
+    }
+    if !quiet {
+        for f in lint.warnings() {
+            println!(
+                "{} {}.json — {}",
+                "warn".yellow().bold(),
+                f.schema_name,
+                f.message.dimmed()
+            );
+        }
+    }
+
     let registry = Registry::load(store).context("loading type registry")?;
     if registry.is_empty() {
         eprintln!(
-            "{}: no schemas found in {}/.types — nothing to validate.",
+            "{}: no schemas found in {} — nothing to validate.",
             "warning".yellow().bold(),
-            store.display()
+            lint.schemas_dir.display()
         );
     }
-
-    let mut s = Summary { checked: 0, valid: 0, untyped: 0, failed: 0 };
 
     for entry in WalkDir::new(store)
         .into_iter()

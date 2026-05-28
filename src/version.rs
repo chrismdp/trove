@@ -161,6 +161,111 @@ impl VersionStore {
         )?;
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
+
+    /// Hashes of blobs whose existing embeddings do NOT include the target
+    /// `model` — i.e. they were embedded with a different model (or sentinel-
+    /// embedded with a null embedding_model). Used by `trove embed --remodel`
+    /// to migrate the vault after the MODEL constant changes. `limit` matches
+    /// the batching pattern used by `pending_embedding_hashes`.
+    pub fn stale_model_hashes(&mut self, model: &str, limit: i64) -> Result<Vec<String>> {
+        let rows = self.client.query(
+            "select b.hash from blobs b \
+             where exists (select 1 from blob_chunks c where c.blob_hash = b.hash) \
+               and not exists ( \
+                 select 1 from blob_chunks c \
+                 where c.blob_hash = b.hash and c.embedding_model = $1 \
+               ) \
+             order by b.created_at limit $2",
+            &[&model, &limit],
+        )?;
+        Ok(rows.iter().map(|r| r.get(0)).collect())
+    }
+}
+
+/// A point-in-time snapshot of how much room Trove is taking in Postgres —
+/// the rows the operator pays for and the bytes Postgres pays for to store
+/// them. All `_bytes` are server-reported (`pg_total_relation_size` /
+/// `pg_database_size`) so they include indexes, toast, and free space the
+/// table is holding — i.e. the bill-shaped figure, not just live tuple bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbUsage {
+    pub database_bytes: i64,
+    pub blobs_rows: i64,
+    pub blobs_bytes: i64,
+    pub file_versions_rows: i64,
+    pub file_versions_bytes: i64,
+    pub blob_chunks_rows: i64,
+    pub blob_chunks_bytes: i64,
+    /// Distinct `file_versions.path` values — the live tree's "known files"
+    /// count (a file with 5 revs counts once).
+    pub distinct_paths: i64,
+    /// Blobs with at least one row in `blob_chunks` (sentinel rows count —
+    /// they mean "we processed it and decided there's nothing to embed").
+    pub embedded_blobs: i64,
+    /// Blobs with no rows in `blob_chunks` — what `trove embed` will pick up
+    /// next. A climbing number with `embedded_blobs` flat means the embedder
+    /// isn't running (or `OPENAI_API_KEY` is missing).
+    pub pending_blobs: i64,
+}
+
+impl VersionStore {
+    /// One-shot snapshot of DB usage — sizes, counts, embedding progress.
+    /// Runs every query in a single read-only transaction so the snapshot is
+    /// internally consistent (no torn reads if a write commits between calls).
+    /// Returns a useful error if a Trove table is missing rather than silently
+    /// returning 0 — schema readiness is `doctor`'s job, and `usage` assumes
+    /// the migration has run.
+    pub fn usage(&mut self) -> Result<DbUsage> {
+        let mut tx = self.client.build_transaction().read_only(true).start()?;
+
+        // Fail loud if a table is missing — pg_total_relation_size on a
+        // non-existent regclass would otherwise panic the query.
+        for table in ["blobs", "file_versions", "blob_chunks"] {
+            let present: bool = tx
+                .query_one("select to_regclass($1) is not null", &[&table])?
+                .get(0);
+            if !present {
+                anyhow::bail!(
+                    "schema not migrated — table `{table}` is missing. Run `trove install`."
+                );
+            }
+        }
+
+        let database_bytes: i64 = tx
+            .query_one("select pg_database_size(current_database())::bigint", &[])?
+            .get(0);
+
+        let row = tx.query_one(
+            "select \
+                 (select count(*) from blobs)::bigint, \
+                 pg_total_relation_size('blobs'::regclass)::bigint, \
+                 (select count(*) from file_versions)::bigint, \
+                 pg_total_relation_size('file_versions'::regclass)::bigint, \
+                 (select count(*) from blob_chunks)::bigint, \
+                 pg_total_relation_size('blob_chunks'::regclass)::bigint, \
+                 (select count(distinct path) from file_versions)::bigint, \
+                 (select count(*) from blobs b \
+                    where exists (select 1 from blob_chunks c where c.blob_hash = b.hash))::bigint, \
+                 (select count(*) from blobs b \
+                    where not exists (select 1 from blob_chunks c where c.blob_hash = b.hash))::bigint",
+            &[],
+        )?;
+
+        let usage = DbUsage {
+            database_bytes,
+            blobs_rows: row.get(0),
+            blobs_bytes: row.get(1),
+            file_versions_rows: row.get(2),
+            file_versions_bytes: row.get(3),
+            blob_chunks_rows: row.get(4),
+            blob_chunks_bytes: row.get(5),
+            distinct_paths: row.get(6),
+            embedded_blobs: row.get(7),
+            pending_blobs: row.get(8),
+        };
+        tx.commit()?;
+        Ok(usage)
+    }
 }
 
 /// One embedding row to write for a blob. `embedding` is the pgvector text

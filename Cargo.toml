@@ -13,7 +13,9 @@ path = "src/main.rs"
 # `mount` pulls the substrate runtime: JuiceFS-backed FUSE (libjfs) + COW
 # version capture + the `trove embed` worker (ureq for the OpenAI call). Kept
 # behind a feature so `trove check` and the validator build with no native deps.
-mount = ["dep:fuser", "dep:libc", "dep:ureq", "dep:similar", "dep:tiny_http"]
+# Note: tiny_http is NOT in this feature — `trove docs` serves the embedded
+# walkthrough without needing libjfs, Postgres, or an OpenAI key.
+mount = ["dep:fuser", "dep:libc", "dep:ureq", "dep:similar"]
 
 [dependencies]
 fuser = { version = "0.17", optional = true }
@@ -33,4 +35,10 @@ hex = "0.4"
 toml = "0.8"
 ureq = { version = "2", features = ["json"], optional = true }
 similar = { version = "2", optional = true }
-tiny_http = { version = "0.12", optional = true }
+# HTTP server. Used by both `trove server` (mount feature, vault data viewer)
+# and `trove docs` (always available, embedded walkthrough). Not optional.
+tiny_http = "0.12"
+# Embedded markdown docs served by `trove docs`. rust-embed bakes the docs/
+# tree into the binary; pulldown-cmark renders MD→HTML at request time.
+rust-embed = { version = "8", features = ["debug-embed"] }
+pulldown-cmark = { version = "0.10", default-features = false, features = ["html"] }

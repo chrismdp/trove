@@ -314,6 +314,70 @@ fn truncate_on_governed_file_is_gated() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Pin that `bash`'s `>` redirect actually surfaces EINVAL when the validation
+/// gate rejects a write. The docs lean on this — but it only holds because bash
+/// checks `close()`'s return value. Other tools that ignore `close()` will exit
+/// 0 even though nothing persisted; the `.errors` sidecar is the reliable signal
+/// regardless of how the writing tool handles close.
+#[test]
+fn bash_redirect_surfaces_einval() {
+    let (fs, dir) = fresh_fs("bashredir");
+    let schema_root = dir.join("schemas");
+    std::fs::create_dir_all(schema_root.join(".types")).unwrap();
+    std::fs::write(schema_root.join(".types/person.json"), PERSON_SCHEMA).unwrap();
+    let registry = Registry::load(&schema_root).unwrap();
+
+    let mountpoint = dir.join("mnt");
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    let session = mount::spawn(fs, registry, &mountpoint).expect("mount");
+    wait_mounted(&mountpoint);
+    std::fs::create_dir(mountpoint.join("people")).expect("mkdir people");
+
+    // `people/*.md` is governed — `echo garbage` has no frontmatter and no
+    // required `type`, so the validation gate must reject it.
+    let governed_path = mountpoint.join("people/bob.md");
+    let output = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(format!("echo garbage > {}", governed_path.display()))
+        .output()
+        .expect("bash should spawn");
+
+    // 1. The bash invocation should fail (non-zero exit because the redirect close errored).
+    assert!(
+        !output.status.success(),
+        "bash > on a rejected write should fail; got: stdout={:?}, stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // 2. Stderr should mention the write error (bash 4/5 phrasing varies — match loosely).
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.to_lowercase().contains("write error") || stderr.contains("Invalid argument"),
+        "expected a write error in stderr; got: {stderr:?}"
+    );
+
+    // 3. The file itself must not have persisted the garbage.
+    let on_disk = std::fs::read(&governed_path).unwrap_or_default();
+    assert_ne!(
+        on_disk.as_slice(),
+        b"garbage\n",
+        "rejected write should NOT have landed on disk"
+    );
+
+    // 4. The .errors sidecar must exist and mention the schema problem.
+    let sidecar = mountpoint.join("people/bob.md.errors");
+    let errors = std::fs::read_to_string(&sidecar)
+        .expect(".errors sidecar should exist after a rejected write");
+    assert!(
+        !errors.trim().is_empty(),
+        ".errors sidecar should contain a violation report"
+    );
+
+    drop(session);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Concurrency regression: many writers at once must not deadlock the mount.
 /// With fuser's default single event-loop thread this hung indefinitely (the
 /// lone worker blocks in a handler while the kernel needs it for a dependent

@@ -5,7 +5,7 @@
 //! are covered by the recorder/blobstore tests; here we only assert metadata.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use trove::version::{sha256_hex, VersionStore};
+use trove::version::{sha256_hex, ChunkInsert, VersionStore};
 
 fn db_url() -> String {
     std::env::var("TROVE_DB_URL")
@@ -95,6 +95,97 @@ fn pending_embedding_hashes_surfaces_unembedded_blobs() {
 
     let pending = s.pending_embedding_hashes(10_000).unwrap();
     assert!(pending.contains(&hash), "new blob should be pending embedding");
+}
+
+#[test]
+fn stale_model_hashes_surfaces_blobs_on_old_models_only() {
+    let mut s = store();
+    // Embed two distinct blobs with distinct models. Sentinel rows (embedding =
+    // None) are fine here — the query keys off `embedding_model`, not the vector.
+    let current_model = "text-embedding-3-large";
+    let old_model = "text-embedding-2-tiny";
+
+    let path_current = unique_path("remodel-current");
+    let content_current = format!("current-{}", unique_path("c")).into_bytes();
+    let hash_current = sha256_hex(&content_current);
+    record(&mut s, &path_current, &content_current, None);
+    s.replace_chunks(
+        &hash_current,
+        current_model,
+        &[ChunkInsert { ordinal: 0, heading: None, start_byte: 0, end_byte: content_current.len() as i32, embedding: None }],
+    )
+    .unwrap();
+
+    let path_stale = unique_path("remodel-stale");
+    let content_stale = format!("stale-{}", unique_path("c")).into_bytes();
+    let hash_stale = sha256_hex(&content_stale);
+    record(&mut s, &path_stale, &content_stale, None);
+    s.replace_chunks(
+        &hash_stale,
+        old_model,
+        &[ChunkInsert { ordinal: 0, heading: None, start_byte: 0, end_byte: content_stale.len() as i32, embedding: None }],
+    )
+    .unwrap();
+
+    let stale = s.stale_model_hashes(current_model, 100_000).unwrap();
+    assert!(stale.contains(&hash_stale), "blob embedded with an older model should be flagged stale");
+    assert!(!stale.contains(&hash_current), "blob on the current model is not stale");
+}
+
+#[test]
+fn usage_reports_real_figures_and_growth() {
+    // The integration DB is shared with the rest of the suite, which runs in
+    // parallel — so we can't make exact delta assertions on counts (a
+    // concurrent test will move them). What we CAN assert: a snapshot is
+    // self-consistent, sizes are non-negative, and after adding our own
+    // content the totals strictly grew. The growth check is robust even when
+    // other tests are writing alongside, because every concurrent write
+    // also grows the totals (counts/sizes are monotonic in this suite).
+    let mut s = store();
+    let before = s.usage().unwrap();
+
+    // Add some recognisable content of our own.
+    let path_a = unique_path("usage-a");
+    let path_b = unique_path("usage-b");
+    let content_1 = format!("usage-1-{}", unique_path("c")).into_bytes();
+    let content_2 = format!("usage-2-{}", unique_path("c")).into_bytes();
+    let hash_1 = sha256_hex(&content_1);
+    record(&mut s, &path_a, &content_1, None);
+    record(&mut s, &path_a, &content_2, None);
+    record(&mut s, &path_b, &content_1, None); // dedups: same hash as content_1
+
+    s.replace_chunks(
+        &hash_1,
+        "text-embedding-3-large",
+        &[ChunkInsert {
+            ordinal: 0,
+            heading: None,
+            start_byte: 0,
+            end_byte: content_1.len() as i32,
+            embedding: None,
+        }],
+    )
+    .unwrap();
+
+    let after = s.usage().unwrap();
+
+    // Snapshot is internally consistent.
+    assert_eq!(after.embedded_blobs + after.pending_blobs, after.blobs_rows);
+    assert!(after.distinct_paths <= after.file_versions_rows);
+
+    // Sizes are non-negative.
+    assert!(after.database_bytes >= 0);
+    assert!(after.blobs_bytes >= 0);
+    assert!(after.file_versions_bytes >= 0);
+    assert!(after.blob_chunks_bytes >= 0);
+
+    // We added 2 distinct blobs, 3 version rows, 2 distinct paths, and
+    // embedded 1 blob — so each must have grown by at least that much.
+    assert!(after.blobs_rows - before.blobs_rows >= 2);
+    assert!(after.file_versions_rows - before.file_versions_rows >= 3);
+    assert!(after.distinct_paths - before.distinct_paths >= 2);
+    assert!(after.embedded_blobs > before.embedded_blobs);
+    assert!(after.blob_chunks_rows > before.blob_chunks_rows);
 }
 
 #[test]

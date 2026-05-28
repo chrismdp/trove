@@ -1,0 +1,102 @@
+# Sidebar nav for `trove docs`. Order matters; titles are what's shown.
+# Each entry's `slug` is also the URL path: /docs/<slug>. The file is
+# docs/<slug>.md. Sections group entries under a heading.
+
+[[sections]]
+title = "Getting Started"
+
+[[sections.pages]]
+slug = "intro"
+title = "What is Trove?"
+
+[[sections.pages]]
+slug = "quickstart"
+title = "Quickstart"
+
+[[sections.pages]]
+slug = "thesis"
+title = "A filesystem that talks back"
+
+[[sections]]
+title = "The Core (no native deps)"
+
+[[sections.pages]]
+slug = "frontmatter"
+title = "frontmatter.rs — parse the fence"
+
+[[sections.pages]]
+slug = "types"
+title = "types.rs — the schema registry"
+
+[[sections.pages]]
+slug = "validate"
+title = "validate.rs — run a schema"
+
+[[sections.pages]]
+slug = "check"
+title = "commands/check.rs — the validator CLI"
+
+[[sections]]
+title = "The Substrate (mount feature)"
+
+[[sections.pages]]
+slug = "jfs"
+title = "jfs.rs — libjfs FFI"
+
+[[sections.pages]]
+slug = "mount"
+title = "mount.rs — the FUSE projection"
+
+[[sections.pages]]
+slug = "versioning"
+title = "versioning.rs — COW snapshots"
+
+[[sections.pages]]
+slug = "version"
+title = "version.rs — the version DB"
+
+[[sections.pages]]
+slug = "embed"
+title = "embed.rs — the embedding worker"
+
+[[sections]]
+title = "Deep Dives"
+
+[[sections.pages]]
+slug = "write-pipeline"
+title = "The write pipeline"
+
+[[sections.pages]]
+slug = "cow-versions"
+title = "How COW versioning works"
+
+[[sections.pages]]
+slug = "embedding-pipeline"
+title = "Self-triggering embeddings"
+
+[[sections]]
+title = "Operating Trove"
+
+[[sections.pages]]
+slug = "running"
+title = "Running it end-to-end"
+
+[[sections.pages]]
+slug = "usage"
+title = "trove usage"
+
+[[sections.pages]]
+slug = "backup"
+title = "Backup"
+
+[[sections.pages]]
+slug = "troubleshooting"
+title = "Troubleshooting"
+
+[[sections.pages]]
+slug = "packaging"
+title = "Packaging & release matrix"
+
+[[sections.pages]]
+slug = "contributing"
+title = "Contributing"

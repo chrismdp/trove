@@ -36,10 +36,33 @@ enum Command {
         quiet: bool,
     },
 
-    /// Write ~/.config/trove/config.toml interactively (non-secret settings:
-    /// volume, meta, versions_db, cache, r2 bucket). Secrets stay in the
-    /// environment. After this, other commands work without the connection flags.
-    Install,
+    /// Write ~/.config/trove/config.toml interactively, then provision the
+    /// backend: apply the embedded SQL migration to the version DB and format
+    /// the JuiceFS volume. Refuses to clobber existing non-empty Trove tables
+    /// or to re-format a volume against a different bucket — use the safety
+    /// flags to override. Secrets stay in the environment.
+    Install {
+        /// Accept existing Trove tables / a formatted volume; skip the create
+        /// steps. Use when re-running install against a backend you intend to keep.
+        #[arg(long)]
+        reuse: bool,
+        /// DROP existing Trove tables and reformat the JuiceFS volume.
+        /// DESTRUCTIVE — every destructive step still prompts for an explicit
+        /// `destroy` confirmation. Re-formatting against a new bucket orphans
+        /// the chunks under the old one; this flag is the only way through.
+        #[arg(long)]
+        reinstall: bool,
+    },
+
+    /// Serve the bundled documentation on localhost. No native deps, no
+    /// Postgres, no OpenAI — `trove check`-only installs get the docs too.
+    /// The content lives under `docs/` in the source tree and is baked into
+    /// the binary at build time.
+    Docs {
+        /// Port to bind on 127.0.0.1.
+        #[arg(long, default_value_t = 38081)]
+        port: u16,
+    },
 
     /// Mount a JuiceFS-backed Trove filesystem at <mountpoint> (foreground).
     #[cfg(feature = "mount")]
@@ -65,10 +88,12 @@ enum Command {
         /// disable versioning.
         #[arg(long)]
         versions_db: Option<String>,
-        /// Embed each committed file as it's written (self-triggering, no cron).
-        /// Requires a resolvable versions_db and OPENAI_API_KEY.
+        /// Disable on-commit embedding. By default, when versions_db is
+        /// resolvable, every committed file is embedded into `blob_chunks` for
+        /// semantic search; pass `--no-embed` to skip the OpenAI call (useful
+        /// for offline runs or when search isn't needed).
         #[arg(long)]
-        embed: bool,
+        no_embed: bool,
     },
 
     /// Embed un-embedded version blobs into `blob_chunks` for search. Reads
@@ -86,6 +111,11 @@ enum Command {
         /// Run forever, sweeping every N seconds, instead of a single pass.
         #[arg(long)]
         watch: Option<u64>,
+        /// Re-embed any blob whose current chunks use a different embedding_model
+        /// than the one this binary is built against. Use after bumping the MODEL
+        /// constant; idempotent once caught up.
+        #[arg(long)]
+        remodel: bool,
     },
 
     /// Semantic search over file contents: embed the query, then rank chunks by
@@ -120,8 +150,9 @@ enum Command {
         versions_db: Option<String>,
     },
 
-    /// Preflight: check secrets, the version DB + pgvector + schema, and the
-    /// JuiceFS backend are all wired up. Exits non-zero if anything's missing.
+    /// Full health check: configuration + provenance, secrets, backend (DB
+    /// reachable + pgvector + schema + JuiceFS), and a validation sweep over
+    /// the configured store. Exits non-zero if anything's missing or invalid.
     #[cfg(feature = "mount")]
     Doctor {
         #[arg(long)]
@@ -132,6 +163,24 @@ enum Command {
         meta: Option<String>,
         #[arg(long)]
         cache: Option<PathBuf>,
+        /// Override the configured store path (defaults to config / TROVE_STORE).
+        #[arg(long)]
+        store: Option<PathBuf>,
+    },
+
+    /// Show how much space Trove is using — DB (versions + embeddings) and the
+    /// JuiceFS volume's view of the bucket. A quick "is this growing the way I
+    /// expect?" check.
+    #[cfg(feature = "mount")]
+    Usage {
+        #[arg(long)]
+        volume: Option<String>,
+        #[arg(long)]
+        meta: Option<String>,
+        #[arg(long)]
+        cache: Option<PathBuf>,
+        #[arg(long)]
+        versions_db: Option<String>,
     },
 
     /// Show a path's version history, newest first. Needs only the version DB.
@@ -167,6 +216,31 @@ enum Command {
         path: String,
         rev_a: i32,
         rev_b: i32,
+        #[arg(long)]
+        volume: Option<String>,
+        #[arg(long)]
+        meta: Option<String>,
+        #[arg(long)]
+        cache: Option<PathBuf>,
+        #[arg(long)]
+        versions_db: Option<String>,
+    },
+
+    /// Write a local mirror of every committed file. Walks the version chain so
+    /// history is preserved. Incremental by default (re-running skips revs whose
+    /// bytes already exist at the destination with a matching hash).
+    #[cfg(feature = "mount")]
+    Backup {
+        /// Destination directory. Falls back to config `backup_dir`.
+        #[arg(long)]
+        dest: Option<PathBuf>,
+        /// `by-path` (default): live tree at <dest>/<path> + history under
+        /// <dest>/.versions/. `by-rev`: one full tree per rev under <dest>/rev-N/.
+        #[arg(long, default_value = "by-path")]
+        layout: String,
+        /// Walk + count, but don't write any files.
+        #[arg(long)]
+        dry_run: bool,
         #[arg(long)]
         volume: Option<String>,
         #[arg(long)]
@@ -248,9 +322,12 @@ fn run() -> Result<usize> {
     match cli.command {
         Command::Check { store, quiet } => {
             let s = trove::commands::check::run(&store, quiet)?;
+            // Schema count printed first so a `0 schemas` result is unmissable —
+            // an empty registry validates nothing, which is rarely what you want.
             println!(
-                "\n{} {} checked · {} valid · {} untyped · {} {}",
+                "\n{} {} schema(s) · {} checked · {} valid · {} untyped · {} {}",
                 "trove:".bold(),
+                s.schemas_present,
                 s.checked,
                 s.valid.to_string().green(),
                 s.untyped,
@@ -260,48 +337,18 @@ fn run() -> Result<usize> {
             Ok(s.failed)
         }
 
-        Command::Install => {
-            use std::io::{self, Write};
-            let cur = trove::config::Config::load();
-            let path = trove::config::Config::path()?;
-            println!("{} writing {}", "trove install:".bold(), path.display());
-            println!(
-                "{}\n",
-                "secrets stay in the environment, NOT this file: OPENAI_API_KEY, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY".dimmed()
-            );
-            let ask = |label: &str, current: Option<&str>| -> io::Result<Option<String>> {
-                match current {
-                    Some(c) => print!("{label} [{}]: ", c.dimmed()),
-                    None => print!("{label}: "),
-                }
-                io::stdout().flush()?;
-                let mut line = String::new();
-                io::stdin().read_line(&mut line)?;
-                let line = line.trim();
-                Ok(if line.is_empty() {
-                    current.map(str::to_string)
-                } else {
-                    Some(line.to_string())
-                })
-            };
-            let new = trove::config::Config {
-                versions_db: ask("versions_db (postgres URL)", cur.versions_db.as_deref())?,
-                volume: ask("volume name", cur.volume.as_deref())?,
-                meta: ask("meta URL (often the same as versions_db)", cur.meta.as_deref())?,
-                cache: ask("cache dir", cur.cache.as_deref().or(Some("/tmp/trove-cache")))?,
-                r2_bucket: ask("r2 bucket (optional, for `trove doctor`)", cur.r2_bucket.as_deref())?,
-            };
-            let written = new.save()?;
-            println!("\n{} wrote {}", "trove:".bold(), written.display());
-            println!(
-                "{}",
-                "export OPENAI_API_KEY (and R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY for the backend) before mounting.".dimmed()
-            );
+        Command::Docs { port } => {
+            trove::commands::docs::run(port)?;
+            Ok(0)
+        }
+
+        Command::Install { reuse, reinstall } => {
+            trove::commands::install::run(trove::commands::install::InstallFlags { reuse, reinstall })?;
             Ok(0)
         }
 
         #[cfg(feature = "mount")]
-        Command::Mount { mountpoint, volume, meta, cache, types, versions_db, embed } => {
+        Command::Mount { mountpoint, volume, meta, cache, types, versions_db, no_embed } => {
             let fs = init_fs(volume, meta, cache, &cfg)?;
             let registry = match &types {
                 Some(dir) => trove::types::Registry::load(dir)?,
@@ -316,14 +363,18 @@ fn run() -> Result<usize> {
                 Some(url) => Some(trove::version::VersionStore::connect(url)?),
                 None => None,
             };
-            // Optional self-triggering embedding: needs versioning + the key.
-            let embed_tx = if embed {
-                let url = versions_url
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("--embed requires a resolvable versions_db"))?;
-                Some(trove::embed::spawn_embedder(url, openai_key()?)?)
-            } else {
-                None
+            // On-commit embedding is ON by default whenever versioning is on.
+            // Resolve the API key up front so a missing key fails the mount
+            // immediately, not lazily on the first write. `--no-embed` opts out
+            // for offline runs.
+            let embed_tx = match (&versions_url, no_embed) {
+                (Some(url), false) => {
+                    let key = openai_key().map_err(|e| anyhow::anyhow!(
+                        "{e}. Set OPENAI_API_KEY, or pass --no-embed to mount without embedding."
+                    ))?;
+                    Some(trove::embed::spawn_embedder(url, key)?)
+                }
+                _ => None,
             };
             println!(
                 "{} mounting at {} ({}; versioning {}; embed {})",
@@ -335,17 +386,33 @@ fn run() -> Result<usize> {
                     format!("validating via {}", types.as_ref().unwrap().display())
                 },
                 if versions.is_some() { "on" } else { "off" },
-                if embed_tx.is_some() { "on" } else { "off" },
+                if embed_tx.is_some() {
+                    "on"
+                } else if versions.is_none() {
+                    "off (needs versioning)"
+                } else {
+                    "off (--no-embed)"
+                },
             );
             trove::mount::mount_blocking(fs, registry, versions, embed_tx, &mountpoint)?;
             Ok(0)
         }
 
         #[cfg(feature = "mount")]
-        Command::Embed { volume, meta, cache, versions_db, watch } => {
+        Command::Embed { volume, meta, cache, versions_db, watch, remodel } => {
+            if remodel && watch.is_some() {
+                return Err(anyhow::anyhow!(
+                    "--remodel and --watch are mutually exclusive — remodel is a one-shot migration"
+                ));
+            }
             let api_key = openai_key()?;
             let fs = init_fs(volume, meta, cache, &cfg)?;
             let mut versions = connect_versions(versions_db, &cfg)?;
+            if remodel {
+                let n = trove::embed::run_remodel(&fs, &mut versions, &api_key)?;
+                println!("{} re-embedded {n} blob(s) for model upgrade", "trove:".bold());
+                return Ok(0);
+            }
             match watch {
                 Some(secs) => {
                     println!("{} embedding (watch, every {secs}s)…", "trove:".bold());
@@ -392,20 +459,48 @@ fn run() -> Result<usize> {
         }
 
         #[cfg(feature = "mount")]
-        Command::Doctor { versions_db, volume, meta, cache } => {
-            let checks = trove::commands::doctor::run(&cfg, versions_db, volume, meta, cache);
+        Command::Doctor { versions_db, volume, meta, cache, store } => {
+            let checks = trove::commands::doctor::run(&cfg, versions_db, volume, meta, cache, store);
             let failed = checks.iter().filter(|c| !c.ok).count();
             println!("{}", "trove doctor".bold());
+
+            // Group rows by section, in the canonical order, blank line between.
+            use trove::commands::doctor::SECTION_ORDER;
+            let mut printed_sections: Vec<&str> = Vec::new();
+            let mut sections_in_order: Vec<&str> = SECTION_ORDER.to_vec();
+            // Append any extra sections we don't know about (defensive).
             for c in &checks {
-                let mark = if c.ok { "✓".green() } else { "✗".red() };
-                println!("  {mark} {:<18} {}", c.name, c.detail.dimmed());
+                if !sections_in_order.contains(&c.section) {
+                    sections_in_order.push(c.section);
+                }
             }
+            for section in sections_in_order {
+                let rows: Vec<_> = checks.iter().filter(|c| c.section == section).collect();
+                if rows.is_empty() { continue; }
+                if !printed_sections.is_empty() { println!(); }
+                println!("  {}", section.bold());
+                for c in rows {
+                    let mark = if c.ok { "✓".green() } else { "✗".red() };
+                    println!("    {mark} {:<18} {}", c.name, c.detail.dimmed());
+                }
+                printed_sections.push(section);
+            }
+
             if failed == 0 {
                 println!("\n{} all checks passed", "✓".green().bold());
             } else {
                 println!("\n{} {failed} check(s) failed", "✗".red().bold());
             }
             Ok(failed)
+        }
+
+        #[cfg(feature = "mount")]
+        Command::Usage { volume, meta, cache, versions_db } => {
+            let fs = init_fs(volume, meta, cache, &cfg)?;
+            let mut versions = connect_versions(versions_db, &cfg)?;
+            let report = trove::commands::usage::run(&fs, &mut versions)?;
+            trove::commands::usage::print(&report);
+            Ok(0)
         }
 
         #[cfg(feature = "mount")]
@@ -447,6 +542,37 @@ fn run() -> Result<usize> {
             let mut versions = connect_versions(versions_db, &cfg)?;
             let out = trove::commands::history::diff(&fs, &mut versions, &path, rev_a, rev_b)?;
             print!("{out}");
+            Ok(0)
+        }
+
+        #[cfg(feature = "mount")]
+        Command::Backup { dest, layout, dry_run, volume, meta, cache, versions_db } => {
+            use trove::commands::backup::{self, BackupOptions, Layout};
+            let layout = Layout::parse(&layout)?;
+            // Flag > config — backup_dir is purely optional, so failing-fast
+            // here is cleaner than the `resolve` helper (no env var pairing).
+            let dest = dest
+                .or_else(|| cfg.backup_dir.as_deref().map(PathBuf::from))
+                .ok_or_else(|| anyhow::anyhow!(
+                    "no backup destination — pass --dest <dir>, or set `backup_dir` in ~/.config/trove/config.toml (run `trove install`)"
+                ))?;
+            let fs = init_fs(volume, meta, cache, &cfg)?;
+            let mut versions = connect_versions(versions_db, &cfg)?;
+            let report = backup::run(
+                &fs,
+                &mut versions,
+                &BackupOptions { dest: dest.clone(), layout, since: None, dry_run },
+            )?;
+            let prefix = if dry_run { "trove backup (dry-run):" } else { "trove backup:" };
+            println!(
+                "{} {} path(s) walked \u{2192} {}; {} rev(s) written ({}), {} unchanged",
+                prefix.bold(),
+                report.paths,
+                dest.display(),
+                report.revisions_written,
+                trove::commands::usage::human_bytes(report.bytes_written),
+                report.skipped_unchanged,
+            );
             Ok(0)
         }
 

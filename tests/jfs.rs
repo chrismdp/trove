@@ -1,19 +1,13 @@
 //! e2e tests for the libjfs wrapper. Each test formats a real JuiceFS volume
 //! (SQLite metadata + local-file object store — fast, isolated; R2 is proven
 //! separately) and drives it through the safe wrapper. Requires the built
-//! `libjfs` + the `juicefs` binary; run with `--features mount`.
+//! `libjfs`; run with `--features mount`. No `juicefs` binary needed — format
+//! goes through the `jfs_format` FFI entry the same way `trove install` does.
 #![cfg(feature = "mount")]
 
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use trove::jfs::Fs;
-
-/// Path to the `juicefs` binary (built in the spike); override with JUICEFS_BIN.
-fn juicefs_bin() -> String {
-    std::env::var("JUICEFS_BIN")
-        .unwrap_or_else(|_| "/home/cp/code/trove/spike/juicefs/juicefs".to_string())
-}
+use trove::jfs::{self, Fs};
 
 /// A freshly formatted throwaway volume: unique dir, SQLite meta, file store.
 struct TestVol {
@@ -39,23 +33,13 @@ impl TestVol {
         let name = format!("vol{}", uniq.replace('-', ""));
         let meta = format!("sqlite3://{}/meta.db", dir.display());
 
-        let out = Command::new(juicefs_bin())
-            .args([
-                "format",
-                "--storage",
-                "file",
-                "--bucket",
-                &format!("{}/store/", dir.display()),
-                &meta,
-                &name,
-            ])
-            .output()
-            .expect("run juicefs format");
-        assert!(
-            out.status.success(),
-            "juicefs format failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let conf = serde_json::json!({
+            "meta": meta,
+            "name": name,
+            "storage": "file",
+            "bucket": format!("{}/store/", dir.display()),
+        });
+        jfs::format(&conf).expect("jfs::format (FFI) failed");
         TestVol { dir, name, meta }
     }
 
@@ -74,6 +58,51 @@ impl Drop for TestVol {
 fn init_opens_a_formatted_volume() {
     let v = TestVol::new("init");
     let _fs = v.open(); // panics if jfs_init fails
+}
+
+#[test]
+fn jfs_format_ffi_creates_volume_that_can_be_opened() {
+    // Targeted test for the `jfs_format` FFI entry (the one that replaced the
+    // `juicefs` CLI shell-out in `trove install`). Asserts the round-trip:
+    // format → open. If libjfs ever stops accepting our JSON shape, or the
+    // newly-created volume can't be opened, this fails loudly.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let uniq = format!(
+        "{}-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let dir = std::env::temp_dir().join(format!("trove-ffi-format-{uniq}"));
+    std::fs::create_dir_all(dir.join("store")).unwrap();
+    let name = format!("ffi{}", uniq.replace('-', ""));
+    let meta = format!("sqlite3://{}/meta.db", dir.display());
+
+    let conf = serde_json::json!({
+        "meta": meta,
+        "name": name,
+        "storage": "file",
+        "bucket": format!("{}/store/", dir.display()),
+    });
+    jfs::format(&conf).expect("FFI format failed");
+
+    // Verify the volume is openable with the safe wrapper.
+    let fs = Fs::init(&name, &meta, &format!("{}/cache", dir.display()))
+        .expect("Fs::init after FFI format failed");
+    // And functional — minimal write/read round-trip.
+    let f = fs.create("/probe.md", 0o644).unwrap();
+    f.write_at(b"ffi format works", 0).unwrap();
+    f.fsync().unwrap();
+    drop(f);
+    assert_eq!(fs.read_all("/probe.md").unwrap(), b"ffi format works");
+
+    // Cleanup
+    drop(fs);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

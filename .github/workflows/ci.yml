@@ -1,0 +1,101 @@
+# CI — build + lib tests on push/PR across the four supported targets.
+#
+# Integration tests (tests/*.rs that exercise live Postgres / R2 / OpenAI
+# or require /dev/fuse) are intentionally NOT run here. CI proves the
+# code compiles and unit/lib tests pass; end-to-end coverage is the
+# developer's responsibility before tagging a release.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: ${{ matrix.os_label }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            os_label: linux
+            arch: amd64
+            libjfs_file: libjfs-amd64.so
+          - runner: ubuntu-22.04-arm
+            os_label: linux
+            arch: arm64
+            libjfs_file: libjfs-arm64.so
+          - runner: macos-13
+            os_label: macos
+            arch: amd64
+            libjfs_file: libjfs-amd64.dylib
+          - runner: macos-14
+            os_label: macos
+            arch: arm64
+            libjfs_file: libjfs-arm64.dylib
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + libjfs build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            libjfs/build
+          key: ${{ matrix.os_label }}-${{ matrix.arch }}-libjfs-${{ hashFiles('libjfs/build.sh', 'libjfs/patches/**') }}
+          restore-keys: |
+            ${{ matrix.os_label }}-${{ matrix.arch }}-libjfs-
+
+      - name: Install platform deps (linux)
+        if: matrix.os_label == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse3-dev pkg-config
+
+      - name: Install platform deps (macos)
+        if: matrix.os_label == 'macos'
+        # macFUSE on CI requires kernel-extension consent — not possible
+        # in headless GHA. We only need it to RUN a FUSE mount, not to
+        # compile the binary. Mount integration tests are skipped on CI.
+        run: |
+          brew install pkg-config || true
+
+      - name: Build libjfs
+        run: |
+          ./libjfs/build.sh
+          ls -la "libjfs/build/${{ matrix.libjfs_file }}"
+
+      - name: cargo check (core)
+        run: cargo check
+
+      - name: cargo check (mount feature)
+        env:
+          LIBJFS_DIR: ${{ github.workspace }}/libjfs/build
+        run: cargo check --features mount
+
+      - name: cargo build --release --features mount
+        env:
+          LIBJFS_DIR: ${{ github.workspace }}/libjfs/build
+        run: cargo build --release --features mount
+
+      - name: cargo test --lib (core)
+        run: cargo test --lib
+
+      - name: cargo test --features mount --lib
+        env:
+          LIBJFS_DIR: ${{ github.workspace }}/libjfs/build
+        # Lib tests only — integration tests in tests/ require live
+        # Postgres / R2 / OpenAI / /dev/fuse and aren't run on CI.
+        run: cargo test --features mount --lib

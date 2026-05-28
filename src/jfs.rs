@@ -10,6 +10,20 @@
 //! non-negative value on success (a file handle, or a byte count, or 0) and a
 //! **negative errno** on failure.
 
+// Hard-stop with a clear message on unsupported triples — otherwise the
+// `extern "C"` block compiles but the binary won't link.
+#[cfg(not(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "aarch64"),
+    all(target_os = "macos", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64"),
+)))]
+compile_error!(
+    "trove `mount` feature: unsupported target. \
+     Supported: linux/x86_64, linux/aarch64, macos/x86_64, macos/aarch64. \
+     See docs/packaging.md."
+);
+
 use anyhow::{bail, Result};
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
@@ -56,8 +70,15 @@ impl DirEntry {
     }
 }
 
-#[link(name = "jfs-amd64")]
+// Platform-aware link selection. The rustc link name is shared across OSes
+// (linker picks `.so` vs `.dylib`); see `build.rs` and `docs/packaging.md`
+// for the full filename matrix.
+#[cfg_attr(all(target_os = "linux", target_arch = "x86_64"), link(name = "jfs-amd64"))]
+#[cfg_attr(all(target_os = "linux", target_arch = "aarch64"), link(name = "jfs-arm64"))]
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), link(name = "jfs-amd64"))]
+#[cfg_attr(all(target_os = "macos", target_arch = "aarch64"), link(name = "jfs-arm64"))]
 extern "C" {
+    fn jfs_format(json_conf: *const c_char) -> c_int;
     fn jfs_init(
         credential_ptr: usize,
         count: c_int,
@@ -122,6 +143,33 @@ fn check(ret: c_int, op: &str) -> Result<c_int> {
         bail!("{op}: errno {}", -ret);
     }
     Ok(ret)
+}
+
+/// Format a JuiceFS volume in-process.
+///
+/// JSON keys (lowercase camelCase, matching the libjfs `formatConf` Go struct):
+/// `meta` (postgres/sqlite URL — required), `name` (volume name — required),
+/// `storage` (e.g. `"s3"`, `"file"`), `bucket`, `accessKey`, `secretKey`,
+/// `blockSize` (KB, default 4096), `compress` (default `"none"`),
+/// `trashDays` (default 1), `force` (default false).
+///
+/// This is the in-process equivalent of `juicefs format`. It runs the same
+/// blob-store sanity probe (put + get + delete a tiny object) before persisting
+/// the format row to the metadata DB. Returns once the volume is ready for
+/// `Fs::init` to open.
+pub fn format(config: &serde_json::Value) -> Result<()> {
+    let conf_str = config.to_string();
+    let cconf = cs(&conf_str)?;
+    let ret = unsafe { jfs_format(cconf.as_ptr()) };
+    if ret < 0 {
+        bail!(
+            "jfs_format failed (return {ret}, errno {}). \
+             Check libjfs logs above for the specific cause \
+             (auth, bucket, meta URL, etc.).",
+            -ret
+        );
+    }
+    Ok(())
 }
 
 /// An open JuiceFS filesystem handle. Drop order matters: keep `Fs` alive for

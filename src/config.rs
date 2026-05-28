@@ -28,6 +28,12 @@ pub struct Config {
     /// R2/S3 bucket (reference for `trove doctor`; not a secret).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub r2_bucket: Option<String>,
+    /// Path to the vault root (used by doctor's validation sweep and as the default --types for mount).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub store: Option<String>,
+    /// Path to a local mirror directory. When set, `trove backup` writes here by default.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub backup_dir: Option<String>,
 }
 
 impl Config {
@@ -72,12 +78,29 @@ pub fn resolve(
     from_cfg: Option<String>,
     name: &str,
 ) -> Result<String> {
-    flag.filter(|s| !s.is_empty())
-        .or_else(|| std::env::var(env_var).ok().filter(|s| !s.is_empty()))
-        .or(from_cfg)
-        .with_context(|| {
-            format!("no {name} — pass the flag, set {env_var}, or run `trove install`")
-        })
+    resolve_with_source(flag, env_var, from_cfg, name).map(|(v, _)| v)
+}
+
+/// Same as [`resolve`] but also returns where the value came from: `"flag"`,
+/// `"env"`, or `"config"`. Used by `trove doctor` to show provenance.
+pub fn resolve_with_source(
+    flag: Option<String>,
+    env_var: &str,
+    from_cfg: Option<String>,
+    name: &str,
+) -> Result<(String, &'static str)> {
+    if let Some(v) = flag.filter(|s| !s.is_empty()) {
+        return Ok((v, "flag"));
+    }
+    if let Some(v) = std::env::var(env_var).ok().filter(|s| !s.is_empty()) {
+        return Ok((v, "env"));
+    }
+    if let Some(v) = from_cfg {
+        return Ok((v, "config"));
+    }
+    Err(anyhow::anyhow!(
+        "no {name} — pass the flag, set {env_var}, or run `trove install`"
+    ))
 }
 
 #[cfg(test)]
@@ -98,6 +121,19 @@ mod tests {
     }
 
     #[test]
+    fn resolve_with_source_labels_provenance() {
+        std::env::set_var("TROVE_TEST_Z", "from-env");
+        let (v, src) = resolve_with_source(Some("from-flag".into()), "TROVE_TEST_Z", Some("from-cfg".into()), "z").unwrap();
+        assert_eq!((v.as_str(), src), ("from-flag", "flag"));
+        let (v, src) = resolve_with_source(None, "TROVE_TEST_Z", Some("from-cfg".into()), "z").unwrap();
+        assert_eq!((v.as_str(), src), ("from-env", "env"));
+        std::env::remove_var("TROVE_TEST_Z");
+        let (v, src) = resolve_with_source(None, "TROVE_TEST_Z", Some("from-cfg".into()), "z").unwrap();
+        assert_eq!((v.as_str(), src), ("from-cfg", "config"));
+        assert!(resolve_with_source(None, "TROVE_TEST_Z", None, "z").is_err());
+    }
+
+    #[test]
     fn empty_flag_and_env_are_ignored() {
         std::env::set_var("TROVE_TEST_Y", "");
         let r = resolve(Some(String::new()), "TROVE_TEST_Y", Some("cfg".into()), "y").unwrap();
@@ -113,6 +149,8 @@ mod tests {
             meta: None,
             cache: Some("/tmp/c".into()),
             r2_bucket: Some("trove".into()),
+            store: None,
+            backup_dir: None,
         };
         let text = toml::to_string_pretty(&c).unwrap();
         assert!(text.contains("versions_db"));

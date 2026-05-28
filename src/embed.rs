@@ -365,6 +365,26 @@ pub fn run_once(fs: &Fs, versions: &mut VersionStore, api_key: &str) -> Result<u
     Ok(processed)
 }
 
+/// Single sweep that picks blobs whose existing chunks are on a different
+/// model and re-embeds them with the current MODEL. Returns the number of
+/// blobs reprocessed. Idempotent: re-running once everything's up-to-date is
+/// a no-op (no rows are stale).
+pub fn run_remodel(fs: &Fs, versions: &mut VersionStore, api_key: &str) -> Result<usize> {
+    let mut processed = 0;
+    loop {
+        let stale = versions.stale_model_hashes(MODEL, BATCH)?;
+        if stale.is_empty() {
+            break;
+        }
+        for hash in &stale {
+            embed_blob(fs, versions, api_key, hash)
+                .with_context(|| format!("re-embedding blob {hash}"))?;
+            processed += 1;
+        }
+    }
+    Ok(processed)
+}
+
 /// Sweep on an interval forever: embed anything pending, then sleep. Latency is
 /// bounded by `interval`. (A future upgrade fires a `pg_notify` from `commit()`
 /// and `LISTEN`s here for near-instant wake; polling is the robust v1.)

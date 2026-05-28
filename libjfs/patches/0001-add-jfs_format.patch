@@ -1,0 +1,217 @@
+# Adds jfs_format C-exported entry to libjfs so trove can format a JuiceFS
+# volume in-process (no juicefs CLI shell-out). Wraps the same code paths
+# `juicefs format` uses; takes a JSON config matching what jfs_init takes
+# plus volume name, bucket creds, etc.
+#
+# Apply with:  patch -p1 < 0001-add-jfs_format.patch
+# Or:          git apply 0001-add-jfs_format.patch
+diff --git a/sdk/java/libjfs/main.go b/sdk/java/libjfs/main.go
+index e1682fa..9eb5ee5 100644
+--- a/sdk/java/libjfs/main.go
++++ b/sdk/java/libjfs/main.go
+@@ -55,6 +55,7 @@ import (
+ 	"os"
+ 	"path"
+ 	"path/filepath"
++	"regexp"
+ 	"runtime/debug"
+ 	"strconv"
+ 	"strings"
+@@ -63,6 +64,7 @@ import (
+ 	"time"
+ 	"unsafe"
+ 
++	"github.com/google/uuid"
+ 	"github.com/juicedata/juicefs/cmd"
+ 	"github.com/juicedata/juicefs/pkg/acl"
+ 	"github.com/juicedata/juicefs/pkg/chunk"
+@@ -2146,5 +2148,189 @@ func jfs_cancel_token(h int64, id uint32, password *C.char) int32 {
+ 	return errno(kerb.cancelToken(w.ctx, w.Meta(), w.user, id, C.GoString(password)))
+ }
+ 
++// formatConf is the JSON shape accepted by jfs_format. Keep this surface small —
++// only what `trove install` actually needs. Field names match meta.Format
++// wherever possible (lowercase camelCase). Defaults match `juicefs format` CLI
++// defaults so a minimal config produces a valid volume.
++type formatConf struct {
++	Meta        string `json:"meta"`
++	Name        string `json:"name"`
++	Storage     string `json:"storage"`
++	Bucket      string `json:"bucket"`
++	AccessKey   string `json:"accessKey"`
++	SecretKey   string `json:"secretKey"`
++	BlockSize   int    `json:"blockSize"` // KB; 0 means default (4096)
++	Compress    string `json:"compress"`  // "" means default ("none")
++	TrashDays   *int   `json:"trashDays"` // pointer so 0 is distinguishable from unset
++	Force       bool   `json:"force"`
++}
++
++//export jfs_format
++func jfs_format(cjsonConf *C.char) C.int {
++	var fc formatConf
++	jsonStr := C.GoString(cjsonConf)
++	if err := json.Unmarshal([]byte(jsonStr), &fc); err != nil {
++		logger.Errorf("jfs_format: invalid json: %s", err)
++		return C.int(EINVAL)
++	}
++	if fc.Meta == "" || fc.Name == "" {
++		logger.Errorf("jfs_format: meta and name are required")
++		return C.int(EINVAL)
++	}
++	validName := regexp.MustCompile(`^[a-z0-9][a-z0-9\-]{1,61}[a-z0-9]$`)
++	if !validName.MatchString(fc.Name) {
++		logger.Errorf("jfs_format: invalid name %q (must match %s)", fc.Name, validName)
++		return C.int(EINVAL)
++	}
++
++	// Defaults matching `juicefs format` CLI defaults.
++	blockSizeKB := fc.BlockSize
++	if blockSizeKB == 0 {
++		blockSizeKB = 4096
++	}
++	// fixObjectSize rounds the block size to the nearest power of two in [64K, 16M].
++	blockSizeKB = int(fixObjectSize(uint64(blockSizeKB)<<10) >> 10)
++	compress := fc.Compress
++	if compress == "" {
++		compress = "none"
++	}
++	trashDays := 1
++	if fc.TrashDays != nil {
++		trashDays = *fc.TrashDays
++	}
++
++	format := &meta.Format{
++		Name:             fc.Name,
++		UUID:             uuid.New().String(),
++		Storage:          fc.Storage,
++		Bucket:           fc.Bucket,
++		AccessKey:        fc.AccessKey,
++		SecretKey:        fc.SecretKey,
++		BlockSize:        blockSizeKB,
++		Compression:      compress,
++		TrashDays:        trashDays,
++		DirStats:         true,
++		MetaVersion:      meta.MaxVersion,
++		MinClientVersion: "1.1.0-A",
++	}
++
++	// `file` and `sqlite3` storage backends want an absolute bucket path.
++	if format.Storage == "file" || format.Storage == "sqlite3" {
++		p, err := filepath.Abs(format.Bucket)
++		if err != nil {
++			logger.Errorf("jfs_format: resolve %q: %s", format.Bucket, err)
++			return -1
++		}
++		format.Bucket = p
++		if format.Storage == "file" && !strings.HasSuffix(format.Bucket, "/") {
++			format.Bucket += "/"
++		}
++	}
++
++	// Build the object store and run the same put/get/delete sanity test the
++	// `juicefs format` CLI does — fails fast on misconfigured creds/buckets.
++	blob, err := jfsFormatBuildBlob(format)
++	if err != nil {
++		logger.Errorf("jfs_format: object storage: %s", err)
++		return -1
++	}
++	logger.Infof("jfs_format: data use %s", blob)
++	if os.Getenv("JFS_NO_CHECK_OBJECT_STORAGE") == "" {
++		if err := jfsFormatTestStore(context.Background(), blob); err != nil {
++			logger.Errorf("jfs_format: storage %s is not configured correctly: %s", blob, err)
++			return -1
++		}
++		// Stamp the volume UUID so a subsequent format against the same bucket
++		// can detect prior use. Best-effort — JuiceFS warns rather than fails.
++		if err := blob.Put(context.Background(), "juicefs_uuid", bytes.NewReader([]byte(format.UUID))); err != nil {
++			logger.Warnf("jfs_format: put uuid object: %s", err)
++		}
++	}
++
++	// Open metadata client and run Init — the canonical persist step.
++	m := meta.NewClient(fc.Meta, nil)
++	if err := format.Encrypt(); err != nil {
++		logger.Errorf("jfs_format: encrypt: %s", err)
++		return -1
++	}
++	if err := m.Init(format, fc.Force); err != nil {
++		// Best-effort: if Init fails, undo the uuid stamp so the bucket is left
++		// in the state we found it.
++		_ = blob.Delete(context.Background(), "juicefs_uuid")
++		logger.Errorf("jfs_format: init: %s", err)
++		return -1
++	}
++	logger.Infof("jfs_format: volume %s formatted", format.Name)
++	return 0
++}
++
++// jfsFormatBuildBlob mirrors the relevant bits of cmd.createStorage, minus
++// Kerberos/Ranger/ACL/encryption (not in Trove's scope). Returns a prefixed
++// ObjectStorage ready for use.
++func jfsFormatBuildBlob(format *meta.Format) (object.ObjectStorage, error) {
++	if err := format.Decrypt(); err != nil {
++		return nil, fmt.Errorf("decrypt: %s", err)
++	}
++	object.UserAgent = "JuiceFS-SDK " + version.Version()
++	blob, err := object.CreateStorage(strings.ToLower(format.Storage), format.Bucket, format.AccessKey, format.SecretKey, format.SessionToken)
++	if err != nil {
++		return nil, err
++	}
++	blob = object.WithPrefix(blob, format.Name+"/")
++	return blob, nil
++}
++
++// jfsFormatTestStore is a stripped equivalent of cmd.test/doTesting: put a small
++// blob, read it back, delete it. Surfaces auth / endpoint problems before we
++// touch the metadata DB.
++func jfsFormatTestStore(ctx context.Context, store object.ObjectStorage) error {
++	key := "testing/jfs_format_probe"
++	data := []byte("trove-libjfs-format-probe")
++	if err := store.Put(ctx, key, bytes.NewReader(data)); err != nil {
++		// Try to create the bucket on demand (matches cmd.doTesting behaviour).
++		if err2 := store.Create(ctx); err2 == nil {
++			if err3 := store.Put(ctx, key, bytes.NewReader(data)); err3 != nil {
++				return fmt.Errorf("put after create: %s (original: %s)", err3, err)
++			}
++		} else {
++			return fmt.Errorf("put: %s (create bucket also failed: %s)", err, err2)
++		}
++	}
++	r, err := store.Get(ctx, key, 0, -1)
++	if err != nil {
++		return fmt.Errorf("get: %s", err)
++	}
++	got, err := io.ReadAll(r)
++	_ = r.Close()
++	if err != nil {
++		return fmt.Errorf("read body: %s", err)
++	}
++	if !bytes.Equal(got, data) {
++		return fmt.Errorf("read mismatch: expected %x got %x", data, got)
++	}
++	if err := store.Delete(ctx, key); err != nil {
++		logger.Warnf("jfs_format: delete probe key: %s", err)
++	}
++	return nil
++}
++
++// fixObjectSize: rounds `s` to the nearest power of two in [64K, 16M].
++// Mirrors cmd.fixObjectSize so libjfs doesn't need to import cmd's unexported helpers.
++func fixObjectSize(s uint64) uint64 {
++	const min, max = uint64(64 << 10), uint64(16 << 20)
++	var bits uint
++	for s > 1 {
++		bits++
++		s >>= 1
++	}
++	s = s << bits
++	if s < min {
++		s = min
++	} else if s > max {
++		s = max
++	}
++	return s
++}
++
+ func main() {
+ }

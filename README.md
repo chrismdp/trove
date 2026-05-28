@@ -5,6 +5,31 @@ down to the filesystem layer, so any agent — or human — gets typed, validate
 schema-checked shared state with zero per-agent integration. You don't need MCP
 to coordinate agents; you need a filesystem that talks back.
 
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/chrismdp/trove/main/install.sh | sh
+```
+
+Linux + macOS, amd64 + arm64. Pulls the latest pre-built binary (and the
+matching `libjfs` shared library) from the GitHub Release, verifies the
+sha256, installs to `~/.local/share/trove/<version>/`, and symlinks
+`trove` into `~/.local/bin/`.
+
+To pin a specific version:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/chrismdp/trove/main/install.sh | sh -s -- --version v0.2.0
+```
+
+Or build from source (needs a recent Rust toolchain and Go ≥ 1.22 to
+build `libjfs`, plus running `./libjfs/build.sh` before `cargo install`):
+
+```sh
+./libjfs/build.sh
+cargo install --git https://github.com/chrismdp/trove --features mount
+```
+
 ## Status — v0.1 (single-tenant)
 
 Built and tested end-to-end: **schema-on-write validation**, a **FUSE mount**

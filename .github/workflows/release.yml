@@ -1,0 +1,146 @@
+# Release — tag-triggered cross-platform release.
+#
+# Tag `v0.2.0` produces:
+#   trove-0.2.0-linux-amd64.tar.gz   (+ .sha256)
+#   trove-0.2.0-linux-arm64.tar.gz   (+ .sha256)
+#   trove-0.2.0-macos-amd64.tar.gz   (+ .sha256)
+#   trove-0.2.0-macos-arm64.tar.gz   (+ .sha256)
+#
+# Each tarball contains `trove`, the matching `libjfs-<arch>.{so,dylib}`,
+# LICENSE.md and README.md. The relocatable rpath in build.rs ($ORIGIN /
+# @loader_path) makes the binary find libjfs alongside it at runtime.
+name: release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+jobs:
+  build:
+    name: build-${{ matrix.os_label }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            os_label: linux
+            arch: amd64
+            libjfs_file: libjfs-amd64.so
+          - runner: ubuntu-22.04-arm
+            os_label: linux
+            arch: arm64
+            libjfs_file: libjfs-arm64.so
+          - runner: macos-13
+            os_label: macos
+            arch: amd64
+            libjfs_file: libjfs-amd64.dylib
+          - runner: macos-14
+            os_label: macos
+            arch: arm64
+            libjfs_file: libjfs-arm64.dylib
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install platform deps (linux)
+        if: matrix.os_label == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse3-dev pkg-config
+
+      - name: Install platform deps (macos)
+        if: matrix.os_label == 'macos'
+        run: brew install pkg-config || true
+
+      - name: Build libjfs
+        run: |
+          ./libjfs/build.sh
+          ls -la "libjfs/build/${{ matrix.libjfs_file }}"
+
+      - name: cargo build --release --features mount
+        env:
+          LIBJFS_DIR: ${{ github.workspace }}/libjfs/build
+        run: cargo build --release --features mount
+
+      - name: Compute version
+        id: version
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tarball=trove-${version}-${{ matrix.os_label }}-${{ matrix.arch }}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Package
+        shell: bash
+        env:
+          TARBALL: ${{ steps.version.outputs.tarball }}
+          LIBJFS_FILE: ${{ matrix.libjfs_file }}
+        run: |
+          set -eu
+          staging="dist/staging"
+          out="dist/out"
+          mkdir -p "$staging" "$out"
+          cp target/release/trove "$staging/trove"
+          cp "libjfs/build/${LIBJFS_FILE}" "$staging/${LIBJFS_FILE}"
+          cp LICENSE.md "$staging/LICENSE.md"
+          cp README.md "$staging/README.md"
+          chmod +x "$staging/trove"
+          tar -C "$staging" -czf "$out/${TARBALL}" .
+          # Portable sha256 (sha256sum on linux, shasum on macos).
+          cd "$out"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${TARBALL}" > "${TARBALL}.sha256"
+          else
+            shasum -a 256 "${TARBALL}" > "${TARBALL}.sha256"
+          fi
+          ls -la
+
+      - name: Upload artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trove-${{ matrix.os_label }}-${{ matrix.arch }}
+          path: |
+            dist/out/${{ steps.version.outputs.tarball }}
+            dist/out/${{ steps.version.outputs.tarball }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artefacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List release assets
+        run: ls -la dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
