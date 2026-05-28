@@ -65,28 +65,35 @@ jobs:
 
       - name: Install platform deps (macos)
         if: matrix.os_label == 'macos'
-        # macFUSE userland (headers + dylib + pkg-config) is required for
-        # `fuser` to link. The KEXT half of macFUSE needs kernel-extension
-        # consent — not possible in headless GHA — but we don't need to
-        # actually mount, only to compile/link. `brew install --cask
-        # macfuse` stages the userland files without loading the KEXT.
-        # macFUSE 4.x ships `osxfuse.pc` but NOT `fuse.pc`; the `fuser`
-        # crate looks for `fuse`, so we symlink. Mount integration tests
-        # are skipped on CI regardless.
+        # Diagnostic cycle — see release.yml for full rationale.
         run: |
-          brew install pkg-config || true
-          brew install --cask --no-quarantine macfuse || true
-          # macFUSE 4.x's pkg-config file is osxfuse.pc; fuser asks for fuse.
-          # Find osxfuse.pc and symlink fuse.pc next to it.
-          osxfuse_pc=$(find /usr/local /opt/homebrew /Library/Frameworks/macFUSE.framework -name 'osxfuse.pc' 2>/dev/null | head -1)
-          if [ -n "$osxfuse_pc" ]; then
-            sudo ln -sf "$osxfuse_pc" "$(dirname "$osxfuse_pc")/fuse.pc"
-            echo "Symlinked fuse.pc -> $osxfuse_pc"
-          else
-            echo "warning: osxfuse.pc not found after macFUSE install"
-          fi
-          # Verify the link resolves and includes a usable -lfuse / -losxfuse.
-          pkg-config --cflags --libs fuse || echo "warning: pkg-config fuse still failing"
+          set -x
+          echo "::group::pkg-config baseline"
+          which pkg-config && pkg-config --version
+          echo "PKG_CONFIG_PATH default: $(pkg-config --variable=pc_path pkg-config)"
+          echo "::endgroup::"
+
+          echo "::group::brew install pkg-config"
+          brew install pkg-config
+          echo "::endgroup::"
+
+          echo "::group::brew install --cask macfuse"
+          brew install --cask --no-quarantine macfuse 2>&1 || echo "EXIT=$?"
+          echo "::endgroup::"
+
+          echo "::group::find macFUSE artefacts"
+          find /usr/local /opt/homebrew /Library/Frameworks /Library/Filesystems -maxdepth 8 \( -name 'osxfuse.pc' -o -name 'fuse.pc' -o -name 'libfuse*.dylib' -o -name 'libosxfuse*.dylib' -o -name 'fuse.h' -o -name 'osxfuse.h' \) 2>/dev/null || true
+          echo "::endgroup::"
+
+          echo "::group::macFUSE framework contents"
+          ls -la /Library/Frameworks/macFUSE.framework/ 2>&1 || echo "no macFUSE.framework"
+          ls -la /Library/Frameworks/macFUSE.framework/Versions/A/ 2>&1 || true
+          ls -la /Library/Frameworks/macFUSE.framework/Versions/A/Headers/ 2>&1 || true
+          echo "::endgroup::"
+
+          echo "::group::pkg-config lookup"
+          pkg-config --cflags --libs fuse 2>&1 || echo "fuse lookup failed (expected on first cycle)"
+          echo "::endgroup::"
 
       - name: Build libjfs
         run: |
