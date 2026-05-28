@@ -78,32 +78,24 @@ jobs:
           find /usr/local /opt/homebrew /Library/Frameworks /Library/Filesystems -maxdepth 8 \( -name 'osxfuse.pc' -o -name 'fuse.pc' -o -name 'libfuse*.dylib' -o -name 'libosxfuse*.dylib' -o -name 'fuse.h' -o -name 'osxfuse.h' \) 2>/dev/null || true
           echo "::endgroup::"
 
-          echo "::group::link fuse.pc into pkg-config path"
-          osxfuse_pc=$(find /usr/local /opt/homebrew /Library/Frameworks/macFUSE.framework -name 'osxfuse.pc' 2>/dev/null | head -1)
-          if [ -n "$osxfuse_pc" ]; then
-            target_dir="$(dirname "$osxfuse_pc")"
-            sudo ln -sf "$osxfuse_pc" "$target_dir/fuse.pc"
-            echo "Symlinked $target_dir/fuse.pc -> $osxfuse_pc"
-          elif [ -d /Library/Frameworks/macFUSE.framework ]; then
-            echo "No osxfuse.pc found — synthesising fuse.pc against framework"
-            sudo mkdir -p /usr/local/lib/pkgconfig
-            sudo bash -c 'printf "%s\n" \
-              "Name: fuse" \
-              "Description: macFUSE userland (synthesised against framework)" \
-              "Version: 4.8.3" \
-              "Libs: -F/Library/Frameworks -framework macFUSE" \
-              "Cflags: -I/Library/Frameworks/macFUSE.framework/Versions/A/Headers -D_FILE_OFFSET_BITS=64 -DFUSE_USE_VERSION=29" \
-              > /usr/local/lib/pkgconfig/fuse.pc'
-            echo "Wrote /usr/local/lib/pkgconfig/fuse.pc:"
+          echo "::group::confirm fuse.pc"
+          # macFUSE 4.x's installer ships /usr/local/lib/pkgconfig/fuse.pc and
+          # /usr/local/lib/libfuse.2.dylib (libfuse2-compatible userland that
+          # fuser 0.17 links against). Just confirm and dump — do NOT overwrite.
+          if [ -f /usr/local/lib/pkgconfig/fuse.pc ]; then
+            echo "Found /usr/local/lib/pkgconfig/fuse.pc:"
             cat /usr/local/lib/pkgconfig/fuse.pc
           else
-            echo "ERROR: macFUSE not installed anywhere we can find"
+            echo "ERROR: /usr/local/lib/pkgconfig/fuse.pc not present after macFUSE cask install"
+            ls -la /usr/local/lib/pkgconfig/ || true
             exit 1
           fi
           echo "::endgroup::"
 
           echo "::group::verify pkg-config fuse"
+          export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH}"
           pkg-config --cflags --libs fuse
+          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:\$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
           echo "::endgroup::"
 
       - name: Build libjfs

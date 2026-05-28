@@ -81,35 +81,28 @@ jobs:
           ls -la /Library/Frameworks/macFUSE.framework/Versions/A/Headers/ 2>&1 || true
           echo "::endgroup::"
 
-          echo "::group::link fuse.pc into pkg-config path"
-          # macFUSE 4.x ships osxfuse.pc (not fuse.pc). Symlink so fuser's
-          # `pkg-config fuse` lookup succeeds. If no .pc was installed at
-          # all, synthesise one pointing at the framework.
-          osxfuse_pc=$(find /usr/local /opt/homebrew /Library/Frameworks/macFUSE.framework -name 'osxfuse.pc' 2>/dev/null | head -1)
-          if [ -n "$osxfuse_pc" ]; then
-            target_dir="$(dirname "$osxfuse_pc")"
-            sudo ln -sf "$osxfuse_pc" "$target_dir/fuse.pc"
-            echo "Symlinked $target_dir/fuse.pc -> $osxfuse_pc"
-          elif [ -d /Library/Frameworks/macFUSE.framework ]; then
-            echo "No osxfuse.pc found — synthesising fuse.pc against framework"
-            sudo mkdir -p /usr/local/lib/pkgconfig
-            sudo bash -c 'printf "%s\n" \
-              "Name: fuse" \
-              "Description: macFUSE userland (synthesised against framework)" \
-              "Version: 4.8.3" \
-              "Libs: -F/Library/Frameworks -framework macFUSE" \
-              "Cflags: -I/Library/Frameworks/macFUSE.framework/Versions/A/Headers -D_FILE_OFFSET_BITS=64 -DFUSE_USE_VERSION=29" \
-              > /usr/local/lib/pkgconfig/fuse.pc'
-            echo "Wrote /usr/local/lib/pkgconfig/fuse.pc:"
+          echo "::group::confirm fuse.pc"
+          # macFUSE 4.x's installer DOES ship /usr/local/lib/pkgconfig/fuse.pc
+          # plus /usr/local/lib/libfuse.2.dylib (the libfuse2-compatible userland
+          # that fuser 0.17 links against). Older docs say macFUSE 4 ships
+          # only osxfuse.pc — that's no longer true. Just confirm fuse.pc
+          # exists and dump it for the log; don't overwrite it.
+          if [ -f /usr/local/lib/pkgconfig/fuse.pc ]; then
+            echo "Found /usr/local/lib/pkgconfig/fuse.pc:"
             cat /usr/local/lib/pkgconfig/fuse.pc
           else
-            echo "ERROR: macFUSE not installed anywhere we can find"
+            echo "ERROR: /usr/local/lib/pkgconfig/fuse.pc not present after macFUSE cask install"
+            ls -la /usr/local/lib/pkgconfig/ || true
             exit 1
           fi
           echo "::endgroup::"
 
           echo "::group::verify pkg-config fuse"
+          # macFUSE installs to /usr/local/lib/pkgconfig but pkg-config from
+          # /opt/homebrew may not search there by default. Prepend explicitly.
+          export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH}"
           pkg-config --cflags --libs fuse
+          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:\$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
           echo "::endgroup::"
 
       - name: Build libjfs
