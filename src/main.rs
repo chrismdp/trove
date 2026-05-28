@@ -289,6 +289,21 @@ enum Command {
         versions_db: Option<String>,
     },
 
+    /// Upgrade trove in place by re-running the canonical install script
+    /// (`install.sh` from the repo). Resolves the latest release tag from
+    /// GitHub, short-circuits if you're already on it, otherwise shells out
+    /// to `curl … | sh` so the script's sha256 verification + symlink dance
+    /// stay the single source of truth. Pass `--version vX.Y.Z` to pin a
+    /// specific release.
+    SelfUpdate {
+        /// Pin a specific release tag (e.g. `v0.1.2`). Defaults to latest.
+        #[arg(long)]
+        version: Option<String>,
+        /// Skip the "already on latest" short-circuit and re-install anyway.
+        #[arg(long)]
+        force: bool,
+    },
+
     /// Restore a path to an earlier revision (recorded as a new revision, never
     /// a silent overwrite).
     #[cfg(feature = "mount")]
@@ -654,6 +669,11 @@ fn run() -> Result<usize> {
                 trove::commands::usage::human_bytes(report.bytes_written),
                 report.skipped_unchanged,
             );
+            Ok(0)
+        }
+
+        Command::SelfUpdate { version, force } => {
+            trove::commands::self_update::run(version.as_deref(), force)?;
             Ok(0)
         }
 

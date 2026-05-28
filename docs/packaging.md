@@ -123,11 +123,21 @@ The workflow:
    (`$ORIGIN` on Linux, `@loader_path` on macOS) makes the binary
    find the dylib alongside it at runtime, so the shipped tarball
    needs no `LD_LIBRARY_PATH`.
-3. Tars `trove`, the matching `libjfs-<arch>.{so,dylib}`,
+3. **macOS only**: patches the dylib install name with
+   `install_name_tool`. JuiceFS's upstream Makefile gives
+   `libjfs-arm64.dylib` an install name = the bare filename, no
+   `@rpath/` prefix. rustc copies that literal into trove's
+   `LC_LOAD_DYLIB`, so at runtime dyld does absolute/CWD search and
+   the `@loader_path` rpath never fires. The release step rewrites the
+   dylib's id to `@rpath/libjfs-arm64.dylib`, changes trove's load
+   command to match, and re-signs both binaries (codesign breaks on
+   `install_name_tool` edits). Linux is unaffected — ELF DT_NEEDED
+   resolves via `$ORIGIN` from the load name directly.
+4. Tars `trove`, the matching `libjfs-<arch>.{so,dylib}`,
    `LICENSE.md` and `README.md` into
    `trove-<version>-<os>-<arch>.tar.gz`.
-4. Computes `sha256` of the tarball, emits a sidecar `.sha256` file.
-5. Uploads all eight assets (4 tarballs + 4 sha256s) as a GitHub
+5. Computes `sha256` of the tarball, emits a sidecar `.sha256` file.
+6. Uploads all six assets (3 tarballs + 3 sha256s) as a GitHub
    Release for the tag.
 
 Users get sha256 verification automatically via the install script

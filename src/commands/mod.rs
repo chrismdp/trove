@@ -9,6 +9,10 @@ pub mod install;
 /// so it's available in the core build (not gated on `mount`).
 pub mod docs;
 
+/// `trove self-update` — re-runs `install.sh` from the repo to upgrade in
+/// place. Core build so even a `trove check`-only install can self-upgrade.
+pub mod self_update;
+
 /// `trove log/cat/diff/restore` — version-history commands (read clones via libjfs).
 #[cfg(feature = "mount")]
 pub mod history;

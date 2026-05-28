@@ -1,6 +1,6 @@
 [package]
 name = "trove"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "A filesystem that talks back — schema-on-write validation for markdown+frontmatter knowledge stores"
 license-file = "LICENSE.md"

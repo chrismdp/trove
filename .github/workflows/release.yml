@@ -115,6 +115,31 @@ jobs:
           LIBJFS_DIR: ${{ github.workspace }}/libjfs/build
         run: cargo build --release --features mount
 
+      - name: Patch macOS dylib install names
+        if: matrix.os_label == 'macos'
+        # JuiceFS's libjfs-arm64.dylib ships with install name = the bare
+        # filename ("libjfs-arm64.dylib"), no @rpath/@loader_path prefix.
+        # rustc copies that literal into trove's LC_LOAD_DYLIB command, so at
+        # runtime dyld goes straight to absolute / CWD search and never
+        # consults the @loader_path rpath that build.rs set — the dylib next
+        # to the binary in the tarball can't be found. Patch both sides:
+        # give the dylib a proper @rpath-prefixed id, and rewrite trove's
+        # load command to match. Re-codesign afterwards (install_name_tool
+        # invalidates the existing signature). Verify with otool.
+        env:
+          LIBJFS_FILE: ${{ matrix.libjfs_file }}
+        run: |
+          set -eu
+          DYLIB="libjfs/build/${LIBJFS_FILE}"
+          BIN="target/release/trove"
+          install_name_tool -id "@rpath/${LIBJFS_FILE}" "$DYLIB"
+          install_name_tool -change "${LIBJFS_FILE}" "@rpath/${LIBJFS_FILE}" "$BIN"
+          codesign --force --sign - "$DYLIB"
+          codesign --force --sign - "$BIN"
+          echo "::group::otool -L target/release/trove"
+          otool -L "$BIN" | grep -E "libjfs|@rpath" || true
+          echo "::endgroup::"
+
       - name: Compute version
         id: version
         shell: bash
