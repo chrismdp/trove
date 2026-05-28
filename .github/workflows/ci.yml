@@ -28,10 +28,9 @@ jobs:
             os_label: linux
             arch: arm64
             libjfs_file: libjfs-arm64.so
-          - runner: macos-13
-            os_label: macos
-            arch: amd64
-            libjfs_file: libjfs-amd64.dylib
+          # Intel Macs (x86_64) are not supported — the GH-hosted macos-13
+          # runner is being deprecated and the Intel Mac population is small
+          # and shrinking. Apple Silicon (arm64) only. See docs/packaging.md.
           - runner: macos-14
             os_label: macos
             arch: arm64

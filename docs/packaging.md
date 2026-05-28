@@ -23,14 +23,22 @@ read/write/stat/clone surface that backs the FUSE mount (see
 
 ## The platform matrix
 
-Trove targets four host triples for v1. Windows is out of scope.
+Trove targets three host triples for v1. Windows and Intel Macs are
+out of scope.
 
-| target triple             | libjfs filename          | rustc link name |
-|---------------------------|--------------------------|-----------------|
-| `x86_64-unknown-linux-gnu` | `libjfs-amd64.so`        | `jfs-amd64`     |
-| `aarch64-unknown-linux-gnu` | `libjfs-arm64.so`        | `jfs-arm64`     |
-| `x86_64-apple-darwin`     | `libjfs-amd64.dylib`     | `jfs-amd64`     |
-| `aarch64-apple-darwin`    | `libjfs-arm64.dylib`     | `jfs-arm64`     |
+| target triple              | libjfs filename       | rustc link name |
+|----------------------------|-----------------------|-----------------|
+| `x86_64-unknown-linux-gnu` | `libjfs-amd64.so`     | `jfs-amd64`     |
+| `aarch64-unknown-linux-gnu`| `libjfs-arm64.so`     | `jfs-arm64`     |
+| `aarch64-apple-darwin`     | `libjfs-arm64.dylib`  | `jfs-arm64`     |
+
+**Why no Intel Mac?** The `macos-13` GitHub-hosted runner is being
+deprecated, the Intel Mac population is small and shrinking (every Mac
+sold since late 2020 is Apple Silicon), and supporting it adds a CI leg
+that's increasingly fragile for marginal coverage. `build.rs` and
+`install.sh` both fail loudly with a clear pointer when run on Intel
+Mac. If your use case genuinely needs it, open an issue — the build is
+straightforward; we just don't run it in CI.
 
 The rustc link name is shared across OSes; the system linker resolves
 the `.so` vs `.dylib` extension. `build.rs` checks the per-OS filename

@@ -454,3 +454,126 @@ fn xattrs_round_trip() {
     assert!(!fs.remove_xattr("/note.md", key).unwrap());
 }
 
+// ---------------------------------------------------------------------------
+// POSIX advisory locks: jfs_flock / jfs_setlk / jfs_getlk pass-through.
+//
+// libjfs/JuiceFS owns lock state at the Meta layer; these tests prove the FFI
+// wrapper round-trips conflict detection and unlock correctly. Lock-type
+// constants are fcntl values (F_RDLCK=0, F_WRLCK=1, F_UNLCK=2) at this layer,
+// matching the upstream Setlk/Flock API. EAGAIN = 11 on Linux.
+
+const EAGAIN: i32 = 11;
+
+#[test]
+fn flock_exclusive_blocks_second_holder() {
+    let v = TestVol::new("flock-ex");
+    let fs = v.open();
+    fs.create("/lock.md", 0o644).unwrap().fsync().unwrap();
+
+    let a = fs.open("/lock.md", 0).unwrap();
+    let b = fs.open("/lock.md", 0).unwrap();
+
+    a.flock(1, jfs::F_WRLCK).expect("first writer takes exclusive lock");
+    let err = b.flock(2, jfs::F_WRLCK).expect_err("second exclusive must conflict");
+    assert_eq!(err.0, EAGAIN, "expected EAGAIN, got errno {}", err.0);
+
+    // After unlock, the second holder can take it.
+    a.flock(1, jfs::F_UNLCK).expect("unlock");
+    b.flock(2, jfs::F_WRLCK).expect("second now succeeds after first releases");
+}
+
+#[test]
+fn flock_shared_locks_coexist_but_block_exclusive() {
+    let v = TestVol::new("flock-sh");
+    let fs = v.open();
+    fs.create("/r.md", 0o644).unwrap().fsync().unwrap();
+
+    let a = fs.open("/r.md", 0).unwrap();
+    let b = fs.open("/r.md", 0).unwrap();
+    let c = fs.open("/r.md", 0).unwrap();
+
+    a.flock(1, jfs::F_RDLCK).expect("a takes shared");
+    b.flock(2, jfs::F_RDLCK).expect("b takes shared concurrently");
+
+    let err = c.flock(3, jfs::F_WRLCK).expect_err("exclusive vs shared must conflict");
+    assert_eq!(err.0, EAGAIN);
+
+    a.flock(1, jfs::F_UNLCK).unwrap();
+    b.flock(2, jfs::F_UNLCK).unwrap();
+    c.flock(3, jfs::F_WRLCK).expect("after all shared released, exclusive succeeds");
+}
+
+#[test]
+fn setlk_byte_range_disjoint_ranges_dont_conflict() {
+    let v = TestVol::new("setlk-disjoint");
+    let fs = v.open();
+    fs.create("/br.md", 0o644).unwrap().fsync().unwrap();
+
+    let a = fs.open("/br.md", 0).unwrap();
+    let b = fs.open("/br.md", 0).unwrap();
+
+    // Two exclusive byte-range locks on non-overlapping ranges should both succeed.
+    a.setlk(1, jfs::F_WRLCK, 0, 100, false, 1234)
+        .expect("range [0,100] for owner 1");
+    b.setlk(2, jfs::F_WRLCK, 200, 300, false, 5678)
+        .expect("range [200,300] for owner 2");
+}
+
+#[test]
+fn setlk_byte_range_overlapping_ranges_conflict() {
+    let v = TestVol::new("setlk-overlap");
+    let fs = v.open();
+    fs.create("/br2.md", 0o644).unwrap().fsync().unwrap();
+
+    let a = fs.open("/br2.md", 0).unwrap();
+    let b = fs.open("/br2.md", 0).unwrap();
+
+    a.setlk(1, jfs::F_WRLCK, 0, 100, false, 1234).expect("a locks [0,100]");
+    let err = b
+        .setlk(2, jfs::F_WRLCK, 50, 150, false, 5678)
+        .expect_err("b's [50,150] overlaps — must EAGAIN");
+    assert_eq!(err.0, EAGAIN);
+
+    // Release a's range; b can then take its (overlapping) range.
+    a.setlk(1, jfs::F_UNLCK, 0, 100, false, 1234).unwrap();
+    b.setlk(2, jfs::F_WRLCK, 50, 150, false, 5678)
+        .expect("after a unlocks, b takes its range");
+}
+
+#[test]
+fn getlk_reports_no_conflict_on_clean_file() {
+    let v = TestVol::new("getlk-clean");
+    let fs = v.open();
+    fs.create("/g.md", 0o644).unwrap().fsync().unwrap();
+
+    let f = fs.open("/g.md", 0).unwrap();
+    let info = f
+        .getlk(1, jfs::F_WRLCK, 0, u64::MAX)
+        .expect("getlk on a clean file returns Ok");
+    assert_eq!(
+        info.typ,
+        jfs::F_UNLCK,
+        "no conflict — typ should be F_UNLCK; got {:?}",
+        info
+    );
+}
+
+#[test]
+fn getlk_reports_conflicting_holder() {
+    let v = TestVol::new("getlk-conflict");
+    let fs = v.open();
+    fs.create("/gc.md", 0o644).unwrap().fsync().unwrap();
+
+    let a = fs.open("/gc.md", 0).unwrap();
+    let b = fs.open("/gc.md", 0).unwrap();
+
+    // owner 1 holds an exclusive range; pid 99 recorded on it.
+    a.setlk(1, jfs::F_WRLCK, 0, 100, false, 99).unwrap();
+
+    // owner 2 asks: would my exclusive lock on the whole file succeed?
+    let info = b.getlk(2, jfs::F_WRLCK, 0, u64::MAX).expect("getlk ok");
+    assert_ne!(info.typ, jfs::F_UNLCK, "expected conflict, got {:?}", info);
+    assert_eq!(info.pid, 99, "conflicting holder pid not reported");
+}
+
+

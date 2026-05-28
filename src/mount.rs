@@ -14,13 +14,13 @@
 //! a `Mutex`. Inode/handle ids and flags are newtypes (`INodeNo`, `FileHandle`,
 //! `OpenFlags`, …) — we convert at the boundary.
 
-use crate::jfs::{File, FileInfo, Fs};
+use crate::jfs::{self, File, FileInfo, Fs, LockErrno};
 use crate::types::Registry;
 use fuser::{
     BackgroundSession, BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem,
     FopenFlags, Generation, INodeNo, LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyCreate,
-    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite,
-    RenameFlags, Request, TimeOrNow, WriteFlags,
+    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen, ReplyStatfs,
+    ReplyWrite, RenameFlags, Request, TimeOrNow, WriteFlags,
 };
 use crate::version::{sha256_hex, VersionStore};
 use std::collections::HashMap;
@@ -1161,6 +1161,93 @@ impl Filesystem for TroveFs {
             Ok(true) => reply.ok(),
             Ok(false) => reply.error(no_attr_errno()),
             Err(_) => reply.error(Errno::EIO),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // POSIX advisory locks
+    //
+    // BSD `flock(2)` and POSIX/OFD `fcntl(2)` byte-range locks share the same
+    // FUSE protocol opcodes (setlk / getlk) — the kernel converts a `flock()`
+    // syscall into a whole-file F_RDLCK/F_WRLCK/F_UNLCK setlk request. So one
+    // pair of handlers covers both surfaces.
+    //
+    // Locks are cooperative (advisory): two processes that both call the
+    // syscall coordinate; a process that doesn't is unaffected. That's the
+    // standard POSIX semantic and what tooling like vim, git, and CLI editors
+    // expect.
+    //
+    // Write-handle limitation: a governed `Write` handle has no jfs fd until
+    // it commits — its proposed bytes live in an in-memory buffer. We reject
+    // lock requests on those handles with ENOLCK. In practice this only bites
+    // when an editor opens a brand-new governed file (a fresh markdown note
+    // before its first save) and tries to lock it — most editors fall back to
+    // no-lock and continue. See docs/mount.md.
+    fn getlk(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        lock_owner: LockOwner,
+        start: u64,
+        end: u64,
+        typ: i32,
+        _pid: u32,
+        reply: ReplyLock,
+    ) {
+        let g = self.inner.lock().unwrap();
+        let file_ref = match g.open_files.get(&fh.0) {
+            Some(OpenFile::Read { reader }) => reader,
+            Some(OpenFile::PassThrough { writer, .. }) => writer,
+            Some(OpenFile::Write { .. }) => {
+                // No jfs fd backs a buffered write — can't ask anything about
+                // its locks. Report no-conflict so cooperative tools advance.
+                reply.locked(start, end, jfs::F_UNLCK, 0);
+                return;
+            }
+            None => {
+                reply.error(Errno::EBADF);
+                return;
+            }
+        };
+        match file_ref.getlk(lock_owner.0, typ, start, end) {
+            Ok(info) => reply.locked(info.start, info.end, info.typ, info.pid),
+            Err(LockErrno(e)) => reply.error(Errno::from_i32(e)),
+        }
+    }
+
+    fn setlk(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        lock_owner: LockOwner,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+        sleep: bool,
+        reply: ReplyEmpty,
+    ) {
+        let g = self.inner.lock().unwrap();
+        let file_ref = match g.open_files.get(&fh.0) {
+            Some(OpenFile::Read { reader }) => reader,
+            Some(OpenFile::PassThrough { writer, .. }) => writer,
+            Some(OpenFile::Write { .. }) => {
+                // ENOLCK: locks are unavailable for buffered write handles.
+                // Editors that take advisory locks typically fall back to
+                // no-lock and proceed.
+                reply.error(Errno::ENOLCK);
+                return;
+            }
+            None => {
+                reply.error(Errno::EBADF);
+                return;
+            }
+        };
+        match file_ref.setlk(lock_owner.0, typ, start, end, sleep, pid) {
+            Ok(()) => reply.ok(),
+            Err(LockErrno(e)) => reply.error(Errno::from_i32(e)),
         }
     }
 }

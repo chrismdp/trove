@@ -90,6 +90,10 @@ slug = "backup"
 title = "Backup"
 
 [[sections.pages]]
+slug = "posix"
+title = "POSIX compatibility"
+
+[[sections.pages]]
 slug = "troubleshooting"
 title = "Troubleshooting"
 

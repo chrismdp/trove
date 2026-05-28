@@ -200,13 +200,50 @@ files safely. `tests/mount.rs` puts the whole FUSE stack through the
 kernel: read, write, the validation gate, the version-on-commit
 self-trigger, the embed channel. Run those if you change anything here.
 
+## POSIX advisory locks
+
+Both BSD `flock(2)` (whole-file, per-fd) and POSIX `fcntl(2)` byte-range
+record locks are forwarded through to JuiceFS's Meta layer. They're
+**advisory** — two cooperative processes coordinate; a process that
+doesn't call the lock syscalls is unaffected. That's the standard POSIX
+contract, and what tooling like vim swap files, git index locks, and
+shell `flock(1)` expect.
+
+How it's wired:
+
+- The Rust binding exposes `File::flock`, `File::setlk`, `File::getlk` in
+  `src/jfs.rs`. These go through new libjfs FFI entries
+  (`jfs_flock`, `jfs_setlk`, `jfs_getlk`) added by
+  `libjfs/patches/0002-add-locks.patch` — upstream libjfs doesn't expose
+  locks even though JuiceFS supports them at the VFS/Meta layer.
+- The mount handlers (`getlk`, `setlk` on the `Filesystem` impl) pull the
+  open file's underlying jfs fd out of the `OpenFile::Read` /
+  `OpenFile::PassThrough` variant and call straight through. The kernel
+  converts `flock()` syscalls into whole-file F_RDLCK/F_WRLCK setlk
+  requests, so we don't need a separate flock handler.
+- Conflicts (`F_SETLK` with `sleep=false`) return EAGAIN, distinguishable
+  from a real I/O error; `F_SETLKW` (`sleep=true`) blocks in libjfs.
+- Locks are released on close (POSIX semantics, handled by libjfs).
+
+### Limitation: locks on buffered governed writes
+
+A governed `OpenFile::Write` handle has no jfs fd until it commits — its
+proposed bytes live in an in-memory buffer. Lock requests on those
+handles return:
+
+- `setlk` → ENOLCK
+- `getlk` → reports no conflict (F_UNLCK)
+
+In practice this only bites when an editor opens a brand-new governed
+file (a fresh markdown note that doesn't yet exist in jfs) and takes an
+advisory lock on it. Most editors that take advisory locks fall back to
+no-lock and proceed, which matches the behaviour they already exhibit
+against simple CLI editors. After the first commit, subsequent opens use
+the `Read` / `PassThrough` variants and locks pass through normally.
+
 ## What handlers omit
 
-- **No `xattr` handlers** — not implemented (libjfs supports it; we don't
-  need it).
 - **No `fallocate`** — not surfaced.
-- **No locking** — FUSE locks are advisory; the kernel's own per-inode
-  locking is enough for v0.1.
 
 ## Read this next
 

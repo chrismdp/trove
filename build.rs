@@ -6,8 +6,11 @@
 //
 //   linux  / x86_64   →  libjfs-amd64.so      link name: jfs-amd64
 //   linux  / aarch64  →  libjfs-arm64.so      link name: jfs-arm64
-//   macos  / x86_64   →  libjfs-amd64.dylib   link name: jfs-amd64
 //   macos  / aarch64  →  libjfs-arm64.dylib   link name: jfs-arm64
+//
+// Intel Macs (macos/x86_64) are intentionally NOT supported — the population
+// is small and shrinking and the GH-hosted runner is being deprecated. Apple
+// Silicon only. See docs/packaging.md.
 //
 // The rustc link name is shared across OSes — the system linker resolves the
 // extension (`.so` vs `.dylib`). The file on disk does change per OS, which is
@@ -29,11 +32,14 @@ fn main() {
     let (link_name, file_name) = match (target_os.as_str(), target_arch.as_str()) {
         ("linux", "x86_64") => ("jfs-amd64", "libjfs-amd64.so"),
         ("linux", "aarch64") => ("jfs-arm64", "libjfs-arm64.so"),
-        ("macos", "x86_64") => ("jfs-amd64", "libjfs-amd64.dylib"),
         ("macos", "aarch64") => ("jfs-arm64", "libjfs-arm64.dylib"),
+        ("macos", "x86_64") => panic!(
+            "trove: Intel Macs are not supported. trove ships for Apple Silicon \
+             (macos/aarch64) only — see docs/packaging.md for the rationale."
+        ),
         _ => panic!(
             "trove: the `mount` feature is not supported on target {target_os}/{target_arch}. \
-             Supported: linux/x86_64, linux/aarch64, macos/x86_64, macos/aarch64. \
+             Supported: linux/x86_64, linux/aarch64, macos/aarch64. \
              See docs/packaging.md."
         ),
     };

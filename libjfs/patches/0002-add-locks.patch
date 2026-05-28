@@ -1,0 +1,106 @@
+# Adds jfs_flock / jfs_setlk / jfs_getlk C-exported entries to libjfs so trove
+# can expose POSIX advisory locks (BSD-style flock(2) + fcntl(2) byte-range
+# POSIX/OFD locks) through its FUSE mount. The upstream libjfs main.go does
+# not expose locks at all even though JuiceFS supports them in the VFS/Meta
+# layers — these wrappers reach into Meta directly using the open file's
+# inode (analogous to how jfs_flush / jfs_fsync are written).
+#
+# Lock-type values use the Linux fcntl(2) numbering (F_RDLCK=0, F_WRLCK=1,
+# F_UNLCK=2), matching what pkg/vfs/vfs_unix.go expects. The Rust binding
+# translates BSD LOCK_SH/LOCK_EX/LOCK_UN into these on the way down.
+#
+# On conflict (lock would block) the underlying Meta returns syscall.EAGAIN,
+# which the errno() helper's default branch turns into -11 — distinguishable
+# from any other I/O error.
+#
+# Apply with:  patch -p1 < 0002-add-locks.patch
+# Or:          git apply 0002-add-locks.patch
+
+diff --git a/sdk/java/libjfs/main.go b/sdk/java/libjfs/main.go
+index e1682fa..36b8e4e 100644
+--- a/sdk/java/libjfs/main.go
++++ b/sdk/java/libjfs/main.go
+@@ -1982,6 +1982,83 @@ func jfs_fsync(pid int64, fd int32) int32 {
+ 	return errno(f.Fsync(f.w.withPid(pid)))
+ }
+ 
++//export jfs_flock
++// BSD-style whole-file advisory lock. `ltype` uses the fcntl numbering
++// (F_RDLCK=0 shared, F_WRLCK=1 exclusive, F_UNLCK=2 release). Non-blocking:
++// a conflict returns -EAGAIN (=-11) so callers can distinguish "would block"
++// from a real I/O error. `owner` identifies the lock holder for conflict
++// detection (FUSE passes through; direct callers use any stable u64).
++func jfs_flock(pid int64, fd int32, owner uint64, ltype int32) int32 {
++	filesLock.Lock()
++	f, ok := openFiles[fd]
++	filesLock.Unlock()
++	if !ok {
++		return EINVAL
++	}
++	ctx := f.w.withPid(pid)
++	return errno(f.w.Meta().Flock(ctx, f.Inode(), owner, uint32(ltype), false))
++}
++
++//export jfs_setlk
++// POSIX byte-range advisory lock (fcntl F_SETLK / F_SETLKW). `ltype` uses
++// fcntl numbering (F_RDLCK/F_WRLCK/F_UNLCK). `start` and `end` bound the
++// range; `end` of 0xFFFFFFFFFFFFFFFF means "to EOF" (the convention the
++// Meta layer already understands — see pkg/meta/*_lock.go). `block` selects
++// F_SETLKW (true, blocking) vs F_SETLK (false, non-blocking; conflict
++// returns -EAGAIN). `lpid` is the holder pid recorded in the lock entry —
++// only meaningful for getlk's response, but Meta.Setlk takes it.
++func jfs_setlk(pid int64, fd int32, owner uint64, ltype int32, start, end uint64, block uint8, lpid uint32) int32 {
++	filesLock.Lock()
++	f, ok := openFiles[fd]
++	filesLock.Unlock()
++	if !ok {
++		return EINVAL
++	}
++	ctx := f.w.withPid(pid)
++	return errno(f.w.Meta().Setlk(ctx, f.Inode(), owner, block != 0, uint32(ltype), start, end, lpid))
++}
++
++//export jfs_getlk
++// POSIX lock query (fcntl F_GETLK). Asks "would acquiring this lock
++// conflict?" Inputs: the lock we'd want to take (`ltype`, `start`, `end`).
++// Outputs (via pointers): the conflicting lock if one exists (its type,
++// range, and holder pid), or `*outType = F_UNLCK` (=2) if no conflict.
++// Pointers must be valid for the duration of the call; values are written
++// only on success (return 0).
++func jfs_getlk(
++	pid int64, fd int32, owner uint64,
++	ltype int32, start, end uint64,
++	outType *int32, outStart, outEnd *uint64, outPid *uint32,
++) int32 {
++	filesLock.Lock()
++	f, ok := openFiles[fd]
++	filesLock.Unlock()
++	if !ok {
++		return EINVAL
++	}
++	ctx := f.w.withPid(pid)
++	typ := uint32(ltype)
++	st := start
++	en := end
++	var lpid uint32 = 0
++	err := f.w.Meta().Getlk(ctx, f.Inode(), owner, &typ, &st, &en, &lpid)
++	if err == 0 {
++		if outType != nil {
++			*outType = int32(typ)
++		}
++		if outStart != nil {
++			*outStart = st
++		}
++		if outEnd != nil {
++			*outEnd = en
++		}
++		if outPid != nil {
++			*outPid = lpid
++		}
++	}
++	return errno(err)
++}
++
+ //export jfs_ranger_cfg
+ func jfs_ranger_cfg(cname *C.char, buf uintptr, count int32) int32 {
+ 	name := C.GoString(cname)

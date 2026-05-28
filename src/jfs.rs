@@ -15,13 +15,12 @@
 #[cfg(not(any(
     all(target_os = "linux", target_arch = "x86_64"),
     all(target_os = "linux", target_arch = "aarch64"),
-    all(target_os = "macos", target_arch = "x86_64"),
     all(target_os = "macos", target_arch = "aarch64"),
 )))]
 compile_error!(
     "trove `mount` feature: unsupported target. \
-     Supported: linux/x86_64, linux/aarch64, macos/x86_64, macos/aarch64. \
-     See docs/packaging.md."
+     Supported: linux/x86_64, linux/aarch64, macos/aarch64 (Apple Silicon). \
+     Intel Macs are not supported — see docs/packaging.md."
 );
 
 use anyhow::{bail, Result};
@@ -75,7 +74,6 @@ impl DirEntry {
 // for the full filename matrix.
 #[cfg_attr(all(target_os = "linux", target_arch = "x86_64"), link(name = "jfs-amd64"))]
 #[cfg_attr(all(target_os = "linux", target_arch = "aarch64"), link(name = "jfs-arm64"))]
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), link(name = "jfs-amd64"))]
 #[cfg_attr(all(target_os = "macos", target_arch = "aarch64"), link(name = "jfs-arm64"))]
 extern "C" {
     fn jfs_format(json_conf: *const c_char) -> c_int;
@@ -149,6 +147,75 @@ extern "C" {
     ) -> c_int;
     fn jfs_listXattr(pid: i64, h: i64, path: *const c_char, buf: usize, bufsize: c_int) -> c_int;
     fn jfs_removeXattr(pid: i64, h: i64, path: *const c_char, name: *const c_char) -> c_int;
+
+    // --- POSIX advisory locks (added via libjfs patches/0002-add-locks.patch) ---
+    // `ltype` uses fcntl numbering: F_RDLCK=0, F_WRLCK=1, F_UNLCK=2.
+    fn jfs_flock(pid: i64, fd: c_int, owner: u64, ltype: c_int) -> c_int;
+    fn jfs_setlk(
+        pid: i64,
+        fd: c_int,
+        owner: u64,
+        ltype: c_int,
+        start: u64,
+        end: u64,
+        block: u8,
+        lpid: u32,
+    ) -> c_int;
+    fn jfs_getlk(
+        pid: i64,
+        fd: c_int,
+        owner: u64,
+        ltype: c_int,
+        start: u64,
+        end: u64,
+        out_type: *mut c_int,
+        out_start: *mut u64,
+        out_end: *mut u64,
+        out_pid: *mut u32,
+    ) -> c_int;
+}
+
+// POSIX fcntl lock types (Linux numbering; matches what libjfs/JuiceFS expects
+// on the FFI). The mount layer accepts these directly from FUSE; the BSD
+// flock(2) call path is converted by the kernel into whole-file setlk requests
+// using F_RDLCK / F_WRLCK / F_UNLCK, so we never see raw LOCK_SH/LOCK_EX/LOCK_UN
+// from the kernel. The flock() convenience methods on `File` translate libc's
+// BSD constants into these on the way down.
+pub const F_RDLCK: c_int = 0;
+pub const F_WRLCK: c_int = 1;
+pub const F_UNLCK: c_int = 2;
+
+/// `getlk` result. `typ == F_UNLCK` means "no conflict — the proposed lock
+/// would succeed". Anything else describes the conflicting lock holder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LockInfo {
+    pub typ: c_int,
+    pub start: u64,
+    pub end: u64,
+    pub pid: u32,
+}
+
+/// Distinguished error type for lock calls so the FUSE handler (and direct
+/// callers) can map -EAGAIN cleanly without parsing an `anyhow` string. Carries
+/// the raw positive errno value.
+#[derive(Debug, Clone, Copy)]
+pub struct LockErrno(pub c_int);
+
+impl std::fmt::Display for LockErrno {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "lock op failed: errno {}", self.0)
+    }
+}
+
+impl std::error::Error for LockErrno {}
+
+/// Convert a libjfs lock return to a typed errno. libjfs returns `< 0 = -errno`.
+fn check_lock(ret: c_int) -> std::result::Result<(), LockErrno> {
+    if ret < 0 {
+        Err(LockErrno(-ret))
+    } else {
+        Ok(())
+    }
 }
 
 // setXattr mode constants (libjfs follows Linux semantics).
@@ -639,6 +706,77 @@ impl File {
     pub fn fsync(&self) -> Result<()> {
         check(unsafe { jfs_fsync(PID, self.fd) }, "fsync")?;
         Ok(())
+    }
+
+    /// Raw libjfs fd. Needed by the mount layer in cases where it wants to call
+    /// the lock FFI directly without going through these wrappers (typed errno).
+    pub fn raw_fd(&self) -> c_int {
+        self.fd
+    }
+
+    /// BSD-style whole-file advisory lock (`flock(2)` equivalent). `ltype` is
+    /// one of [`F_RDLCK`] (shared), [`F_WRLCK`] (exclusive), [`F_UNLCK`]
+    /// (release). Non-blocking: on conflict returns [`LockErrno`] with EAGAIN.
+    /// `owner` identifies the lock holder for conflict detection — use the
+    /// process id or any stable u64.
+    pub fn flock(&self, owner: u64, ltype: c_int) -> std::result::Result<(), LockErrno> {
+        check_lock(unsafe { jfs_flock(PID, self.fd, owner, ltype) })
+    }
+
+    /// POSIX byte-range advisory lock (`fcntl(2)` F_SETLK / F_SETLKW). `end` of
+    /// `u64::MAX` means "to EOF" (the Meta layer's convention). `block = true`
+    /// is F_SETLKW (waits indefinitely); `block = false` is F_SETLK and returns
+    /// EAGAIN on conflict. `lpid` is the holder pid recorded in the lock entry
+    /// — `getlk` returns it to the caller.
+    pub fn setlk(
+        &self,
+        owner: u64,
+        ltype: c_int,
+        start: u64,
+        end: u64,
+        block: bool,
+        lpid: u32,
+    ) -> std::result::Result<(), LockErrno> {
+        check_lock(unsafe {
+            jfs_setlk(PID, self.fd, owner, ltype, start, end, block as u8, lpid)
+        })
+    }
+
+    /// POSIX lock query (`fcntl(2)` F_GETLK). Returns `LockInfo` describing
+    /// whether a conflicting lock exists: `typ == F_UNLCK` (the response from
+    /// libjfs) means no conflict — the proposed lock would succeed. Otherwise
+    /// the returned range/pid describes the conflicting holder.
+    pub fn getlk(
+        &self,
+        owner: u64,
+        ltype: c_int,
+        start: u64,
+        end: u64,
+    ) -> std::result::Result<LockInfo, LockErrno> {
+        let mut out_type: c_int = 0;
+        let mut out_start: u64 = 0;
+        let mut out_end: u64 = 0;
+        let mut out_pid: u32 = 0;
+        check_lock(unsafe {
+            jfs_getlk(
+                PID,
+                self.fd,
+                owner,
+                ltype,
+                start,
+                end,
+                &mut out_type,
+                &mut out_start,
+                &mut out_end,
+                &mut out_pid,
+            )
+        })?;
+        Ok(LockInfo {
+            typ: out_type,
+            start: out_start,
+            end: out_end,
+            pid: out_pid,
+        })
     }
 }
 

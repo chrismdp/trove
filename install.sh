@@ -83,6 +83,12 @@ case "$uname_m" in
     *)              err "unsupported architecture: $uname_m (trove ships amd64 + arm64 only)" ;;
 esac
 
+# Intel Macs aren't supported — refuse with a clear pointer rather than 404 on
+# a non-existent release asset. Apple Silicon (arm64) only on macOS.
+if [ "$OS" = "macos" ] && [ "$ARCH" = "amd64" ]; then
+    err "Intel Macs are not supported. trove ships for Apple Silicon (arm64) only on macOS. See docs/packaging.md."
+fi
+
 # ---------- resolve version ----------
 
 if [ -z "$VERSION" ]; then
