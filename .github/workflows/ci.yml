@@ -70,17 +70,23 @@ jobs:
         # consent — not possible in headless GHA — but we don't need to
         # actually mount, only to compile/link. `brew install --cask
         # macfuse` stages the userland files without loading the KEXT.
-        # Mount integration tests are skipped on CI regardless.
+        # macFUSE 4.x ships `osxfuse.pc` but NOT `fuse.pc`; the `fuser`
+        # crate looks for `fuse`, so we symlink. Mount integration tests
+        # are skipped on CI regardless.
         run: |
           brew install pkg-config || true
           brew install --cask --no-quarantine macfuse || true
-          # Verify userland is in place — at least one of fuse/osxfuse
-          # pkg-config files and the dylib should be present.
-          pkg-config --cflags fuse 2>/dev/null \
-            || pkg-config --cflags osxfuse 2>/dev/null \
-            || echo "warning: neither fuse nor osxfuse pkg-config found"
-          ls /usr/local/include/fuse 2>/dev/null || true
-          ls /usr/local/lib/libfuse.dylib /usr/local/lib/libosxfuse.dylib 2>/dev/null || true
+          # macFUSE 4.x's pkg-config file is osxfuse.pc; fuser asks for fuse.
+          # Find osxfuse.pc and symlink fuse.pc next to it.
+          osxfuse_pc=$(find /usr/local /opt/homebrew /Library/Frameworks/macFUSE.framework -name 'osxfuse.pc' 2>/dev/null | head -1)
+          if [ -n "$osxfuse_pc" ]; then
+            sudo ln -sf "$osxfuse_pc" "$(dirname "$osxfuse_pc")/fuse.pc"
+            echo "Symlinked fuse.pc -> $osxfuse_pc"
+          else
+            echo "warning: osxfuse.pc not found after macFUSE install"
+          fi
+          # Verify the link resolves and includes a usable -lfuse / -losxfuse.
+          pkg-config --cflags --libs fuse || echo "warning: pkg-config fuse still failing"
 
       - name: Build libjfs
         run: |
