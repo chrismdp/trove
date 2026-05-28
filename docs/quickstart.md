@@ -159,6 +159,11 @@ mkdir -p /mnt/trove
 trove mount /mnt/trove --types ./my-store
 ```
 
+Got an existing vault you want trove to manage? Use `trove import
+~/vault` instead — it moves the files aside, mounts trove at the
+original path, and streams the files back through the validation gate.
+See [Running it end-to-end](/docs/running#mounting-onto-an-existing-directory).
+
 **Write a file, watch it validate + version + embed**:
 
 ```bash

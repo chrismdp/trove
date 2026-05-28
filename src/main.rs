@@ -69,6 +69,13 @@ enum Command {
     Mount {
         /// Where to mount (an existing empty directory).
         mountpoint: PathBuf,
+        /// Mount onto a non-empty directory. By default `trove mount` refuses
+        /// — FUSE overlays the mountpoint, so existing files become invisible
+        /// while mounted (recoverable on unmount, but alarming). Pass this when
+        /// you've thought about it; use `trove import` to bring existing files
+        /// into a vault instead.
+        #[arg(long)]
+        allow_non_empty: bool,
         /// JuiceFS volume name (must already be formatted). Falls back to config.
         #[arg(long)]
         volume: Option<String>,
@@ -94,6 +101,37 @@ enum Command {
         /// for offline runs or when search isn't needed).
         #[arg(long)]
         no_embed: bool,
+    },
+
+    /// Take over an existing directory: move its contents to a backup,
+    /// mount trove at the original path, and stream the files back through
+    /// the validation gate so they get versioned and embedded. Foreground —
+    /// the mount stays running after import (this directory IS your vault now).
+    #[cfg(feature = "mount")]
+    Import {
+        /// The directory to take over. Becomes the trove mountpoint.
+        path: PathBuf,
+        /// Schemas to validate against during import. Defaults to <path>/.types/.
+        #[arg(long)]
+        types: Option<PathBuf>,
+        #[arg(long)]
+        volume: Option<String>,
+        #[arg(long)]
+        meta: Option<String>,
+        #[arg(long)]
+        cache: Option<PathBuf>,
+        #[arg(long)]
+        versions_db: Option<String>,
+        #[arg(long)]
+        no_embed: bool,
+        /// Skip the typed-confirmation step. Use in scripts. The same safety
+        /// thresholds (path checks, size limits) still apply.
+        #[arg(long)]
+        yes: bool,
+        /// Skip the file-count / total-size safety thresholds. Required to
+        /// import a directory with > 10k files or > 1 GB.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Embed un-embedded version blobs into `blob_chunks` for search. Reads
@@ -348,7 +386,35 @@ fn run() -> Result<usize> {
         }
 
         #[cfg(feature = "mount")]
-        Command::Mount { mountpoint, volume, meta, cache, types, versions_db, no_embed } => {
+        Command::Mount { mountpoint, allow_non_empty, volume, meta, cache, types, versions_db, no_embed } => {
+            // FUSE overlays the mountpoint while mounted — any existing files
+            // become invisible (recoverable on unmount, but alarming). Refuse
+            // non-empty mountpoints by default; the `--allow-non-empty` escape
+            // hatch is for users who've thought about it. Hidden files (.DS_Store,
+            // .Spotlight-V100, .directory) are ignored — every filesystem drops
+            // those and they're not what "non-empty" is trying to protect.
+            use anyhow::Context;
+            let visible = std::fs::read_dir(&mountpoint)
+                .with_context(|| format!("opening mountpoint {}", mountpoint.display()))?
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .chars()
+                        .next()
+                        != Some('.')
+                })
+                .count();
+            if visible > 0 && !allow_non_empty {
+                anyhow::bail!(
+                    "mountpoint {} is not empty — FUSE will hide its contents while mounted.\n\
+                     To import these files into a trove vault, run:\n  \
+                     trove import {}\n\
+                     To mount anyway (advanced; existing files become temporarily invisible), pass --allow-non-empty.",
+                    mountpoint.display(),
+                    mountpoint.display()
+                );
+            }
             let fs = init_fs(volume, meta, cache, &cfg)?;
             let registry = match &types {
                 Some(dir) => trove::types::Registry::load(dir)?,
@@ -395,6 +461,21 @@ fn run() -> Result<usize> {
                 },
             );
             trove::mount::mount_blocking(fs, registry, versions, embed_tx, &mountpoint)?;
+            Ok(0)
+        }
+
+        #[cfg(feature = "mount")]
+        Command::Import { path, types, volume, meta, cache, versions_db, no_embed, yes, force } => {
+            use trove::commands::import::ImportOptions;
+            trove::commands::import::run(
+                ImportOptions { path, types, yes, force },
+                &cfg,
+                volume,
+                meta,
+                cache,
+                versions_db,
+                no_embed,
+            )?;
             Ok(0)
         }
 

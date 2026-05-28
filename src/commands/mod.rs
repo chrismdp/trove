@@ -30,3 +30,10 @@ pub mod usage;
 /// every revision in the version chain. Incremental by default.
 #[cfg(feature = "mount")]
 pub mod backup;
+
+/// `trove import` — take over an existing directory. Moves the original to a
+/// timestamped backup, mounts trove at the original path, and streams the
+/// files back through the validation gate so they get versioned + embedded.
+/// The pure safety predicates (path/size guards) are core; the IO half is
+/// mount-feature-gated.
+pub mod import;

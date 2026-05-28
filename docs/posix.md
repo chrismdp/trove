@@ -37,6 +37,7 @@ This page is the honest list of what works, what doesn't, and why.
 |---|---|---|
 | `close()` / `fsync()` on a governed file with invalid frontmatter | returns `EINVAL`; nothing persists; a `<path>.errors` sidecar appears | This **is** the "filesystem that talks back" feature. See [The write pipeline](/docs/write-pipeline). |
 | File mode on a freshly-committed governed file | set to the mode the agent's `open(O_CREAT, mode)` requested | A change from earlier versions which hardcoded `0o644`. Mode is preserved on every edit thereafter (truncate-in-place). |
+| `trove mount` on a non-empty mountpoint | refuses by default; `--allow-non-empty` overrides | FUSE overlays the mountpoint, hiding existing files while the mount is up. Refusing by default avoids the "where did all my files go?" panic. Use [`trove import`](/docs/running#mounting-onto-an-existing-directory) to bring existing files into a vault instead. |
 
 ## What's not supported (yet)
 

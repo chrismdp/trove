@@ -88,6 +88,60 @@ trove doctor
 If anything fails here, **fix it before mounting**. A green doctor is the
 contract that the mount can succeed.
 
+## Mounting onto an existing directory
+
+### `trove mount` projects onto a path; it does not import
+
+`trove mount <path>` runs a FUSE filesystem at `<path>`. While mounted,
+the kernel routes every read and write under that path through trove —
+**any files that were already there are hidden** by the overlay, just
+like mounting any other filesystem. The files are not gone (they
+reappear on `umount`), but they're invisible during the mount, which is
+alarming the first time you see it.
+
+To protect against accidental "where did all my files go?" moments,
+`trove mount` refuses to mount onto a non-empty directory by default:
+
+```
+$ trove mount ~/vault
+error: mountpoint /home/you/vault is not empty — FUSE will hide its
+       contents while mounted.
+       To import these files into a trove vault, run:
+         trove import /home/you/vault
+       To mount anyway (advanced; existing files become temporarily
+       invisible), pass --allow-non-empty.
+```
+
+Hidden filesystem droppings (`.DS_Store`, `.Spotlight-V100`,
+`.directory`) don't count toward "non-empty" — those are ignored.
+
+### Use `trove import` to take over an existing vault
+
+When you DO want trove to manage a directory of existing files, use
+`trove import`:
+
+```bash
+trove import ~/vault --types ~/vault/.types
+```
+
+What it does, in order:
+
+1. **Dry-run validation** against the SOURCE — if any file would be
+   rejected by the validation gate, the import aborts before touching
+   anything. Fix the failures in place, then re-run.
+2. **Confirmation** — you retype the destination path to proceed.
+3. **Move** `~/vault` to `~/.trove-backup/vault-<timestamp>/` (an atomic
+   rename on the same filesystem).
+4. **Mount** trove at the now-empty `~/vault`.
+5. **Stream** the backed-up files back through the mount, so each one
+   runs the validation gate, gets versioned, and gets embedded.
+
+The original tree is retained at `~/.trove-backup/<basename>-<timestamp>`
+so you can `mv` it back if anything goes wrong. Safety thresholds (>
+10k files or > 1 GB) require `--force` to override — these exist to
+catch typos like `trove import /`. Use `--yes` to skip the typed
+confirmation in scripts.
+
 ## Step 5: mount
 
 ```bash
