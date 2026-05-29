@@ -48,9 +48,12 @@ keys are named `R2_*` but any S3-compatible store works (MinIO, AWS S3).
 - **Running on one machine?** A local `postgres` install is fine — point
   `TROVE_VERSIONS_DB` at `127.0.0.1:5432`.
 - **Running across machines?** Use a hosted Postgres (Supabase, Neon, RDS).
-  Just point `TROVE_VERSIONS_DB` at it — use the **session** pooler (port
-  5432), not the transaction pooler (6543): trove holds a live database
-  session, which pgbouncer's transaction mode breaks.
+  Point `TROVE_VERSIONS_DB` at it. On Supabase, click **Connect → Connection
+  string → Session pooler** and use that URI (host ends in
+  `.pooler.supabase.com`, port 5432). Do **not** use the **Direct connection**
+  (`db.<ref>.supabase.co`) — it's IPv6-only and fails with a DNS lookup error
+  on most machines — nor the **Transaction pooler** (6543), whose transaction
+  mode breaks the live session trove keeps.
 
 Optional fourth: `OPENAI_API_KEY` for semantic search. Without it, pass
 `--no-embed` to `trove mount` and you'll still get validation + version

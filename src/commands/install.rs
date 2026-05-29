@@ -329,9 +329,12 @@ fn run_interactive(flags: InstallFlags) -> Result<()> {
         "Postgres database \u{2014} stores metadata, version history and embeddings.",
         &[
             "Easiest is Supabase (free tier): create a project at https://supabase.com,",
-            "then Project Settings \u{2192} Database \u{2192} Connection string \u{2192} URI.",
-            "Pick the \"Session pooler\" (port 5432), NOT the transaction pooler (6543).",
-            "Paste the whole URI below \u{2014} it already includes your database password.",
+            "then click \"Connect\" (top bar) \u{2192} Connection string \u{2192} Session pooler.",
+            "Use THAT URI \u{2014} its host ends in .pooler.supabase.com, port 5432. Paste it",
+            "below (it includes your database password).",
+            "Do NOT use \"Direct connection\" (db.<ref>.supabase.co): it's IPv6-only and",
+            "fails with a DNS lookup error on most machines. Avoid the Transaction pooler",
+            "(6543) too \u{2014} trove holds a live session its transaction mode would break.",
         ],
     );
     let versions_db = ask("versions_db (postgres URL)", cur.versions_db.as_deref())?;
@@ -608,10 +611,11 @@ fn print_agent_guide(resolved: &Config) {
         mark(resolved.versions_db.is_some()),
         cur(&resolved.versions_db)
     );
-    println!("                          Accepts DATABASE_URL too. Use the hosted *session*");
-    println!("                          pooler (port 5432) — trove holds a live session, so");
-    println!("                          pgbouncer transaction mode (6543) breaks it.");
-    println!("                          e.g. postgres://user:pass@host:5432/postgres");
+    println!("                          Accepts DATABASE_URL too.");
+    println!("                          Supabase: use the Session pooler string (host ends in");
+    println!("                          .pooler.supabase.com, port 5432) — NOT \"Direct connection\"");
+    println!("                          (db.<ref>.supabase.co), which is IPv6-only and fails to");
+    println!("                          resolve on most machines. Avoid the 6543 transaction pooler.");
     println!(
         "  {} TROVE_R2_BUCKET       Full S3 endpoint URL of the bucket.{}",
         mark(resolved.r2_bucket.is_some()),
@@ -666,21 +670,52 @@ fn print_agent_guide(resolved: &Config) {
     );
 }
 
-fn ask(label: &str, current: Option<&str>) -> io::Result<Option<String>> {
-    use colored::Colorize;
-    match current {
-        Some(c) => print!("{label} [{}]: ", c.dimmed()),
-        None => print!("{label}: "),
-    }
-    io::stdout().flush()?;
-    let mut line = String::new();
-    io::stdin().read_line(&mut line)?;
+/// Prompt for a value, with full line editing where available (arrow keys,
+/// home/end, ^U/^K — see [`read_input_line`]). Empty input keeps `current`.
+fn ask(label: &str, current: Option<&str>) -> Result<Option<String>> {
+    let prompt = match current {
+        Some(c) => format!("{label} [{c}]: "),
+        None => format!("{label}: "),
+    };
+    let line = read_input_line(&prompt)?;
     let line = line.trim();
     Ok(if line.is_empty() {
         current.map(str::to_string)
     } else {
         Some(line.to_string())
     })
+}
+
+/// Read one line of input with readline-style editing: left/right arrows move
+/// the cursor, home/end/^A/^E jump, ^U/^K cut — the things people expect when
+/// fixing a typo in a pasted connection string. A fresh editor per prompt means
+/// no cross-prompt history (up-arrow on the bucket prompt shouldn't surface your
+/// DB URL). Only compiled with `mount`, which pulls `rustyline`; the install IO
+/// path is mount-gated regardless.
+#[cfg(feature = "mount")]
+fn read_input_line(prompt: &str) -> Result<String> {
+    use rustyline::error::ReadlineError;
+    let mut editor = rustyline::DefaultEditor::new()
+        .map_err(|e| anyhow!("initialising the line editor: {e}"))?;
+    match editor.readline(prompt) {
+        Ok(line) => Ok(line),
+        // Ctrl-D on an empty line: treat as "accept default / leave blank".
+        Err(ReadlineError::Eof) => Ok(String::new()),
+        Err(ReadlineError::Interrupted) => bail!("aborted (Ctrl-C)"),
+        Err(e) => Err(anyhow!("reading input: {e}")),
+    }
+}
+
+/// Fallback when `rustyline` isn't linked (core-only build): plain canonical
+/// read. No arrow-key editing, but the core build never runs `trove install`'s
+/// IO path anyway.
+#[cfg(not(feature = "mount"))]
+fn read_input_line(prompt: &str) -> Result<String> {
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    Ok(line)
 }
 
 /// Print a short "what this is / how to get it" paragraph before a prompt:
