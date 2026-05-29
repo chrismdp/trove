@@ -2,6 +2,35 @@
 
 Symptoms and what they usually mean.
 
+## `trove init`/`mount` fails to mount on macOS (macFUSE)
+
+trove mounts the vault with FUSE. On macOS that's **macFUSE**, which must be
+installed *and* approved — the approval step is easy to miss, so the first mount
+often fails with a cryptic error. trove prints these steps on a failed mount;
+in full:
+
+1. **Install** (once): `brew install --cask macfuse`
+2. **Approve**: open **System Settings → Privacy & Security**, scroll to
+   **Security**. If you see *"System software from developer 'Benjamin
+   Fleischer' was blocked from loading"*, click **Allow**.
+3. **Reboot** — macFUSE loads a system extension that only takes effect after a
+   restart.
+4. Re-run `trove init` (or `trove mount`).
+
+On **Apple Silicon**, if no *Allow* button appears, permit system extensions
+first: boot into **Recovery** (hold the power button at startup) → **Startup
+Security Utility** → set **Reduced Security** and tick *"Allow user management of
+kernel extensions from identified developers"*, then retry.
+
+If macFUSE was already installed and approved and it still fails, it's usually
+stale state after an OS or macFUSE update — a reboot clears it. A FUSE mount
+left in a bad state can make Finder/Spotlight (and so the whole machine) appear
+to hang while they wait on the dead mountpoint; a reboot recovers it.
+
+> Note: on macOS trove mounts single-threaded — macFUSE doesn't support the
+> multi-threaded dispatch trove uses on Linux. This is automatic; you don't need
+> to configure anything.
+
 ## `trove check` says everything is "untyped"
 
 Your `.types/<name>.json` schemas don't have `globs` arrays, or the globs

@@ -1271,25 +1271,38 @@ fn config() -> fuser::Config {
     // BackgroundSession unmounts on drop, and the foreground mount unmounts on
     // exit. (Reconsider AutoUnmount + AllowOther for the long-running daemon.)
     cfg.mount_options = vec![MountOption::FSName("trove".to_string())];
-    // Multi-threaded dispatch. fuser defaults to a SINGLE event-loop thread,
-    // which deadlocks under concurrent clients: the lone worker blocks inside a
-    // handler (e.g. a commit doing blocking libjfs I/O) while the kernel needs
-    // it to service a dependent request, and nothing makes progress. Confirmed
-    // empirically — 4 concurrent writers fine, ~30 hung the single worker. With
-    // several workers the kernel can always hand a request to an idle thread.
-    // (Our state is a `Mutex<Inner>`, so concurrent handlers are still
-    // serialised for correctness; libjfs itself is concurrency-safe. Narrowing
-    // that lock around the blocking I/O is a later optimisation, not needed for
-    // deadlock-freedom because commit I/O goes to the backing store, never back
-    // through this mount.) `clone_fd` gives each worker its own /dev/fuse fd
-    // (Linux 4.5+) for parallel request reads.
-    cfg.n_threads = Some(
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .clamp(4, 16),
-    );
-    cfg.clone_fd = true;
+
+    // Multi-threaded dispatch + fd cloning are **Linux-only**. macFUSE (macOS)
+    // runs a single event loop: asking for more threads fails outright with
+    // "numThreads != 1 only supported on linux", and `clone_fd` (a per-worker
+    // /dev/fuse fd, Linux 4.5+) isn't available either. So we tune per-OS.
+    #[cfg(target_os = "linux")]
+    {
+        // fuser defaults to a SINGLE event-loop thread, which deadlocks under
+        // concurrent clients: the lone worker blocks inside a handler (e.g. a
+        // commit doing blocking libjfs I/O) while the kernel needs it to service
+        // a dependent request, and nothing makes progress. Confirmed empirically
+        // — 4 concurrent writers fine, ~30 hung the single worker. With several
+        // workers the kernel can always hand a request to an idle thread. (Our
+        // state is a `Mutex<Inner>`, so handlers are still serialised for
+        // correctness; libjfs is concurrency-safe. Commit I/O goes to the
+        // backing store, never back through this mount, so this is deadlock-free.)
+        cfg.n_threads = Some(
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .clamp(4, 16),
+        );
+        cfg.clone_fd = true;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // macOS / macFUSE: single worker only. Heavy concurrency can still
+        // serialise on the one thread, but that's a macFUSE limitation, not
+        // something we can configure around.
+        cfg.n_threads = Some(1);
+        cfg.clone_fd = false;
+    }
     cfg
 }
 
@@ -1306,6 +1319,10 @@ pub fn spawn_with_versions(
     mountpoint: &Path,
 ) -> io::Result<BackgroundSession> {
     fuser::spawn_mount2(TroveFs::with_versions(fs, registry, versions), mountpoint, &config())
+        .map_err(|e| {
+            report_mount_failure(&e);
+            e
+        })
 }
 
 /// Background mount with version capture + self-triggering embed. For tests.
@@ -1321,6 +1338,10 @@ pub fn spawn_with_versions_and_embed(
         mountpoint,
         &config(),
     )
+    .map_err(|e| {
+        report_mount_failure(&e);
+        e
+    })
 }
 
 /// Mount in the foreground; blocks until unmounted. For the `trove mount` CLI.
@@ -1337,4 +1358,56 @@ pub fn mount_blocking(
         mountpoint,
         &config(),
     )
+    .map_err(|e| {
+        report_mount_failure(&e);
+        e
+    })
+}
+
+/// On a mount failure, print platform guidance to stderr before the error
+/// propagates. On macOS a FUSE mount almost always fails because macFUSE isn't
+/// installed or — on first install — hasn't been approved in System Settings (a
+/// system extension that needs a reboot to load); the raw error is cryptic, so
+/// we spell out the fix. On Linux it's usually a missing fuse3 or an
+/// unprivileged-mount restriction (e.g. inside a container).
+#[allow(unused_variables)]
+fn report_mount_failure(err: &io::Error) {
+    #[cfg(target_os = "macos")]
+    {
+        eprintln!();
+        eprintln!("trove couldn't mount — on macOS this needs macFUSE, which must be");
+        eprintln!("installed AND approved (a one-time step that's easy to miss):");
+        eprintln!();
+        eprintln!("  1. Install (once):  brew install --cask macfuse");
+        eprintln!("  2. Approve it:      System Settings → Privacy & Security → scroll to");
+        eprintln!("                      Security. If you see \"System software from developer");
+        eprintln!("                      'Benjamin Fleischer' was blocked\", click Allow.");
+        eprintln!("  3. Reboot:          macFUSE loads a system extension that only takes");
+        eprintln!("                      effect after a restart.");
+        eprintln!("  4. Re-run `trove init` (or `trove mount`).");
+        eprintln!();
+        eprintln!("  Apple Silicon: if no Allow button appears, enable system extensions in");
+        eprintln!("  Recovery → Startup Security Utility (Reduced Security + \"Allow user");
+        eprintln!("  management of kernel extensions from identified developers\"), then retry.");
+        eprintln!();
+        eprintln!("  (underlying error: {err})");
+        eprintln!();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let s = err.to_string().to_lowercase();
+        if s.contains("fusermount")
+            || s.contains("permission")
+            || s.contains("operation not permitted")
+            || s.contains("no such file")
+        {
+            eprintln!();
+            eprintln!("trove couldn't mount. FUSE may be missing, or unprivileged mounts");
+            eprintln!("are disabled:");
+            eprintln!("  • Install FUSE:   sudo apt-get install fuse3   (or your distro's package)");
+            eprintln!("  • In a container: run with  --cap-add SYS_ADMIN --device /dev/fuse");
+            eprintln!("  (underlying error: {err})");
+            eprintln!();
+        }
+    }
 }

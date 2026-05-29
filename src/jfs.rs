@@ -282,6 +282,9 @@ impl Fs {
     pub fn init(name: &str, meta: &str, cache_dir: &str) -> Result<Fs> {
         // The byte-string fields MUST be non-empty or libjfs panics the whole
         // process in ParseBytesStr/ParseMbpsStr (learned in the spike).
+        // maxUploads/maxDownloads are set explicitly: omitting them leaves
+        // JuiceFS at 0, which its SelfCheck clamps to a single upload thread (a
+        // real throughput cap), so we give it JuiceFS's normal defaults.
         let conf = serde_json::json!({
             "meta": meta,
             "cacheDir": cache_dir,
@@ -290,6 +293,8 @@ impl Fs {
             "readahead": "0",
             "uploadLimit": "0",
             "downloadLimit": "0",
+            "maxUploads": 20,
+            "maxDownloads": 200,
             "autoCreate": true,
             "noUsageReport": true,
             "caller": 1,
