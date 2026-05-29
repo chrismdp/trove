@@ -36,11 +36,16 @@ enum Command {
         quiet: bool,
     },
 
-    /// Write ~/.config/trove/config.toml interactively, then provision the
-    /// backend: apply the embedded SQL migration to the version DB and format
-    /// the JuiceFS volume. Refuses to clobber existing non-empty Trove tables
-    /// or to re-format a volume against a different bucket — use the safety
-    /// flags to override. Secrets stay in the environment.
+    /// Write ~/.config/trove/config.toml, then provision the backend: apply the
+    /// embedded SQL migration to the version DB and format the JuiceFS volume.
+    /// At a terminal this is a guided, interactive setup (prompts + secret
+    /// entry). With no TTY — i.e. an agent or script is driving it — it reads
+    /// every setting from the environment (TROVE_VERSIONS_DB, TROVE_R2_BUCKET,
+    /// R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, …) and either provisions straight
+    /// through or prints exactly which variables to set. Refuses to clobber
+    /// existing non-empty Trove tables or to re-format a volume against a
+    /// different bucket — use the safety flags to override. Secrets stay in the
+    /// environment, never the config file.
     Install {
         /// Accept existing Trove tables / a formatted volume; skip the create
         /// steps. Use when re-running install against a backend you intend to keep.
@@ -54,12 +59,22 @@ enum Command {
         reinstall: bool,
     },
 
-    /// Serve the bundled documentation on localhost. No native deps, no
-    /// Postgres, no OpenAI — `trove check`-only installs get the docs too.
-    /// The content lives under `docs/` in the source tree and is baked into
-    /// the binary at build time.
+    /// Read the bundled documentation. With no arguments it lists every page;
+    /// pass a page slug to print that page's markdown to stdout (`trove docs
+    /// quickstart`); `--all` prints the whole manual concatenated (handy to
+    /// pipe to an agent); `--serve` opens the browser UI instead of printing.
+    /// No native deps, no Postgres, no OpenAI — the content lives under `docs/`
+    /// and is baked into the binary at build time.
     Docs {
-        /// Port to bind on 127.0.0.1.
+        /// Page slug to print (e.g. `quickstart`). Omit to list all pages.
+        page: Option<String>,
+        /// Print every page concatenated, in nav order.
+        #[arg(long)]
+        all: bool,
+        /// Serve the docs as a browser UI on 127.0.0.1 instead of printing.
+        #[arg(long)]
+        serve: bool,
+        /// Port to bind on 127.0.0.1 with `--serve`.
         #[arg(long, default_value_t = 38081)]
         port: u16,
     },
@@ -390,8 +405,22 @@ fn run() -> Result<usize> {
             Ok(s.failed)
         }
 
-        Command::Docs { port } => {
-            trove::commands::docs::run(port)?;
+        Command::Docs { page, all, serve, port } => {
+            if serve {
+                trove::commands::docs::serve(port)?;
+            } else {
+                use std::io::Write;
+                let out = if all {
+                    trove::commands::docs::all_markdown()?
+                } else if let Some(slug) = page {
+                    trove::commands::docs::page_markdown(&slug)?
+                } else {
+                    trove::commands::docs::index_text()?
+                };
+                // Tolerate a closed pipe (`trove docs --all | head`) instead of
+                // panicking on the broken-pipe write.
+                let _ = std::io::stdout().write_all(out.as_bytes());
+            }
             Ok(0)
         }
 

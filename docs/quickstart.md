@@ -35,20 +35,22 @@ If you have a **Postgres server** and an **S3-compatible bucket**, you have
 everything you need. Trove uses three variables:
 
 ```bash
-export DATABASE_URL="postgres://user:pass@host:5432/dbname"
-export S3_ACCESS_KEY_ID="..."
-export S3_SECRET_ACCESS_KEY="..."
+export TROVE_VERSIONS_DB="postgres://user:pass@host:5432/dbname"  # DATABASE_URL also accepted
+export R2_ACCESS_KEY_ID="..."
+export R2_SECRET_ACCESS_KEY="..."
 ```
 
 That's it. The Postgres URL doubles as JuiceFS's metadata engine AND the
 version-chain + embeddings store — **one connection, one substrate**. The
-S3 bucket holds the file data; JuiceFS chunks and stores it for you.
+S3 bucket holds the file data; JuiceFS chunks and stores it for you. The
+keys are named `R2_*` but any S3-compatible store works (MinIO, AWS S3).
 
 - **Running on one machine?** A local `postgres` install is fine — point
-  `DATABASE_URL` at `127.0.0.1:5432`.
+  `TROVE_VERSIONS_DB` at `127.0.0.1:5432`.
 - **Running across machines?** Use a hosted Postgres (Supabase, Neon, RDS).
-  Just point `DATABASE_URL` at it. JuiceFS handles the metadata coordination
-  itself.
+  Just point `TROVE_VERSIONS_DB` at it (use the **session** pooler — port
+  5432, not the transaction pooler on 6543: JuiceFS keeps session state).
+  JuiceFS handles the metadata coordination itself.
 
 Optional fourth: `OPENAI_API_KEY` for semantic search. Without it, pass
 `--no-embed` to `trove mount` and you'll still get validation + version
@@ -122,9 +124,15 @@ path glob, applied to YAML frontmatter. The rest of the system builds the
 With the three secrets above exported:
 
 ```bash
-# 1. Write config + provision the backend (one-time, interactive).
+# 1. Write config + provision the backend (one-time).
 trove install
-#    → asks for DATABASE_URL, S3 bucket URL, volume name, vault path
+#    → at a terminal: a guided setup — prompts for the Postgres URL, bucket
+#      endpoint, volume name and vault path, and reads any missing secrets
+#      (R2 keys, OpenAI key) without echoing them
+#    → no TTY (an agent/script): reads everything from the environment
+#      (TROVE_VERSIONS_DB, TROVE_R2_BUCKET, R2_ACCESS_KEY_ID,
+#      R2_SECRET_ACCESS_KEY) and provisions with no prompts — or prints
+#      exactly which variables to set if something's missing
 #    → writes ~/.config/trove/config.toml
 #    → applies the embedded SQL migration (blobs, file_versions, blob_chunks, pgvector)
 #    → formats the JuiceFS volume on your bucket
@@ -139,15 +147,15 @@ If install fails partway, the equivalent manual steps are:
 
 ```bash
 # Apply the schema migration manually.
-psql "$DATABASE_URL" -f supabase/migrations/*_init_version_chain_and_embeddings.sql
+psql "$TROVE_VERSIONS_DB" -f supabase/migrations/*_init_version_chain_and_embeddings.sql
 
 # Format the JuiceFS volume on your bucket.
 juicefs format \
     --storage s3 \
     --bucket   "https://<bucket>.<acct>.r2.cloudflarestorage.com" \
-    --access-key  "$S3_ACCESS_KEY_ID" \
-    --secret-key  "$S3_SECRET_ACCESS_KEY" \
-    "$DATABASE_URL" \
+    --access-key  "$R2_ACCESS_KEY_ID" \
+    --secret-key  "$R2_SECRET_ACCESS_KEY" \
+    "$TROVE_VERSIONS_DB" \
     trove
 ```
 
@@ -190,8 +198,8 @@ r2_bucket   = "trove"
 store       = "/home/you/vault"
 ```
 
-**Secrets are NOT in this file.** `S3_ACCESS_KEY_ID`,
-`S3_SECRET_ACCESS_KEY`, and `OPENAI_API_KEY` stay in the environment (or
+**Secrets are NOT in this file.** `R2_ACCESS_KEY_ID`,
+`R2_SECRET_ACCESS_KEY`, and `OPENAI_API_KEY` stay in the environment (or
 your `.envrc` / `1password run`).
 
 ## Next

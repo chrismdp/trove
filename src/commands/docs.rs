@@ -1,9 +1,15 @@
-//! `trove docs` — embedded walkthrough served on localhost.
+//! `trove docs` — the embedded walkthrough, available two ways.
 //!
 //! The `docs/` directory at the crate root is baked into the binary at compile
-//! time via `rust-embed`. At request time we look up the slug, render the
-//! markdown to HTML with `pulldown-cmark`, and serve it inside a fumadocs-style
-//! shell (sidebar from `meta.toml`, content pane, right-side table of contents,
+//! time via `rust-embed`. Most of the time you just want to *read* a page, so
+//! the default is to **print markdown to stdout** ([`page_markdown`],
+//! [`all_markdown`], [`index_text`]) — no server, no browser, nothing to kill
+//! afterwards. This is what an agent reaches for: `trove docs quickstart` or
+//! `trove docs --all` and it has the manual in one read.
+//!
+//! [`serve`] is the richer path for a human: it renders the same markdown to
+//! HTML with `pulldown-cmark` and serves it inside a fumadocs-style shell
+//! (sidebar from `meta.toml`, content pane, right-side table of contents,
 //! client-side search across all pages).
 //!
 //! No native deps, no Postgres, no libjfs. `trove check`-only installs get the
@@ -37,8 +43,82 @@ pub struct Page {
     title: String,
 }
 
+/// Raw markdown for a single page, by slug (the same slug used in the URL and
+/// in `meta.toml`). Returns an error listing the valid slugs on a miss — so a
+/// typo is self-correcting rather than a bare 404.
+pub fn page_markdown(slug: &str) -> Result<String> {
+    let file = DocsAssets::get(&format!("{slug}.md")).ok_or_else(|| {
+        let available = load_meta()
+            .map(|m| {
+                m.sections
+                    .iter()
+                    .flat_map(|s| s.pages.iter())
+                    .map(|p| p.slug.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        anyhow!("no docs page {slug:?}. Available pages: {available}")
+    })?;
+    let md = std::str::from_utf8(&file.data).context("docs page is not UTF-8")?;
+    Ok(md.to_string())
+}
+
+/// Every page concatenated in nav order, each preceded by an HTML comment
+/// naming its source file so the boundaries are visible. Built for piping the
+/// whole manual into an agent in one read.
+pub fn all_markdown() -> Result<String> {
+    let meta = load_meta()?;
+    let mut out = String::new();
+    for section in &meta.sections {
+        for page in &section.pages {
+            let Some(file) = DocsAssets::get(&format!("{}.md", page.slug)) else {
+                continue;
+            };
+            let Ok(md) = std::str::from_utf8(&file.data) else {
+                continue;
+            };
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str(&format!("<!-- docs/{}.md · {} -->\n\n", page.slug, page.title));
+            out.push_str(md);
+            if !md.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// A plain-text index of every page (section headers + slug + title) plus a
+/// usage hint. Printed when `trove docs` is run with no page and no `--serve`.
+pub fn index_text() -> Result<String> {
+    let meta = load_meta()?;
+    let width = meta
+        .sections
+        .iter()
+        .flat_map(|s| &s.pages)
+        .map(|p| p.slug.len())
+        .max()
+        .unwrap_or(0);
+    let mut out = String::from("trove docs — bundled manual\n\n");
+    out.push_str("  trove docs <slug>     print one page's markdown\n");
+    out.push_str("  trove docs --all      print the whole manual\n");
+    out.push_str("  trove docs --serve    open the browser UI (http://127.0.0.1:38081)\n\n");
+    for section in &meta.sections {
+        out.push_str(&section.title);
+        out.push('\n');
+        for page in &section.pages {
+            out.push_str(&format!("  {:<width$}  {}\n", page.slug, page.title, width = width));
+        }
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 /// Start the docs server, blocking until Ctrl-C.
-pub fn run(port: u16) -> Result<()> {
+pub fn serve(port: u16) -> Result<()> {
     let meta = load_meta()?;
     let addr = format!("127.0.0.1:{port}");
     let server = Server::http(&addr).map_err(|e| anyhow!("binding {addr}: {e}"))?;
@@ -642,5 +722,35 @@ mod tests {
         // rust-embed setup is wired correctly and the toml is valid.
         let meta = load_meta().expect("docs/meta.toml must embed and parse");
         assert!(!meta.sections.is_empty());
+    }
+
+    #[test]
+    fn page_markdown_returns_known_page() {
+        // `intro` is the first page every catalog has; it must embed.
+        let md = page_markdown("intro").expect("intro.md must embed");
+        assert!(!md.trim().is_empty());
+    }
+
+    #[test]
+    fn page_markdown_unknown_slug_lists_alternatives() {
+        let err = page_markdown("does-not-exist").unwrap_err().to_string();
+        assert!(err.contains("does-not-exist"));
+        // The error names valid pages so a typo self-corrects.
+        assert!(err.contains("intro"), "error should list available pages: {err}");
+    }
+
+    #[test]
+    fn index_text_lists_pages_with_hint() {
+        let idx = index_text().expect("index renders");
+        assert!(idx.contains("trove docs <slug>"));
+        assert!(idx.contains("quickstart"));
+    }
+
+    #[test]
+    fn all_markdown_concatenates_every_page() {
+        let all = all_markdown().expect("concatenation renders");
+        // Boundary markers and at least two distinct pages present.
+        assert!(all.contains("<!-- docs/intro.md"));
+        assert!(all.contains("<!-- docs/quickstart.md"));
     }
 }

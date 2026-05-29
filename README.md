@@ -30,6 +30,22 @@ build `libjfs`, plus running `./libjfs/build.sh` before `cargo install`):
 cargo install --git https://github.com/chrismdp/trove --features mount
 ```
 
+## Docs
+
+The full manual ships inside the binary — no server required:
+
+```sh
+trove docs                 # list every page
+trove docs quickstart      # print one page's markdown to stdout
+trove docs --all           # print the whole manual (handy to pipe to an agent)
+trove docs --serve         # browser UI at http://127.0.0.1:38081
+```
+
+`trove install` is the one-time setup. At a terminal it's a guided,
+interactive flow (prompts + no-echo secret entry); with no TTY it reads
+everything from the environment and either provisions straight through or
+prints exactly which variables to set — so an agent can run it unattended.
+
 ## Status — v0.1 (single-tenant)
 
 Built and tested end-to-end: **schema-on-write validation**, a **FUSE mount**

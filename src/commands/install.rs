@@ -21,7 +21,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use postgres::{Client, NoTls};
 use std::collections::HashSet;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 
 use crate::config::Config;
 
@@ -219,47 +219,172 @@ fn plan_format(db: &DbState, requested_bucket: &str, flags: InstallFlags) -> For
 
 // -- IO half --------------------------------------------------------------
 
-/// Public entry point used by `main.rs`. Walks the user through the prompts,
-/// saves config, then provisions Postgres + JuiceFS with all the safety gates.
+/// Public entry point used by `main.rs`. Branches on whether stdin is a TTY:
+///
+/// - **Terminal** → [`run_interactive`]: a guided setup that explains what's
+///   needed, prompts for the config, and reads any missing secrets without
+///   echoing them.
+/// - **No TTY** (an agent or script is driving us) → [`run_noninteractive`]:
+///   read every setting from the environment and either provision straight
+///   through, or — if something's missing — print a precise "set these
+///   variables" guide instead of blocking forever on a dead stdin.
 pub fn run(flags: InstallFlags) -> Result<()> {
+    if io::stdin().is_terminal() {
+        run_interactive(flags)
+    } else {
+        run_noninteractive(flags)
+    }
+}
+
+/// An environment variable, treating empty-string as unset.
+fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|s| !s.is_empty())
+}
+
+/// True when both R2 credentials are present in the environment.
+fn r2_keys_present() -> bool {
+    env_nonempty("R2_ACCESS_KEY_ID").is_some() && env_nonempty("R2_SECRET_ACCESS_KEY").is_some()
+}
+
+/// Resolve the full config from the environment, layered over any existing
+/// config file. Mirrors the precedence the rest of the CLI uses (env > config),
+/// with the same defaults the interactive prompts offer (`volume = trove`,
+/// `meta = versions_db`, `cache = /tmp/trove-cache`). `DATABASE_URL` is accepted
+/// as an alias for `TROVE_VERSIONS_DB` because it's the near-universal name and
+/// the value is persisted to config here anyway.
+fn resolve_env_config(cur: &Config) -> Config {
+    let versions_db = env_nonempty("TROVE_VERSIONS_DB")
+        .or_else(|| env_nonempty("DATABASE_URL"))
+        .or_else(|| cur.versions_db.clone());
+    let meta = env_nonempty("TROVE_META")
+        .or_else(|| cur.meta.clone())
+        .or_else(|| versions_db.clone());
+    Config {
+        versions_db,
+        volume: env_nonempty("TROVE_VOLUME")
+            .or_else(|| cur.volume.clone())
+            .or_else(|| Some("trove".to_string())),
+        meta,
+        cache: env_nonempty("TROVE_CACHE")
+            .or_else(|| cur.cache.clone())
+            .or_else(|| Some("/tmp/trove-cache".to_string())),
+        r2_bucket: env_nonempty("TROVE_R2_BUCKET").or_else(|| cur.r2_bucket.clone()),
+        store: env_nonempty("TROVE_STORE").or_else(|| cur.store.clone()),
+        backup_dir: env_nonempty("TROVE_BACKUP_DIR").or_else(|| cur.backup_dir.clone()),
+    }
+}
+
+/// No-TTY path: read everything from the environment. If the required pieces
+/// are all present, provision with zero prompts; otherwise print the setup
+/// guide and exit non-zero (rather than silently writing an empty config or
+/// hanging on `read_line`).
+fn run_noninteractive(flags: InstallFlags) -> Result<()> {
+    let cur = Config::load();
+    let new = resolve_env_config(&cur);
+    let ready = new.versions_db.is_some() && new.r2_bucket.is_some() && r2_keys_present();
+    if !ready {
+        print_agent_guide(&new);
+        bail!(
+            "not enough configuration in the environment and no TTY to prompt — \
+             set the variables listed above and re-run `trove install`"
+        );
+    }
+    provision(new, flags)
+}
+
+/// Guided, interactive path for a human at a terminal.
+fn run_interactive(flags: InstallFlags) -> Result<()> {
     use colored::Colorize;
     let cur = Config::load();
-    let path = Config::path()?;
-    println!("{} writing {}", "trove install:".bold(), path.display());
-    println!(
-        "{}\n",
-        "secrets stay in the environment, NOT this file: OPENAI_API_KEY, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY".dimmed()
-    );
+    let cfg_path = Config::path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "~/.config/trove/config.toml".to_string());
 
-    // (a) prompts
+    println!("{}", "trove install — let's set up your vault.".bold());
+    println!(
+        "Writes {cfg_path}, applies the DB migration, and formats your object-store volume.\n"
+    );
+    println!("You'll need:");
+    println!(
+        "  {} a Postgres URL (Supabase / Neon / RDS / local) — metadata, version history, embeddings",
+        "•".dimmed()
+    );
+    println!(
+        "  {} an S3-compatible bucket + keys (Cloudflare R2, MinIO, AWS S3) — the file data",
+        "•".dimmed()
+    );
+    println!(
+        "  {} optionally an OpenAI API key — semantic search (skip it and mount with {})",
+        "•".dimmed(),
+        "--no-embed".cyan()
+    );
+    println!("\nFull walkthrough any time: {}\n", "trove docs quickstart".cyan());
+
+    // (a) non-secret config prompts
     let new = Config {
         versions_db: ask("versions_db (postgres URL)", cur.versions_db.as_deref())?,
-        volume: ask("volume name", cur.volume.as_deref())?,
-        meta: ask("meta URL (often the same as versions_db)", cur.meta.as_deref())?,
+        volume: ask("volume name", cur.volume.as_deref().or(Some("trove")))?,
+        meta: ask("meta URL (blank = same as versions_db)", cur.meta.as_deref())?,
         store: ask(
             "store (vault path, used by `trove doctor`'s validation sweep)",
             cur.store.as_deref(),
         )?,
         cache: ask("cache dir", cur.cache.as_deref().or(Some("/tmp/trove-cache")))?,
-        r2_bucket: ask("r2 bucket (optional, for `trove doctor`)", cur.r2_bucket.as_deref())?,
+        r2_bucket: ask(
+            "r2 bucket endpoint URL (https://<bucket>.<acct>.r2.cloudflarestorage.com)",
+            cur.r2_bucket.as_deref(),
+        )?,
         backup_dir: ask(
             "backup mirror directory [optional \u{2014} write a local copy of every committed file]",
             cur.backup_dir.as_deref(),
         )?,
     };
 
-    // (b) secrets pre-flight
-    if std::env::var("OPENAI_API_KEY").ok().filter(|s| !s.is_empty()).is_none() {
+    // (b) secrets — prompt for any not already exported, kept out of config.
+    println!(
+        "\n{}",
+        "Secrets (kept in your environment, never written to config):".bold()
+    );
+    let entered = collect_secrets_interactive()?;
+
+    // (c) provision (shared with the non-interactive path)
+    provision(new, flags)?;
+
+    // (d) remind the user to persist anything typed this run, since it only
+    // lives in this process — future `trove mount` runs need it too.
+    if !entered.is_empty() {
+        println!(
+            "\n{} the secrets you just entered live only in this process. Persist them so future runs find them:",
+            "note:".yellow().bold()
+        );
+        for (name, val) in &entered {
+            println!("  export {name}={}", shell_quote(val));
+        }
+        println!(
+            "  {}",
+            "(add to ~/.envrc, your shell rc, or wrap the mount in `op run` / `1password run`)".dimmed()
+        );
+    }
+    Ok(())
+}
+
+/// Shared provisioning: persist config, then run the migration + volume format
+/// behind all the safety gates. Identical work whether a human or an agent
+/// supplied the settings — only the data-gathering differs.
+fn provision(new: Config, flags: InstallFlags) -> Result<()> {
+    use colored::Colorize;
+
+    // secrets pre-flight (informational)
+    if env_nonempty("OPENAI_API_KEY").is_none() {
         eprintln!(
-            "{} OPENAI_API_KEY is not set — embed/search will be unavailable until you export it.",
+            "{} OPENAI_API_KEY is not set — embed/search will be unavailable until you export it (mount with --no-embed to skip).",
             "warning:".yellow().bold()
         );
     }
-    let r2_keys_set = std::env::var("R2_ACCESS_KEY_ID").ok().filter(|s| !s.is_empty()).is_some()
-        && std::env::var("R2_SECRET_ACCESS_KEY").ok().filter(|s| !s.is_empty()).is_some();
+    let r2_keys_set = r2_keys_present();
 
-    // (c) save the config BEFORE we touch the DB — a failed migration shouldn't
-    // wipe the user's prompt answers.
+    // Save the config BEFORE we touch the DB — a failed migration shouldn't
+    // wipe the answers we just gathered.
     let written = new.save()?;
     println!("\n{} wrote {}", "trove:".bold(), written.display());
 
@@ -274,7 +399,7 @@ pub fn run(flags: InstallFlags) -> Result<()> {
     let meta_url = new.meta.as_deref().unwrap_or(versions_db);
     let bucket = new.r2_bucket.as_deref().unwrap_or("");
 
-    // (d) DB pre-flight + migration
+    // DB pre-flight + migration
     let mut client = Client::connect(versions_db, NoTls).with_context(|| {
         format!(
             "couldn't connect to {versions_db} — set up Postgres + create the DB first, then re-run `trove install`"
@@ -284,7 +409,7 @@ pub fn run(flags: InstallFlags) -> Result<()> {
     let p = plan(&db_state, bucket, flags);
     apply_migration(&mut client, &p.migration, flags)?;
 
-    // (e) JuiceFS volume pre-flight + format
+    // JuiceFS volume pre-flight + format
     if !r2_keys_set {
         match p.format {
             FormatAction::Format | FormatAction::DropAndReformat { .. } => bail!(
@@ -295,7 +420,7 @@ pub fn run(flags: InstallFlags) -> Result<()> {
     }
     apply_format(&mut client, &p.format, volume, meta_url, bucket, flags)?;
 
-    // (f) summary
+    // summary
     let schema_summary = match p.migration {
         MigrationAction::RunMigration | MigrationAction::DropAndRecreate { .. } => {
             "Trove schema created (3 tables, pgvector)"
@@ -320,6 +445,181 @@ pub fn run(flags: InstallFlags) -> Result<()> {
         "✓".green()
     );
     Ok(())
+}
+
+/// Each secret trove reads, with a one-line blurb and where to get it. Drives
+/// both the interactive prompts and the non-interactive guide so the two never
+/// drift apart.
+const SECRETS: [(&str, &str, &str); 3] = [
+    (
+        "OPENAI_API_KEY",
+        "embeddings + `trove search` (optional)",
+        "https://platform.openai.com/api-keys",
+    ),
+    (
+        "R2_ACCESS_KEY_ID",
+        "object-store access key id (needed to format the volume)",
+        "Cloudflare dashboard \u{2192} R2 \u{2192} Manage API Tokens",
+    ),
+    (
+        "R2_SECRET_ACCESS_KEY",
+        "object-store secret key",
+        "shown once when you create the R2 API token",
+    ),
+];
+
+/// Prompt for each secret not already in the environment. Sets entered values
+/// in the process env (so the format step downstream can read them) and returns
+/// them so the caller can remind the user to persist them.
+fn collect_secrets_interactive() -> Result<Vec<(&'static str, String)>> {
+    use colored::Colorize;
+    let mut entered = Vec::new();
+    for (name, blurb, where_) in SECRETS {
+        if env_nonempty(name).is_some() {
+            println!("  {} {name} already set", "✓".green());
+            continue;
+        }
+        println!("  {name} — {blurb}");
+        println!("    {} {where_}", "where:".dimmed());
+        let val = prompt_secret(&format!("    paste {name} (blank to skip): "))?;
+        if val.is_empty() {
+            continue;
+        }
+        std::env::set_var(name, &val);
+        entered.push((name, val));
+    }
+    Ok(entered)
+}
+
+/// Print + flush a label, then read one line without echoing it to the terminal
+/// (where the platform supports it). Trims the trailing newline.
+fn prompt_secret(label: &str) -> Result<String> {
+    print!("{label}");
+    io::stdout().flush()?;
+    Ok(read_secret_line()?.trim().to_string())
+}
+
+/// Read a line with terminal echo disabled, restoring the prior terminal state
+/// afterwards. Only compiled with the `mount` feature, which is the one that
+/// pulls `libc` — and the only build that can actually format a volume, so a
+/// no-`mount` install never reaches a real secret prompt.
+#[cfg(feature = "mount")]
+fn read_secret_line() -> io::Result<String> {
+    use std::os::unix::io::AsRawFd;
+    let fd = io::stdin().as_raw_fd();
+    let mut term: libc::termios = unsafe { std::mem::zeroed() };
+    let have_term = unsafe { libc::tcgetattr(fd, &mut term) } == 0;
+    let saved = term;
+    if have_term {
+        term.c_lflag &= !libc::ECHO;
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &term) };
+    }
+    let mut line = String::new();
+    let res = io::stdin().read_line(&mut line);
+    if have_term {
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &saved) };
+        // The Enter the user pressed wasn't echoed; emit the newline ourselves.
+        println!();
+    }
+    res?;
+    Ok(line)
+}
+
+/// Fallback when `libc` isn't linked (core-only build): read with echo on.
+#[cfg(not(feature = "mount"))]
+fn read_secret_line() -> io::Result<String> {
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    Ok(line)
+}
+
+/// Single-quote a value for a copy-pasteable `export`, closing and reopening the
+/// quote around any embedded single quote.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The non-interactive setup guide: every env var trove reads, which are set,
+/// the current resolved values, and a copy-pasteable block to finish. This is
+/// what an agent sees when it runs `trove install` with no TTY and a
+/// not-yet-complete environment.
+fn print_agent_guide(resolved: &Config) {
+    use colored::Colorize;
+    let mark = |present: bool| if present { "✓".green() } else { "✗".red() };
+    let cur = |v: &Option<String>| {
+        v.as_deref()
+            .map(|s| format!(" (currently: {s})").dimmed().to_string())
+            .unwrap_or_default()
+    };
+
+    println!("{}", "trove install — non-interactive (no TTY detected)".bold());
+    println!(
+        "Reading settings from the environment instead of prompting. Set the variables\n\
+         below, then re-run `trove install` — it provisions end-to-end with no prompts.\n"
+    );
+
+    println!("{}", "Required".bold());
+    println!(
+        "  {} TROVE_VERSIONS_DB     Postgres URL — metadata, version history, embeddings.{}",
+        mark(resolved.versions_db.is_some()),
+        cur(&resolved.versions_db)
+    );
+    println!("                          Accepts DATABASE_URL too. Use the hosted *session*");
+    println!("                          pooler (port 5432) — JuiceFS keeps session state, so");
+    println!("                          pgbouncer transaction mode (6543) breaks it.");
+    println!("                          e.g. postgres://user:pass@host:5432/postgres");
+    println!(
+        "  {} TROVE_R2_BUCKET       Full S3 endpoint URL of the bucket.{}",
+        mark(resolved.r2_bucket.is_some()),
+        cur(&resolved.r2_bucket)
+    );
+    println!("                          e.g. https://<bucket>.<accountid>.r2.cloudflarestorage.com");
+    println!(
+        "  {} R2_ACCESS_KEY_ID      Object-store access key id (Cloudflare R2 \u{2192} API Tokens).",
+        mark(env_nonempty("R2_ACCESS_KEY_ID").is_some())
+    );
+    println!(
+        "  {} R2_SECRET_ACCESS_KEY  Object-store secret key (shown once at token creation).",
+        mark(env_nonempty("R2_SECRET_ACCESS_KEY").is_some())
+    );
+
+    println!("\n{}", "Optional".bold());
+    println!(
+        "  {} OPENAI_API_KEY        Embeddings + `trove search`. Omit \u{2192} mount with --no-embed.",
+        mark(env_nonempty("OPENAI_API_KEY").is_some())
+    );
+    println!(
+        "  {} TROVE_VOLUME          JuiceFS volume name (default: trove).{}",
+        mark(env_nonempty("TROVE_VOLUME").is_some()),
+        cur(&resolved.volume)
+    );
+    println!(
+        "  {} TROVE_META            JuiceFS metadata URL (default: = TROVE_VERSIONS_DB).",
+        mark(env_nonempty("TROVE_META").is_some())
+    );
+    println!(
+        "  {} TROVE_STORE           Vault path for `trove doctor`'s validation sweep.{}",
+        mark(env_nonempty("TROVE_STORE").is_some()),
+        cur(&resolved.store)
+    );
+    println!(
+        "  {} TROVE_CACHE           Local block-cache dir (default: /tmp/trove-cache).",
+        mark(env_nonempty("TROVE_CACHE").is_some())
+    );
+
+    println!("\n{}", "Finish setup".bold());
+    println!("  export TROVE_VERSIONS_DB='postgres://…'");
+    println!("  export TROVE_R2_BUCKET='https://<bucket>.<acct>.r2.cloudflarestorage.com'");
+    println!("  export R2_ACCESS_KEY_ID='…' R2_SECRET_ACCESS_KEY='…'");
+    println!("  export OPENAI_API_KEY='sk-…'      # optional");
+    println!("  trove install                     # migration + volume format, no prompts");
+    println!("  trove doctor                      # confirm everything is green");
+
+    println!("\n{}", "Docs (no server needed)".bold());
+    println!("  trove docs quickstart   one page   ·   trove docs --all   whole manual   ·   trove docs   list pages");
+    println!(
+        "\nSafety flags: --reuse keeps existing data; --reinstall wipes it (refuses without a TTY)."
+    );
 }
 
 fn ask(label: &str, current: Option<&str>) -> io::Result<Option<String>> {
@@ -545,9 +845,17 @@ fn drop_jfs_tables(client: &mut Client) -> Result<()> {
     Ok(())
 }
 
-/// Prompt for an explicit `destroy` confirmation. Anything else aborts.
+/// Prompt for an explicit `destroy` confirmation. Anything else aborts. With no
+/// TTY (an agent / script is driving us) there's no safe way to confirm an
+/// irreversible step, so we refuse outright rather than read a dead stdin.
 fn confirm_destroy(prompt: &str) -> Result<()> {
     use colored::Colorize;
+    if !io::stdin().is_terminal() {
+        bail!(
+            "{prompt}\nRefusing this destructive step without a TTY — can't take an \
+             interactive confirmation. Re-run `trove install` in a terminal if you really mean it."
+        );
+    }
     println!("{}", prompt.yellow().bold());
     print!("Type 'destroy' to proceed (anything else aborts): ");
     io::stdout().flush()?;
@@ -790,5 +1098,56 @@ mod tests {
     #[test]
     fn malformed_format_json_returns_none() {
         assert_eq!(parse_bucket_from_format_json("not json"), None);
+    }
+
+    // -- env resolution / helpers (non-interactive path) --
+
+    #[test]
+    fn shell_quote_wraps_and_escapes() {
+        assert_eq!(shell_quote("simple"), "'simple'");
+        // An embedded single quote closes, escapes, reopens.
+        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn env_nonempty_treats_empty_as_unset() {
+        std::env::set_var("TROVE_TEST_NONEMPTY", "");
+        assert_eq!(env_nonempty("TROVE_TEST_NONEMPTY"), None);
+        std::env::set_var("TROVE_TEST_NONEMPTY", "x");
+        assert_eq!(env_nonempty("TROVE_TEST_NONEMPTY").as_deref(), Some("x"));
+        std::env::remove_var("TROVE_TEST_NONEMPTY");
+    }
+
+    #[test]
+    fn resolve_env_config_applies_precedence_and_defaults() {
+        // Start from a clean slate for the vars we assert on.
+        for v in [
+            "TROVE_VERSIONS_DB", "DATABASE_URL", "TROVE_VOLUME",
+            "TROVE_META", "TROVE_CACHE", "TROVE_R2_BUCKET", "TROVE_STORE",
+        ] {
+            std::env::remove_var(v);
+        }
+        let cur = Config::default();
+
+        // No env, empty config → volume/cache get defaults; meta mirrors db (None here).
+        let c = resolve_env_config(&cur);
+        assert_eq!(c.volume.as_deref(), Some("trove"));
+        assert_eq!(c.cache.as_deref(), Some("/tmp/trove-cache"));
+        assert_eq!(c.versions_db, None);
+
+        // DATABASE_URL is accepted as an alias and feeds meta's default.
+        std::env::set_var("DATABASE_URL", "postgres://db-alias");
+        let c = resolve_env_config(&cur);
+        assert_eq!(c.versions_db.as_deref(), Some("postgres://db-alias"));
+        assert_eq!(c.meta.as_deref(), Some("postgres://db-alias"));
+
+        // TROVE_VERSIONS_DB wins over DATABASE_URL.
+        std::env::set_var("TROVE_VERSIONS_DB", "postgres://canonical");
+        let c = resolve_env_config(&cur);
+        assert_eq!(c.versions_db.as_deref(), Some("postgres://canonical"));
+
+        for v in ["TROVE_VERSIONS_DB", "DATABASE_URL"] {
+            std::env::remove_var(v);
+        }
     }
 }
