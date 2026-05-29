@@ -161,6 +161,21 @@ pub fn with_search_path(meta_url: &str, schema: &str) -> String {
     format!("{meta_url}{sep}search_path={schema}")
 }
 
+/// Build the meta URL handed to JuiceFS/libjfs. Two fixups the rust-postgres
+/// driver doesn't need but libjfs does:
+/// 1. **Scheme**: libjfs's Postgres meta driver only recognises `postgres://` —
+///    it rejects the `postgresql://` that Supabase (and many tools) emit with
+///    `FATAL: Invalid meta driver: postgresql`. rust-postgres accepts both, so
+///    trove's own connection is fine; only the JuiceFS hand-off needs this.
+/// 2. **Schema**: point JuiceFS's `jfs_*` tables at the volume's schema.
+pub fn juicefs_meta_url(meta_url: &str, schema: &str) -> String {
+    let normalised = match meta_url.strip_prefix("postgresql://") {
+        Some(rest) => format!("postgres://{rest}"),
+        None => meta_url.to_string(),
+    };
+    with_search_path(&normalised, schema)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,6 +263,20 @@ mod tests {
         assert_eq!(
             with_search_path("postgres://h/db?sslmode=require", "trove_x"),
             "postgres://h/db?sslmode=require&search_path=trove_x"
+        );
+    }
+
+    #[test]
+    fn juicefs_meta_url_normalises_scheme() {
+        // libjfs only accepts `postgres://`, not the `postgresql://` Supabase emits.
+        assert_eq!(
+            juicefs_meta_url("postgresql://u:p@h:5432/db", "trove_x"),
+            "postgres://u:p@h:5432/db?search_path=trove_x"
+        );
+        // Already-correct scheme is left alone.
+        assert_eq!(
+            juicefs_meta_url("postgres://h/db", "trove_x"),
+            "postgres://h/db?search_path=trove_x"
         );
     }
 }

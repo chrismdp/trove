@@ -508,7 +508,7 @@ fn provision(mut new: Config, flags: InstallFlags) -> Result<()> {
             );
         }
     }
-    let meta_with_schema = crate::config::with_search_path(meta_url, &schema);
+    let meta_with_schema = crate::config::juicefs_meta_url(meta_url, &schema);
     apply_format(&mut client, &p.format, &volume, &meta_with_schema, bucket, &schema, flags)?;
 
     // summary

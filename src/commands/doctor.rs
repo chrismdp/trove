@@ -207,7 +207,7 @@ pub fn run(
         (Ok(vol), Ok(met)) => {
             // Match the mount path: point JuiceFS at the volume's schema.
             let met = match cfg.schema_name() {
-                Some(schema) => config::with_search_path(&met, &schema),
+                Some(schema) => config::juicefs_meta_url(&met, &schema),
                 None => met,
             };
             let cache_dir = cache

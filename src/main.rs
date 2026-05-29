@@ -371,7 +371,7 @@ fn init_fs(
     // Point JuiceFS at the volume's schema so its jfs_* tables land there, not
     // in `public`, matching where the version tables live.
     let meta = match cfg.schema_name() {
-        Some(schema) => trove::config::with_search_path(&meta, &schema),
+        Some(schema) => trove::config::juicefs_meta_url(&meta, &schema),
         None => meta,
     };
     let cache = cache
