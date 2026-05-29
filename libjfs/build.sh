@@ -56,14 +56,27 @@ LIBFILE="libjfs-${ARCH}.${EXT}"
 HEADERFILE="libjfs-${ARCH}.h"
 MARKER="$BUILD_DIR/.sha"
 
+# Cache identity = pinned juicefs SHA + a hash of this script and every patch.
+# Keying on the SHA alone is a trap: editing a patch (e.g. adding the locks
+# export) leaves JUICEFS_SHA unchanged, so a restored stale build/ would be
+# treated as a cache hit and the new symbols would never be built. CI restores
+# build/ via a partial cache-key match, so this guard is what forces the
+# rebuild. (sha256sum on Linux, shasum on macOS.)
+if command -v sha256sum >/dev/null 2>&1; then
+    PATCH_HASH="$(cat "$0" "$SCRIPT_DIR"/patches/*.patch 2>/dev/null | sha256sum | cut -d' ' -f1)"
+else
+    PATCH_HASH="$(cat "$0" "$SCRIPT_DIR"/patches/*.patch 2>/dev/null | shasum -a 256 | cut -d' ' -f1)"
+fi
+STAMP="${JUICEFS_SHA}-${PATCH_HASH}"
+
 if [ "$FORCE" -eq 1 ]; then
     echo "--force: wiping $BUILD_DIR"
     rm -rf "$BUILD_DIR"
 fi
 
-# Cache hit: built artefact + marker file at the pinned SHA.
-if [ -f "$BUILD_DIR/$LIBFILE" ] && [ -f "$MARKER" ] && [ "$(cat "$MARKER")" = "$JUICEFS_SHA" ]; then
-    echo "libjfs cached at $BUILD_DIR/$LIBFILE (SHA $JUICEFS_SHA)"
+# Cache hit: built artefact + marker matching the SHA *and* the patch hash.
+if [ -f "$BUILD_DIR/$LIBFILE" ] && [ -f "$MARKER" ] && [ "$(cat "$MARKER")" = "$STAMP" ]; then
+    echo "libjfs cached at $BUILD_DIR/$LIBFILE (stamp $STAMP)"
     exit 0
 fi
 
@@ -106,8 +119,8 @@ if [ -f "$WORKTREE/sdk/java/libjfs/$HEADERFILE" ]; then
     cp "$WORKTREE/sdk/java/libjfs/$HEADERFILE" "$BUILD_DIR/$HEADERFILE"
 fi
 
-# Stamp the SHA so subsequent runs detect a cache hit.
-printf '%s\n' "$JUICEFS_SHA" > "$MARKER"
+# Stamp the SHA + patch hash so subsequent runs detect a cache hit.
+printf '%s\n' "$STAMP" > "$MARKER"
 
 # Clean up the source worktree — we only need the built artefact.
 rm -rf "$WORKTREE"

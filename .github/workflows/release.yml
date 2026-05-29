@@ -16,7 +16,15 @@ on:
     tags: ['v*.*.*']
 
 jobs:
+  # Gate: a tag must pass the same CI (build + lib tests, all targets) and the
+  # full containerised e2e before any artefact is built or published.
+  ci:
+    uses: ./.github/workflows/ci.yml
+  e2e:
+    uses: ./.github/workflows/e2e.yml
+
   build:
+    needs: [ci, e2e]
     name: build-${{ matrix.os_label }}-${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
     permissions:

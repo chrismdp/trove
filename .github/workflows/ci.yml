@@ -11,6 +11,8 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Callable as a gate from release.yml so a tag never publishes on red CI.
+  workflow_call:
 
 jobs:
   build:
@@ -122,6 +124,11 @@ jobs:
       - name: cargo test --features mount --lib
         env:
           LIBJFS_DIR: ${{ github.workspace }}/libjfs/build
+          # The test binary dynamically links libjfs, so the loader must find it
+          # at runtime. The build-time rpath covers Linux; macOS needs the dylib
+          # on the fallback search path explicitly.
+          LD_LIBRARY_PATH: ${{ github.workspace }}/libjfs/build
+          DYLD_FALLBACK_LIBRARY_PATH: ${{ github.workspace }}/libjfs/build
         # Lib tests only — integration tests in tests/ require live
         # Postgres / R2 / OpenAI / /dev/fuse and aren't run on CI.
         run: cargo test --features mount --lib
