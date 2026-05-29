@@ -14,6 +14,10 @@ slug = "quickstart"
 title = "Quickstart"
 
 [[sections.pages]]
+slug = "stripe-projects"
+title = "Provision with Stripe Projects (optional)"
+
+[[sections.pages]]
 slug = "thesis"
 title = "A filesystem that talks back"
 

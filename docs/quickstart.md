@@ -40,21 +40,26 @@ export R2_ACCESS_KEY_ID="..."
 export R2_SECRET_ACCESS_KEY="..."
 ```
 
-That's it. The Postgres URL doubles as JuiceFS's metadata engine AND the
+That's it. The Postgres URL is both the metadata engine AND the
 version-chain + embeddings store — **one connection, one substrate**. The
-S3 bucket holds the file data; JuiceFS chunks and stores it for you. The
+S3 bucket holds the file data; trove chunks and stores it for you. The
 keys are named `R2_*` but any S3-compatible store works (MinIO, AWS S3).
 
 - **Running on one machine?** A local `postgres` install is fine — point
   `TROVE_VERSIONS_DB` at `127.0.0.1:5432`.
 - **Running across machines?** Use a hosted Postgres (Supabase, Neon, RDS).
-  Just point `TROVE_VERSIONS_DB` at it (use the **session** pooler — port
-  5432, not the transaction pooler on 6543: JuiceFS keeps session state).
-  JuiceFS handles the metadata coordination itself.
+  Just point `TROVE_VERSIONS_DB` at it — use the **session** pooler (port
+  5432), not the transaction pooler (6543): trove holds a live database
+  session, which pgbouncer's transaction mode breaks.
 
 Optional fourth: `OPENAI_API_KEY` for semantic search. Without it, pass
 `--no-embed` to `trove mount` and you'll still get validation + version
 history.
+
+Don't have a Postgres database or a bucket yet? You can provision both in
+one go with [Stripe Projects](/docs/stripe-projects) (optional) instead of
+clicking through provider dashboards — then come back here for
+`trove install`.
 
 ## Just the validator (no native deps, no Postgres)
 
@@ -135,28 +140,23 @@ trove install
 #      exactly which variables to set if something's missing
 #    → writes ~/.config/trove/config.toml
 #    → applies the embedded SQL migration (blobs, file_versions, blob_chunks, pgvector)
-#    → formats the JuiceFS volume on your bucket
+#    → formats the storage volume on your bucket
 ```
 
-`trove install` runs migrations and formats the volume automatically;
+`trove install` runs the migration and formats the volume automatically;
 safety flags `--reuse` / `--reinstall` cover non-empty DBs (the default
 refuses to clobber existing Trove data, and refuses to re-format a
 volume against a different bucket — that would orphan its chunks).
 
-If install fails partway, the equivalent manual steps are:
+`trove install` is idempotent, so if it fails partway — a flaky DB
+connection, a missing key — fix the cause and run it again; it skips the
+steps that already succeeded (`--reuse` to keep an existing populated DB
+or volume). The volume is formatted in-process, so there's no separate
+tool to run — re-running `trove install` is how you retry that step. If
+you'd rather apply the schema migration by hand, it's a single file:
 
 ```bash
-# Apply the schema migration manually.
 psql "$TROVE_VERSIONS_DB" -f supabase/migrations/*_init_version_chain_and_embeddings.sql
-
-# Format the JuiceFS volume on your bucket.
-juicefs format \
-    --storage s3 \
-    --bucket   "https://<bucket>.<acct>.r2.cloudflarestorage.com" \
-    --access-key  "$R2_ACCESS_KEY_ID" \
-    --secret-key  "$R2_SECRET_ACCESS_KEY" \
-    "$TROVE_VERSIONS_DB" \
-    trove
 ```
 
 **Preflight + mount**:

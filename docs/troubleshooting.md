@@ -40,15 +40,15 @@ The validation gate is rejecting everything. Two common causes:
 
 `cat <path>.errors` always has the verdict.
 
-## "JuiceFS backend" check fails
+## "storage backend" check fails
 
 `trove doctor` says the backend is bad. In order of likelihood:
 
-- **Volume not formatted.** Run `juicefs format` once (see
-  [Running](/docs/running)).
+- **Volume not formatted.** Run `trove install` once (it formats the
+  volume in-process; see [Running](/docs/running)).
 - **Postgres unreachable from the trove process.** Test with `psql
   $VERSIONS_DB`. Container networking is the usual culprit.
-- **R2 credentials wrong.** `juicefs format` succeeded but `jfs_init`
+- **R2 credentials wrong.** The volume formatted fine but `jfs_init`
   fails to fetch a list of chunks. Check `R2_ACCESS_KEY_ID` and
   `R2_SECRET_ACCESS_KEY` are exported in the trove process's
   environment (not just your shell).
@@ -60,9 +60,9 @@ The validation gate is rejecting everything. Two common causes:
 Two possibilities:
 
 1. **The volume is empty.** It works; you just haven't written anything
-   yet. Check with `juicefs status <meta-url>` if you're not sure
-   whether the metadata is talking to the same volume as the binary.
-2. **Path mismatch.** JuiceFS is path-based, FUSE is inode-based. The
+   yet. Run `trove usage` if you're not sure whether the metadata is
+   talking to the same volume as the binary.
+2. **Path mismatch.** The storage layer is path-based, FUSE is inode-based. The
    `ino_to_path` map in the mount is what bridges them. If something
    gets out of sync (rare; usually after a process crash mid-rename),
    restart the mount.

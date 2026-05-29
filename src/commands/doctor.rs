@@ -210,11 +210,11 @@ pub fn run(
                 .or_else(|| cfg.cache.clone())
                 .unwrap_or_else(|| "/tmp/trove-cache".to_string());
             match Fs::init(&vol, &met, &cache_dir) {
-                Ok(_) => checks.push(Check::ok(SECTION_BACKEND, "JuiceFS backend", format!("libjfs + volume {vol:?} + object store OK"))),
-                Err(e) => checks.push(Check::fail(SECTION_BACKEND, "JuiceFS backend", format!("{e:#}"))),
+                Ok(_) => checks.push(Check::ok(SECTION_BACKEND, "storage backend", format!("volume {vol:?} + object store OK"))),
+                Err(e) => checks.push(Check::fail(SECTION_BACKEND, "storage backend", format!("{e:#}"))),
             }
         }
-        _ => checks.push(Check::fail(SECTION_BACKEND, "JuiceFS backend", "volume/meta not configured — skipped (set them or run `trove install`)")),
+        _ => checks.push(Check::fail(SECTION_BACKEND, "storage backend", "volume/meta not configured — skipped (set them or run `trove install`)")),
     }
 
     // --- Validation: lint schemas, then run `trove check` over the store ---

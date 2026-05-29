@@ -10,7 +10,9 @@ versions, embeddings.
   exists vector;` will do it). A local Supabase is fine; any Postgres
   ≥14 with pgvector works.
 - **R2** (or any S3-compatible store). For local dev, MinIO works.
-- **libjfs** built from a pinned JuiceFS source. See [Contributing](/docs/contributing).
+- **libjfs** — the storage library. It ships inside the release tarball
+  next to the binary; you only build it yourself for a source build (see
+  [Packaging](/docs/packaging)).
 - **OPENAI_API_KEY** (or `--no-embed`).
 
 ## Step 1: configuration
@@ -28,16 +30,16 @@ You'll be asked for:
 
 - `versions_db` — the Postgres URL (e.g.
   `postgres://postgres:postgres@127.0.0.1:54322/postgres`)
-- `volume` — the JuiceFS volume name
+- `volume` — the storage volume name
 - `meta` — usually the same as `versions_db`
 - `cache` — local block-cache directory (default `/tmp/trove-cache`)
 - `r2_bucket` — for `trove doctor`'s reference
 
-## Steps 2 + 3: migrations and `juicefs format`
+## Steps 2 + 3: migration and volume setup
 
-**`trove install` now does this for you** — it applies the embedded SQL
+**`trove install` does this for you** — it applies the embedded SQL
 migration (`blobs`, `file_versions`, `blob_chunks`, pgvector, HNSW
-index) and formats the JuiceFS volume on your bucket in the same run.
+index) and formats the storage volume on your bucket in the same run.
 Safety flags:
 
 - `--reuse` — accept an existing populated Trove DB / formatted volume.
@@ -47,25 +49,16 @@ Safety flags:
   confirmation, and re-formatting against a new bucket (which would
   orphan the chunks under the old one) requires this flag.
 
-The manual `psql -f` and `juicefs format` steps below are only needed
-if `trove install` fails partway through:
+`trove install` is idempotent — if it fails partway, fix the cause and
+run it again. The volume is formatted in-process, so there's no separate
+tool to run. If you'd rather apply the schema migration by hand:
 
 ```bash
-# Migration (manual fallback).
 psql "$VERSIONS_DB" -f supabase/migrations/<timestamp>_init_version_chain_and_embeddings.sql
-
-# Volume format (manual fallback).
-juicefs format \
-    --storage s3 \
-    --bucket   "https://<bucket>.<acct>.r2.cloudflarestorage.com" \
-    --access-key  "$R2_ACCESS_KEY_ID" \
-    --secret-key  "$R2_SECRET_ACCESS_KEY" \
-    "$VERSIONS_DB" \
-    myvol
 ```
 
-JuiceFS metadata (`jfs_*`) and Trove's tables coexist peacefully in the
-same Postgres.
+Trove's tables and the storage layer's own bookkeeping tables coexist
+peacefully in the same Postgres.
 
 ## Step 4: preflight
 
@@ -80,7 +73,7 @@ trove doctor
   ✓ versions DB        reachable
   ✓ pgvector           extension installed
   ✓ schema tables      blobs, file_versions, blob_chunks present
-  ✓ JuiceFS backend    libjfs + volume "myvol" + object store OK
+  ✓ storage backend    volume "myvol" + object store OK
 
 ✓ all checks passed
 ```

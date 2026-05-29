@@ -409,11 +409,11 @@ fn provision(new: Config, flags: InstallFlags) -> Result<()> {
     let p = plan(&db_state, bucket, flags);
     apply_migration(&mut client, &p.migration, flags)?;
 
-    // JuiceFS volume pre-flight + format
+    // storage volume pre-flight + format
     if !r2_keys_set {
         match p.format {
             FormatAction::Format | FormatAction::DropAndReformat { .. } => bail!(
-                "R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY are required to format the JuiceFS volume — export them and re-run"
+                "R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY are required to format the storage volume — export them and re-run"
             ),
             _ => {}
         }
@@ -429,12 +429,12 @@ fn provision(new: Config, flags: InstallFlags) -> Result<()> {
     };
     let format_summary = match &p.format {
         FormatAction::Format | FormatAction::DropAndReformat { .. } => {
-            format!("JuiceFS volume `{volume}` formatted on `{bucket}`")
+            format!("storage volume `{volume}` formatted on `{bucket}`")
         }
         FormatAction::SkipSameBucket { bucket } => {
-            format!("JuiceFS volume `{volume}` already formatted on `{bucket}` (kept)")
+            format!("storage volume `{volume}` already formatted on `{bucket}` (kept)")
         }
-        _ => format!("JuiceFS volume `{volume}` already present (kept)"),
+        _ => format!("storage volume `{volume}` already present (kept)"),
     };
     println!();
     println!("{} config saved at {}", "✓".green(), written.display());
@@ -565,7 +565,7 @@ fn print_agent_guide(resolved: &Config) {
         cur(&resolved.versions_db)
     );
     println!("                          Accepts DATABASE_URL too. Use the hosted *session*");
-    println!("                          pooler (port 5432) — JuiceFS keeps session state, so");
+    println!("                          pooler (port 5432) — trove holds a live session, so");
     println!("                          pgbouncer transaction mode (6543) breaks it.");
     println!("                          e.g. postgres://user:pass@host:5432/postgres");
     println!(
@@ -589,12 +589,12 @@ fn print_agent_guide(resolved: &Config) {
         mark(env_nonempty("OPENAI_API_KEY").is_some())
     );
     println!(
-        "  {} TROVE_VOLUME          JuiceFS volume name (default: trove).{}",
+        "  {} TROVE_VOLUME          Storage volume name (default: trove).{}",
         mark(env_nonempty("TROVE_VOLUME").is_some()),
         cur(&resolved.volume)
     );
     println!(
-        "  {} TROVE_META            JuiceFS metadata URL (default: = TROVE_VERSIONS_DB).",
+        "  {} TROVE_META            Storage metadata URL (default: = TROVE_VERSIONS_DB).",
         mark(env_nonempty("TROVE_META").is_some())
     );
     println!(
@@ -781,7 +781,7 @@ fn apply_format(
     match action {
         FormatAction::Format => {
             println!(
-                "{} formatting JuiceFS volume `{volume}` on `{bucket}`…",
+                "{} formatting storage volume `{volume}` on `{bucket}`…",
                 "trove install:".bold()
             );
             run_juicefs_format(volume, meta_url, bucket)?;
@@ -790,25 +790,25 @@ fn apply_format(
         }
         FormatAction::SkipSameBucket { bucket } => {
             println!(
-                "{} JuiceFS volume already formatted on `{bucket}` — skipping format",
+                "{} storage volume already formatted on `{bucket}` — skipping format",
                 "trove install:".bold()
             );
             Ok(())
         }
         FormatAction::ReuseExisting => {
             println!(
-                "{} JuiceFS volume already present — keeping (`--reuse`)",
+                "{} storage volume already present — keeping (`--reuse`)",
                 "trove install:".bold()
             );
             Ok(())
         }
         FormatAction::DropAndReformat { recorded, requested } => {
             println!(
-                "{} JuiceFS volume recorded on `{recorded}`, want `{requested}` — `--reinstall` requested",
+                "{} storage volume recorded on `{recorded}`, want `{requested}` — `--reinstall` requested",
                 "trove install:".bold()
             );
             confirm_destroy(
-                "DROP the JuiceFS metadata and reformat? Existing data in the old bucket will be orphaned.",
+                "DROP the storage volume's metadata and reformat? Existing data in the old bucket will be orphaned.",
             )?;
             drop_jfs_tables(client)?;
             run_juicefs_format(volume, meta_url, bucket)?;
@@ -816,7 +816,7 @@ fn apply_format(
             Ok(())
         }
         FormatAction::RefuseBucketMismatch { recorded, requested } => bail!(
-            "JuiceFS metadata in this DB references bucket `{recorded}`, not `{requested}`. \
+            "the storage volume's metadata in this DB references bucket `{recorded}`, not `{requested}`. \
              Re-formatting against `{requested}` would orphan the existing chunks in `{recorded}`. \
              Refusing to continue. To proceed anyway: `--reinstall`."
         ),
@@ -840,7 +840,7 @@ fn drop_jfs_tables(client: &mut Client) -> Result<()> {
     if !stmt.is_empty() {
         client
             .batch_execute(&stmt)
-            .context("dropping JuiceFS metadata tables")?;
+            .context("dropping the storage volume's metadata tables")?;
     }
     Ok(())
 }
@@ -885,7 +885,7 @@ fn run_juicefs_format(volume: &str, meta_url: &str, bucket: &str) -> Result<()> 
         "secretKey": secret,
     });
     crate::jfs::format(&conf).with_context(|| {
-        format!("formatting JuiceFS volume `{volume}` on bucket `{bucket}` via libjfs")
+        format!("formatting storage volume `{volume}` on bucket `{bucket}`")
     })
 }
 

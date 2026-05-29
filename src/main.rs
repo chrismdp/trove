@@ -37,7 +37,7 @@ enum Command {
     },
 
     /// Write ~/.config/trove/config.toml, then provision the backend: apply the
-    /// embedded SQL migration to the version DB and format the JuiceFS volume.
+    /// embedded SQL migration to the version DB and format the storage volume.
     /// At a terminal this is a guided, interactive setup (prompts + secret
     /// entry). With no TTY — i.e. an agent or script is driving it — it reads
     /// every setting from the environment (TROVE_VERSIONS_DB, TROVE_R2_BUCKET,
@@ -51,7 +51,7 @@ enum Command {
         /// steps. Use when re-running install against a backend you intend to keep.
         #[arg(long)]
         reuse: bool,
-        /// DROP existing Trove tables and reformat the JuiceFS volume.
+        /// DROP existing Trove tables and reformat the storage volume.
         /// DESTRUCTIVE — every destructive step still prompts for an explicit
         /// `destroy` confirmation. Re-formatting against a new bucket orphans
         /// the chunks under the old one; this flag is the only way through.
@@ -79,7 +79,7 @@ enum Command {
         port: u16,
     },
 
-    /// Mount a JuiceFS-backed Trove filesystem at <mountpoint> (foreground).
+    /// Mount a Trove filesystem at <mountpoint> (foreground).
     #[cfg(feature = "mount")]
     Mount {
         /// Where to mount (an existing empty directory).
@@ -91,7 +91,7 @@ enum Command {
         /// into a vault instead.
         #[arg(long)]
         allow_non_empty: bool,
-        /// JuiceFS volume name (must already be formatted). Falls back to config.
+        /// Storage volume name (must already be formatted). Falls back to config.
         #[arg(long)]
         volume: Option<String>,
         /// Metadata engine URL, e.g. postgres://… or sqlite3://… Falls back to config.
@@ -204,7 +204,7 @@ enum Command {
     },
 
     /// Full health check: configuration + provenance, secrets, backend (DB
-    /// reachable + pgvector + schema + JuiceFS), and a validation sweep over
+    /// reachable + pgvector + schema + storage), and a validation sweep over
     /// the configured store. Exits non-zero if anything's missing or invalid.
     #[cfg(feature = "mount")]
     Doctor {
@@ -222,7 +222,7 @@ enum Command {
     },
 
     /// Show how much space Trove is using — DB (versions + embeddings) and the
-    /// JuiceFS volume's view of the bucket. A quick "is this growing the way I
+    /// storage volume's view of the bucket. A quick "is this growing the way I
     /// expect?" check.
     #[cfg(feature = "mount")]
     Usage {

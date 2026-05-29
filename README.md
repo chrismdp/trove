@@ -49,11 +49,11 @@ prints exactly which variables to set — so an agent can run it unattended.
 ## Status — v0.1 (single-tenant)
 
 Built and tested end-to-end: **schema-on-write validation**, a **FUSE mount**
-over JuiceFS (R2 + Postgres), **copy-on-write version history** (via `jfs_clone`,
-zero byte duplication), and **semantic-search embeddings** that self-trigger on
+over an object store (R2 + Postgres), **copy-on-write version history** (zero
+byte duplication), and **semantic-search embeddings** that self-trigger on
 write. One write flows: validate → COW-clone a version → record the chain →
-embed. See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the full design, schema,
-how to run it, and the e2e test map.
+embed. See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the full design (including
+the JuiceFS-backed storage layer), schema, how to run it, and the e2e test map.
 
 Not yet built: the `trove search` query command (vectors are produced + indexed,
 just no query surface yet) and the `trove log/diff/cat/restore` history CLI.
