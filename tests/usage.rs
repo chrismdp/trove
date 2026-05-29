@@ -80,7 +80,7 @@ impl Drop for TestVol {
 
 #[test]
 fn usage_report_is_producible_and_self_consistent() {
-    let Ok(mut versions) = VersionStore::connect(&db_url()) else {
+    let Ok(mut versions) = VersionStore::connect(&db_url(), None) else {
         eprintln!("skipping: no DB reachable at {}", db_url());
         return;
     };

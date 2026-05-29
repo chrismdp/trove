@@ -45,7 +45,7 @@ fn fresh_fs() -> Fs {
 #[test]
 fn history_accumulates_and_every_revision_is_recoverable() {
     let fs = fresh_fs();
-    let mut vs = VersionStore::connect(&db_url()).expect("version DB up? (`supabase start`)");
+    let mut vs = VersionStore::connect(&db_url(), None).expect("version DB up? (`supabase start`)");
     let path = format!("/hist-{}.md", uniq());
 
     // Three edits. Each mirrors what commit() does: write the live file, then
@@ -78,7 +78,7 @@ fn history_accumulates_and_every_revision_is_recoverable() {
 #[test]
 fn identical_content_dedups_one_clone_across_revisions() {
     let fs = fresh_fs();
-    let mut vs = VersionStore::connect(&db_url()).unwrap();
+    let mut vs = VersionStore::connect(&db_url(), None).unwrap();
     let path = format!("/dedup-{}.md", uniq());
     let same = format!("# unchanged {}\nbody\n", uniq());
 

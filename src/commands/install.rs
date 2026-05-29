@@ -271,6 +271,8 @@ fn resolve_env_config(cur: &Config) -> Config {
         r2_bucket: env_nonempty("TROVE_R2_BUCKET").or_else(|| cur.r2_bucket.clone()),
         store: env_nonempty("TROVE_STORE").or_else(|| cur.store.clone()),
         backup_dir: env_nonempty("TROVE_BACKUP_DIR").or_else(|| cur.backup_dir.clone()),
+        // Derived from the volume in `provision` if unset; `TROVE_SCHEMA` overrides.
+        schema: env_nonempty("TROVE_SCHEMA").or_else(|| cur.schema.clone()),
     }
 }
 
@@ -385,7 +387,8 @@ fn run_interactive(flags: InstallFlags) -> Result<()> {
     );
     let backup_dir = ask("backup mirror directory [optional]", cur.backup_dir.as_deref())?;
 
-    let new = Config { versions_db, volume, meta, store, cache, r2_bucket, backup_dir };
+    // `schema` is derived from the volume and pinned into config by `provision`.
+    let new = Config { versions_db, volume, meta, store, cache, r2_bucket, backup_dir, schema: None };
 
     // (b) secrets — prompt for any not already exported, kept out of config.
     println!(
@@ -418,7 +421,7 @@ fn run_interactive(flags: InstallFlags) -> Result<()> {
 /// Shared provisioning: persist config, then run the migration + volume format
 /// behind all the safety gates. Identical work whether a human or an agent
 /// supplied the settings — only the data-gathering differs.
-fn provision(new: Config, flags: InstallFlags) -> Result<()> {
+fn provision(mut new: Config, flags: InstallFlags) -> Result<()> {
     use colored::Colorize;
 
     // secrets pre-flight (informational)
@@ -428,7 +431,17 @@ fn provision(new: Config, flags: InstallFlags) -> Result<()> {
             "warning:".yellow().bold()
         );
     }
-    let r2_keys_set = r2_keys_present();
+
+    // Resolve the per-volume schema and pin it into the config we save, so every
+    // later command (mount, doctor, search…) targets the same isolated schema.
+    let volume = new
+        .volume
+        .clone()
+        .ok_or_else(|| anyhow!("volume is required for the format step"))?;
+    let schema = new
+        .schema_name()
+        .unwrap_or_else(|| crate::config::schema_for(&volume));
+    new.schema = Some(schema.clone());
 
     // Save the config BEFORE we touch the DB — a failed migration shouldn't
     // wipe the answers we just gathered.
@@ -439,40 +452,71 @@ fn provision(new: Config, flags: InstallFlags) -> Result<()> {
         .versions_db
         .as_deref()
         .ok_or_else(|| anyhow!("versions_db is required for the migration step"))?;
-    let volume = new
-        .volume
-        .as_deref()
-        .ok_or_else(|| anyhow!("volume is required for the format step"))?;
     let meta_url = new.meta.as_deref().unwrap_or(versions_db);
     let bucket = new.r2_bucket.as_deref().unwrap_or("");
 
-    // DB pre-flight + migration
+    // DB pre-flight: connect, ensure the volume's schema exists, and point this
+    // session's search_path at it so the migration creates tables there (and the
+    // jfs_* probe + drops act on that schema, not `public`).
     let mut client = Client::connect(versions_db, NoTls).with_context(|| {
         format!(
             "couldn't connect to {versions_db} — set up Postgres + create the DB first, then re-run `trove install`"
         )
     })?;
-    let db_state = inspect_db(&mut client, bucket)?;
+    // pgvector is database-global — create it once under the default search_path
+    // (a no-op on Supabase, where it's pre-installed in `extensions`), so it's
+    // shared across volumes rather than trapped in any one volume's schema.
+    client
+        .batch_execute("create extension if not exists vector")
+        .context("creating the pgvector extension")?;
+    let ident = schema.replace('"', "\"\"");
+    client
+        .batch_execute(&format!(
+            "create schema if not exists \"{ident}\"; \
+             set search_path to \"{ident}\", public, extensions;"
+        ))
+        .with_context(|| format!("creating/selecting schema {schema}"))?;
+    println!("{} using schema {}", "trove install:".bold(), schema.cyan());
+
+    let db_state = inspect_db(&mut client, &schema)?;
     let p = plan(&db_state, bucket, flags);
     apply_migration(&mut client, &p.migration, flags)?;
 
-    // storage volume pre-flight + format
-    if !r2_keys_set {
-        match p.format {
-            FormatAction::Format | FormatAction::DropAndReformat { .. } => bail!(
+    // storage volume pre-flight + format. JuiceFS gets the schema via the meta
+    // URL's search_path so its jfs_* tables land beside ours.
+    let needs_keys = matches!(
+        p.format,
+        FormatAction::Format | FormatAction::DropAndReformat { .. }
+    );
+    if needs_keys && !r2_keys_present() {
+        // The rest of the install already succeeded; at a terminal, give the
+        // user another shot at the keys here rather than making them re-run.
+        if io::stdin().is_terminal() {
+            println!(
+                "{} formatting the volume needs your R2 keys — enter them now:",
+                "trove install:".bold()
+            );
+            for name in ["R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"] {
+                if env_nonempty(name).is_none() {
+                    prompt_secret_into_env(name)?;
+                }
+            }
+        }
+        if !r2_keys_present() {
+            bail!(
                 "R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY are required to format the storage volume — export them and re-run"
-            ),
-            _ => {}
+            );
         }
     }
-    apply_format(&mut client, &p.format, volume, meta_url, bucket, flags)?;
+    let meta_with_schema = crate::config::with_search_path(meta_url, &schema);
+    apply_format(&mut client, &p.format, &volume, &meta_with_schema, bucket, &schema, flags)?;
 
     // summary
-    let schema_summary = match p.migration {
+    let migration_summary = match p.migration {
         MigrationAction::RunMigration | MigrationAction::DropAndRecreate { .. } => {
-            "Trove schema created (3 tables, pgvector)"
+            format!("Trove schema created in `{schema}` (3 tables, pgvector)")
         }
-        _ => "Trove schema already present (kept)",
+        _ => format!("Trove schema already present in `{schema}` (kept)"),
     };
     let format_summary = match &p.format {
         FormatAction::Format | FormatAction::DropAndReformat { .. } => {
@@ -485,7 +529,7 @@ fn provision(new: Config, flags: InstallFlags) -> Result<()> {
     };
     println!();
     println!("{} config saved at {}", "✓".green(), written.display());
-    println!("{} {}", "✓".green(), schema_summary);
+    println!("{} {}", "✓".green(), migration_summary);
     println!("{} {}", "✓".green(), format_summary);
     println!(
         "{} trove install complete. Run `trove mount /mnt/trove` to use it.",
@@ -528,14 +572,30 @@ fn collect_secrets_interactive() -> Result<Vec<(&'static str, String)>> {
         }
         println!("  {name} — {blurb}");
         println!("    {} {where_}", "where:".dimmed());
-        let val = prompt_secret(&format!("    paste {name} (blank to skip): "))?;
-        if val.is_empty() {
-            continue;
+        if let Some(val) = prompt_secret_into_env(name)? {
+            entered.push((name, val));
         }
-        std::env::set_var(name, &val);
-        entered.push((name, val));
     }
     Ok(entered)
+}
+
+/// Prompt once (hidden) for `name`; if a value is entered, set it in the process
+/// env and confirm receipt with a char count — so the user can tell the paste
+/// actually landed (the prompt shows nothing as you type). Returns the value if
+/// one was entered, `None` on a blank skip.
+fn prompt_secret_into_env(name: &str) -> Result<Option<String>> {
+    use colored::Colorize;
+    let val = prompt_secret(&format!(
+        "    paste {name} (hidden \u{2014} you won't see it as you type; blank to skip): "
+    ))?;
+    if val.is_empty() {
+        println!("    {} {name} left unset", "·".dimmed());
+        return Ok(None);
+    }
+    let n = val.chars().count();
+    std::env::set_var(name, &val);
+    println!("    {} {name} set ({n} chars)", "✓".green());
+    Ok(Some(val))
 }
 
 /// Print + flush a label, then read one line without echoing it to the terminal
@@ -728,8 +788,13 @@ fn explain(header: &str, body: &[&str]) {
     }
 }
 
-/// Build a [`DbState`] snapshot. Reads only — no schema changes.
-pub fn inspect_db(client: &mut Client, _requested_bucket: &str) -> Result<DbState> {
+/// Build a [`DbState`] snapshot. Reads only — no schema changes. `schema` is the
+/// schema this volume lives in: the SCHEMA_TABLES / jfs_setting probes resolve
+/// via the caller's `search_path` (which install points at it), but the
+/// `information_schema` jfs_* probe takes the schema explicitly since
+/// `information_schema` doesn't honour `search_path`. Tests probing `public`
+/// pass `"public"`.
+pub fn inspect_db(client: &mut Client, schema: &str) -> Result<DbState> {
     let mut tables_present = HashSet::new();
     let mut tables_with_rows = HashSet::new();
     for table in SCHEMA_TABLES {
@@ -748,12 +813,13 @@ pub fn inspect_db(client: &mut Client, _requested_bucket: &str) -> Result<DbStat
             }
         }
     }
-    // jfs_* probe (escape the underscore so it's matched literally).
+    // jfs_* probe (escape the underscore so it's matched literally). Scoped to
+    // the volume's schema — `information_schema` ignores search_path.
     let jfs_count: i64 = client
         .query_one(
             "select count(*) from information_schema.tables \
-             where table_schema = 'public' and table_name like 'jfs\\_%' escape '\\'",
-            &[],
+             where table_schema = $1 and table_name like 'jfs\\_%' escape '\\'",
+            &[&schema],
         )?
         .get(0);
     let jfs_present = jfs_count > 0;
@@ -835,12 +901,15 @@ fn apply_migration(
                 populated_table
             );
             confirm_destroy("DROP and recreate the Trove schema? Existing data will be destroyed.")?;
+            // Drop only this volume's tables (search_path is the volume schema).
+            // The `vector` extension is database-global and shared across volumes
+            // — leaving it is correct, and `create extension if not exists` makes
+            // the recreate idempotent.
             client
                 .batch_execute(
                     "drop table if exists blob_chunks cascade; \
                      drop table if exists file_versions cascade; \
-                     drop table if exists blobs cascade; \
-                     drop extension if exists vector;",
+                     drop table if exists blobs cascade;",
                 )
                 .context("dropping old Trove schema")?;
             client
@@ -864,6 +933,7 @@ fn apply_format(
     volume: &str,
     meta_url: &str,
     bucket: &str,
+    schema: &str,
     _flags: InstallFlags,
 ) -> Result<()> {
     use colored::Colorize;
@@ -899,7 +969,7 @@ fn apply_format(
             confirm_destroy(
                 "DROP the storage volume's metadata and reformat? Existing data in the old bucket will be orphaned.",
             )?;
-            drop_jfs_tables(client)?;
+            drop_jfs_tables(client, schema)?;
             run_juicefs_format(volume, meta_url, bucket)?;
             println!("  {} volume reformatted", "✓".green());
             Ok(())
@@ -912,19 +982,22 @@ fn apply_format(
     }
 }
 
-/// Drop every `jfs_*` table in the public schema. Used by `--reinstall` after
-/// the user has typed `destroy`.
-fn drop_jfs_tables(client: &mut Client) -> Result<()> {
+/// Drop every `jfs_*` table in the volume's `schema`. Used by `--reinstall`
+/// after the user has typed `destroy`.
+fn drop_jfs_tables(client: &mut Client, schema: &str) -> Result<()> {
     let rows = client.query(
         "select table_name from information_schema.tables \
-         where table_schema = 'public' and table_name like 'jfs\\_%' escape '\\'",
-        &[],
+         where table_schema = $1 and table_name like 'jfs\\_%' escape '\\'",
+        &[&schema],
     )?;
+    let sident = schema.replace('"', "\"\"");
     let mut stmt = String::new();
     for r in &rows {
         let name: String = r.get(0);
-        // Schema-allow-list: only names matching `jfs_*` from information_schema.
-        stmt.push_str(&format!("drop table if exists \"{name}\" cascade; "));
+        // Schema-allow-list: only names matching `jfs_*` from information_schema,
+        // dropped schema-qualified so search_path can't redirect us.
+        let nident = name.replace('"', "\"\"");
+        stmt.push_str(&format!("drop table if exists \"{sident}\".\"{nident}\" cascade; "));
     }
     if !stmt.is_empty() {
         client

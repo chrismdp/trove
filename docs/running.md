@@ -57,8 +57,10 @@ tool to run. If you'd rather apply the schema migration by hand:
 psql "$VERSIONS_DB" -f supabase/migrations/<timestamp>_init_version_chain_and_embeddings.sql
 ```
 
-Trove's tables and the storage layer's own bookkeeping tables coexist
-peacefully in the same Postgres.
+Trove's tables and the storage layer's own bookkeeping tables both live in
+a per-volume schema (`trove_<volume>`), not `public` — so one database can
+host many volumes, and Supabase's `anon`/API role can't see them. See
+[Quickstart — one database, many volumes](/docs/quickstart#one-database-many-volumes-and-nothing-in-public).
 
 ## Step 4: preflight
 

@@ -32,7 +32,7 @@ fn inspect_db_against_live_schema_reports_tables_present() {
         eprintln!("skipping: no DB reachable at {}", db_url());
         return;
     };
-    let s = trove::commands::install::inspect_db(&mut c, "").unwrap();
+    let s = trove::commands::install::inspect_db(&mut c, "public").unwrap();
     // The migration has been applied for the rest of the test suite to work, so
     // we expect all three Trove tables present.
     for t in ["blobs", "file_versions", "blob_chunks"] {
@@ -49,7 +49,7 @@ fn populated_db_without_flags_refuses() {
     // Build a synthetic snapshot the way the live DB looks after some real use,
     // and confirm the planner refuses.
     let Some(mut c) = connect() else { return };
-    let s = trove::commands::install::inspect_db(&mut c, "").unwrap();
+    let s = trove::commands::install::inspect_db(&mut c, "public").unwrap();
     // version.rs runs first and seeds blobs/file_versions; we expect rows.
     if s.tables_with_rows.is_empty() {
         eprintln!("skipping: live DB has no data yet (run tests/version.rs first)");
@@ -66,7 +66,7 @@ fn populated_db_without_flags_refuses() {
 #[test]
 fn populated_db_with_reuse_keeps() {
     let Some(mut c) = connect() else { return };
-    let s = trove::commands::install::inspect_db(&mut c, "").unwrap();
+    let s = trove::commands::install::inspect_db(&mut c, "public").unwrap();
     if s.tables_with_rows.is_empty() {
         return;
     }
@@ -85,7 +85,7 @@ fn populated_db_with_reuse_keeps() {
 #[test]
 fn populated_db_with_reinstall_plans_drop_and_recreate() {
     let Some(mut c) = connect() else { return };
-    let s = trove::commands::install::inspect_db(&mut c, "").unwrap();
+    let s = trove::commands::install::inspect_db(&mut c, "public").unwrap();
     if s.tables_with_rows.is_empty() {
         return;
     }
@@ -107,7 +107,7 @@ fn populated_db_with_reinstall_plans_drop_and_recreate() {
 #[test]
 fn jfs_present_without_recorded_bucket_is_reuse() {
     let Some(mut c) = connect() else { return };
-    let s = trove::commands::install::inspect_db(&mut c, "").unwrap();
+    let s = trove::commands::install::inspect_db(&mut c, "public").unwrap();
     if !s.jfs_present {
         eprintln!("skipping: no jfs_* tables in live DB");
         return;

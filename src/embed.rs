@@ -334,8 +334,9 @@ pub fn embed_blob(fs: &Fs, versions: &mut VersionStore, api_key: &str, hash: &st
 pub fn spawn_embedder(
     versions_url: &str,
     api_key: String,
+    schema: Option<&str>,
 ) -> Result<std::sync::mpsc::Sender<(String, Vec<u8>)>> {
-    let mut versions = VersionStore::connect(versions_url)?;
+    let mut versions = VersionStore::connect(versions_url, schema)?;
     let (tx, rx) = std::sync::mpsc::channel::<(String, Vec<u8>)>();
     std::thread::spawn(move || {
         for (hash, content) in rx {

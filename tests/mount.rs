@@ -526,7 +526,7 @@ fn a_committed_write_is_recorded_as_a_version() {
     // Same Postgres that (in production) also holds JuiceFS's metadata.
     let db = std::env::var("TROVE_DB_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:54322/postgres".to_string());
-    let versions = VersionStore::connect(&db).expect("version DB up? (`supabase start`)");
+    let versions = VersionStore::connect(&db, None).expect("version DB up? (`supabase start`)");
 
     let mountpoint = dir.join("mnt");
     std::fs::create_dir_all(&mountpoint).unwrap();
@@ -543,7 +543,7 @@ fn a_committed_write_is_recorded_as_a_version() {
     // Recorded synchronously at the commit barrier; poll briefly for the async
     // FUSE release to settle.
     let jfs_path = format!("/{rel}");
-    let mut checker = VersionStore::connect(&db).unwrap();
+    let mut checker = VersionStore::connect(&db, None).unwrap();
     let deadline = Instant::now() + Duration::from_secs(3);
     let log = loop {
         let log = checker.log(&jfs_path).unwrap();
@@ -579,10 +579,10 @@ fn ungoverned_text_and_binary_are_both_versioned() {
 
     let db = std::env::var("TROVE_DB_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:54322/postgres".to_string());
-    let versions = VersionStore::connect(&db).expect("version DB up? (`supabase start`)");
+    let versions = VersionStore::connect(&db, None).expect("version DB up? (`supabase start`)");
 
     let key = std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY");
-    let embed_tx = trove::embed::spawn_embedder(&db, key).unwrap();
+    let embed_tx = trove::embed::spawn_embedder(&db, key, None).unwrap();
 
     let mountpoint = dir.join("mnt");
     std::fs::create_dir_all(&mountpoint).unwrap();
@@ -605,7 +605,7 @@ fn ungoverned_text_and_binary_are_both_versioned() {
     // Poll: both files should appear in file_versions.
     let md_path = format!("/{md_rel}");
     let bin_path = format!("/{bin_rel}");
-    let mut checker = VersionStore::connect(&db).unwrap();
+    let mut checker = VersionStore::connect(&db, None).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     let (md_log, bin_log) = loop {
         let a = checker.log(&md_path).unwrap();
@@ -686,8 +686,8 @@ fn a_committed_write_self_triggers_embedding() {
 
     let db = std::env::var("TROVE_DB_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:54322/postgres".to_string());
-    let versions = VersionStore::connect(&db).unwrap();
-    let embed_tx = trove::embed::spawn_embedder(&db, key).unwrap();
+    let versions = VersionStore::connect(&db, None).unwrap();
+    let embed_tx = trove::embed::spawn_embedder(&db, key, None).unwrap();
 
     let mountpoint = dir.join("mnt");
     std::fs::create_dir_all(&mountpoint).unwrap();

@@ -45,7 +45,7 @@ fn fresh_fs() -> Fs {
 #[test]
 fn serves_index_files_and_file_content() {
     let fs = fresh_fs();
-    let mut vs = VersionStore::connect(&db_url()).expect("version DB up? (`supabase start`)");
+    let mut vs = VersionStore::connect(&db_url(), None).expect("version DB up? (`supabase start`)");
 
     // A file in the live tree + a version row (so /files lists it).
     let path = format!("/srv-{}.md", uniq());

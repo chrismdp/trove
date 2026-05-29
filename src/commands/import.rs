@@ -446,8 +446,9 @@ mod io_path {
         let versions_url = versions_db
             .or_else(|| std::env::var("TROVE_VERSIONS_DB").ok().filter(|s| !s.is_empty()))
             .or_else(|| cfg.versions_db.clone());
+        let schema = cfg.schema_name();
         let versions = match &versions_url {
-            Some(url) => Some(VersionStore::connect(url)?),
+            Some(url) => Some(VersionStore::connect(url, schema.as_deref())?),
             None => None,
         };
         let embed_tx: Option<Sender<(String, Vec<u8>)>> = match (&versions_url, no_embed) {
@@ -457,7 +458,7 @@ mod io_path {
                         "OPENAI_API_KEY not set. Set it, or pass --no-embed to import without embedding."
                     )
                 })?;
-                Some(crate::embed::spawn_embedder(url, key)?)
+                Some(crate::embed::spawn_embedder(url, key, schema.as_deref())?)
             }
             _ => None,
         };

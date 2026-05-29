@@ -34,6 +34,12 @@ pub struct Config {
     /// Path to a local mirror directory. When set, `trove backup` writes here by default.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub backup_dir: Option<String>,
+    /// Postgres schema that isolates this volume's metadata from `public` (so a
+    /// Supabase project's anon/API role can't reach it) and lets one database
+    /// host many volumes. Set by `trove install` from the volume name; when
+    /// absent it's derived on the fly via [`schema_for`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub schema: Option<String>,
 }
 
 impl Config {
@@ -55,6 +61,14 @@ impl Config {
             eprintln!("trove: ignoring malformed {}: {e}", path.display());
             Config::default()
         })
+    }
+
+    /// The schema this install's metadata lives in: the stored `schema`, else
+    /// derived from the volume name. `None` only when no volume is known yet.
+    pub fn schema_name(&self) -> Option<String> {
+        self.schema
+            .clone()
+            .or_else(|| self.volume.as_deref().map(schema_for))
     }
 
     /// Write the config to its path, creating the directory if needed.
@@ -101,6 +115,50 @@ pub fn resolve_with_source(
     Err(anyhow::anyhow!(
         "no {name} — pass the flag, set {env_var}, or run `trove install`"
     ))
+}
+
+/// Derive the Postgres schema that isolates a volume's metadata from `public`.
+/// Sanitises the volume name to a safe lowercase identifier and namespaces it
+/// under `trove` (skipping the prefix when the volume already carries it, so
+/// `trove-test` → `trove_test` rather than `trove_trove_test`). Bounded to
+/// Postgres's 63-byte identifier limit.
+pub fn schema_for(volume: &str) -> String {
+    let mut id = String::new();
+    let mut prev_us = true; // collapse a leading run of punctuation
+    for c in volume.chars() {
+        if c.is_ascii_alphanumeric() {
+            id.push(c.to_ascii_lowercase());
+            prev_us = false;
+        } else if !prev_us {
+            id.push('_');
+            prev_us = true;
+        }
+    }
+    while id.ends_with('_') {
+        id.pop();
+    }
+    let mut s = if id.starts_with("trove") {
+        id
+    } else {
+        format!("trove_{id}")
+    };
+    while s.ends_with('_') {
+        s.pop();
+    }
+    if s.is_empty() || s == "trove" {
+        s = "trove_default".to_string();
+    }
+    s.truncate(63);
+    s
+}
+
+/// Append JuiceFS's `search_path` query parameter to a Postgres meta URL, so its
+/// `jfs_*` tables are created in the volume's schema instead of `public`.
+/// JuiceFS honours a single schema here; trove's own connections set a fuller
+/// `search_path` (schema, public, extensions) for the `vector` type.
+pub fn with_search_path(meta_url: &str, schema: &str) -> String {
+    let sep = if meta_url.contains('?') { '&' } else { '?' };
+    format!("{meta_url}{sep}search_path={schema}")
 }
 
 #[cfg(test)]
@@ -151,6 +209,7 @@ mod tests {
             r2_bucket: Some("trove".into()),
             store: None,
             backup_dir: None,
+            schema: None,
         };
         let text = toml::to_string_pretty(&c).unwrap();
         assert!(text.contains("versions_db"));
@@ -158,5 +217,37 @@ mod tests {
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.versions_db.as_deref(), Some("postgres://x"));
         assert_eq!(back.meta, None);
+    }
+
+    #[test]
+    fn schema_for_sanitises_and_namespaces() {
+        assert_eq!(schema_for("trove-test"), "trove_test"); // already trove-prefixed
+        assert_eq!(schema_for("test"), "trove_test"); // gets the prefix
+        assert_eq!(schema_for("My Vault!"), "trove_my_vault");
+        assert_eq!(schema_for("trove"), "trove_default");
+        assert_eq!(schema_for("---"), "trove_default");
+        assert!(schema_for(&"x".repeat(100)).len() <= 63);
+    }
+
+    #[test]
+    fn schema_name_prefers_stored_then_derives() {
+        let mut c = Config { volume: Some("notes".into()), ..Default::default() };
+        assert_eq!(c.schema_name().as_deref(), Some("trove_notes")); // derived
+        c.schema = Some("custom".into());
+        assert_eq!(c.schema_name().as_deref(), Some("custom")); // stored wins
+        let empty = Config::default();
+        assert_eq!(empty.schema_name(), None); // no volume, no schema
+    }
+
+    #[test]
+    fn with_search_path_picks_separator() {
+        assert_eq!(
+            with_search_path("postgres://h/db", "trove_x"),
+            "postgres://h/db?search_path=trove_x"
+        );
+        assert_eq!(
+            with_search_path("postgres://h/db?sslmode=require", "trove_x"),
+            "postgres://h/db?sslmode=require&search_path=trove_x"
+        );
     }
 }

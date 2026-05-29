@@ -65,7 +65,7 @@ fn fresh_fs() -> Fs {
 #[test]
 fn backup_mirrors_every_revision_then_no_ops_on_rerun() {
     let fs = fresh_fs();
-    let Ok(mut versions) = VersionStore::connect(&db_url()) else {
+    let Ok(mut versions) = VersionStore::connect(&db_url(), None) else {
         eprintln!("skipping: no DB reachable at {}", db_url());
         return;
     };
@@ -147,7 +147,7 @@ fn backup_mirrors_every_revision_then_no_ops_on_rerun() {
 #[test]
 fn backup_by_rev_layout_groups_full_trees_per_rev() {
     let fs = fresh_fs();
-    let Ok(mut versions) = VersionStore::connect(&db_url()) else {
+    let Ok(mut versions) = VersionStore::connect(&db_url(), None) else {
         eprintln!("skipping: no DB reachable at {}", db_url());
         return;
     };

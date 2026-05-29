@@ -194,16 +194,36 @@ trove search "people born in March"     # semantic search
 
 ```toml
 versions_db = "postgres://user:pass@host:5432/dbname"
-volume      = "trove"
+volume      = "notes"
 meta        = "postgres://user:pass@host:5432/dbname"   # same as versions_db
 cache       = "/tmp/trove-cache"
-r2_bucket   = "trove"
+r2_bucket   = "https://<bucket>.<acct>.r2.cloudflarestorage.com"
 store       = "/home/you/vault"
+schema      = "trove_notes"   # derived from the volume name
 ```
 
 **Secrets are NOT in this file.** `R2_ACCESS_KEY_ID`,
 `R2_SECRET_ACCESS_KEY`, and `OPENAI_API_KEY` stay in the environment (or
 your `.envrc` / `1password run`).
+
+### One database, many volumes — and nothing in `public`
+
+Each volume's metadata lives in its **own Postgres schema** (`trove_<volume>`,
+derived from the volume name), not in `public`. Two consequences:
+
+- **Isolation.** One database can back many volumes — each gets its own
+  `blobs` / `file_versions` / `blob_chunks` and its own JuiceFS `jfs_*`
+  tables, namespaced by schema. Install a second volume with a different
+  name and it lands in its own `trove_<name>` schema in the same DB.
+- **Not exposed by Supabase's API.** Supabase's auto REST/GraphQL API only
+  serves `public` (+ `graphql_public`), so a `trove_*` schema is invisible
+  to the `anon` key by default, and the schema grants no access to `anon`.
+  (The role in your connection string still has full access — that's how
+  trove reads and writes.) To confirm, hit `…/rest/v1/blobs` with your anon
+  key: it should 404.
+
+The `vector` extension is database-global, so `trove install` creates it
+once in a shared location, not inside a volume's schema.
 
 ## Next
 

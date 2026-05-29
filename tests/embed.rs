@@ -51,7 +51,7 @@ fn embed_blob_writes_one_vector_per_header_chunk() {
     // would cluster these two tiny sections into one chunk).
     std::env::set_var("TROVE_CHUNK_STRATEGY", "heading");
     let fs = fresh_fs();
-    let mut vs = VersionStore::connect(&db_url()).expect("version DB up?");
+    let mut vs = VersionStore::connect(&db_url(), None).expect("version DB up?");
 
     // Unique content so the hash is fresh each run (blob starts un-embedded).
     let tag = uniq();

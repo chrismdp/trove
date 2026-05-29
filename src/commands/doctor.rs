@@ -177,7 +177,7 @@ pub fn run(
     // --- Backend: DB resolvable + reachable + pgvector + schema; JuiceFS ---
     match config::resolve(versions_db, "TROVE_VERSIONS_DB", cfg.versions_db.clone(), "versions DB URL") {
         Err(e) => checks.push(Check::fail(SECTION_BACKEND, "versions DB", e.to_string())),
-        Ok(url) => match VersionStore::connect(&url) {
+        Ok(url) => match VersionStore::connect(&url, cfg.schema_name().as_deref()) {
             Err(e) => checks.push(Check::fail(SECTION_BACKEND, "versions DB", format!("unreachable: {e:#}"))),
             Ok(mut vs) => {
                 checks.push(Check::ok(SECTION_BACKEND, "versions DB", "reachable"));
@@ -205,6 +205,11 @@ pub fn run(
     let met = config::resolve(meta, "TROVE_META", cfg.meta.clone(), "meta URL");
     match (vol, met) {
         (Ok(vol), Ok(met)) => {
+            // Match the mount path: point JuiceFS at the volume's schema.
+            let met = match cfg.schema_name() {
+                Some(schema) => config::with_search_path(&met, &schema),
+                None => met,
+            };
             let cache_dir = cache
                 .map(|c| c.to_string_lossy().into_owned())
                 .or_else(|| cfg.cache.clone())

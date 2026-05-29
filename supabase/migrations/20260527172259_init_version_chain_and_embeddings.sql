@@ -7,8 +7,11 @@
 -- restore) and the semantic-search embeddings. Everything hangs off a
 -- content-addressed blob registry, so identical content is recorded once.
 
--- pgvector for semantic search over file contents.
-create extension if not exists vector;
+-- NOTE: the `vector` extension is created by `trove install` in a shared
+-- location BEFORE this migration runs — it's database-global, not per-volume, so
+-- it must not live in (or be dropped with) a volume's schema. This migration
+-- runs with `search_path` pointed at the volume's own schema, so the tables
+-- below are created there, isolated from `public`.
 
 -- Content-addressed registry: one row per unique file content (sha256). The
 -- bytes themselves are NOT here — they're a COW clone in JuiceFS keyed by this

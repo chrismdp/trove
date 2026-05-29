@@ -37,8 +37,20 @@ pub struct VersionStore {
 
 impl VersionStore {
     /// Connect to the version DB (e.g. `postgres://postgres:postgres@127.0.0.1:54322/postgres`).
-    pub fn connect(url: &str) -> Result<Self> {
-        let client = Client::connect(url, NoTls).context("connecting to Trove version DB")?;
+    /// When `schema` is set, the session's `search_path` is pointed at it (plus
+    /// `public`/`extensions` for the `vector` type), so every unqualified query
+    /// in this module resolves against the volume's isolated schema rather than
+    /// `public`.
+    pub fn connect(url: &str, schema: Option<&str>) -> Result<Self> {
+        let mut client = Client::connect(url, NoTls).context("connecting to Trove version DB")?;
+        if let Some(s) = schema {
+            // `s` is a sanitised identifier (see `config::schema_for`); double
+            // any quote defensively before interpolating.
+            let ident = s.replace('"', "\"\"");
+            client
+                .batch_execute(&format!("set search_path to \"{ident}\", public, extensions"))
+                .with_context(|| format!("setting search_path to schema {s}"))?;
+        }
         Ok(Self { client })
     }
 

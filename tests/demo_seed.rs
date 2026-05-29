@@ -35,7 +35,7 @@ fn db_url() -> String {
 #[ignore = "seeds the live DB with real OpenAI embeddings — run on demand"]
 fn seed_live_demo_corpus() {
     let api_key = std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY (source ~/.secret_env)");
-    let mut vs = VersionStore::connect(&db_url()).expect("version DB up? (`supabase start`)");
+    let mut vs = VersionStore::connect(&db_url(), None).expect("version DB up? (`supabase start`)");
     for (path, content) in DOCS {
         let bytes = content.as_bytes();
         let hash = sha256_hex(bytes);

@@ -43,7 +43,7 @@ fn fresh_fs() -> Fs {
 #[test]
 fn log_cat_diff_restore_round_trip() {
     let fs = fresh_fs();
-    let mut vs = VersionStore::connect(&db_url()).expect("version DB up? (`supabase start`)");
+    let mut vs = VersionStore::connect(&db_url(), None).expect("version DB up? (`supabase start`)");
     let path = format!("/hist-{}.md", uniq());
 
     // Three edits, each written live + versioned (what the mount's commit does).

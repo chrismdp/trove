@@ -354,7 +354,7 @@ fn connect_versions(
     cfg: &trove::config::Config,
 ) -> Result<trove::version::VersionStore> {
     let url = trove::config::resolve(flag, "TROVE_VERSIONS_DB", cfg.versions_db.clone(), "versions DB URL")?;
-    trove::version::VersionStore::connect(&url)
+    trove::version::VersionStore::connect(&url, cfg.schema_name().as_deref())
 }
 
 /// Resolve + init the JuiceFS volume (volume/meta from flag > env > config;
@@ -368,6 +368,12 @@ fn init_fs(
 ) -> Result<trove::jfs::Fs> {
     let volume = trove::config::resolve(volume, "TROVE_VOLUME", cfg.volume.clone(), "volume name")?;
     let meta = trove::config::resolve(meta, "TROVE_META", cfg.meta.clone(), "meta URL")?;
+    // Point JuiceFS at the volume's schema so its jfs_* tables land there, not
+    // in `public`, matching where the version tables live.
+    let meta = match cfg.schema_name() {
+        Some(schema) => trove::config::with_search_path(&meta, &schema),
+        None => meta,
+    };
     let cache = cache
         .map(|c| c.to_string_lossy().into_owned())
         .or_else(|| std::env::var("TROVE_CACHE").ok().filter(|s| !s.is_empty()))
@@ -469,8 +475,9 @@ fn run() -> Result<usize> {
             let versions_url = versions_db
                 .or_else(|| std::env::var("TROVE_VERSIONS_DB").ok().filter(|s| !s.is_empty()))
                 .or_else(|| cfg.versions_db.clone());
+            let schema = cfg.schema_name();
             let versions = match &versions_url {
-                Some(url) => Some(trove::version::VersionStore::connect(url)?),
+                Some(url) => Some(trove::version::VersionStore::connect(url, schema.as_deref())?),
                 None => None,
             };
             // On-commit embedding is ON by default whenever versioning is on.
@@ -482,7 +489,7 @@ fn run() -> Result<usize> {
                     let key = openai_key().map_err(|e| anyhow::anyhow!(
                         "{e}. Set OPENAI_API_KEY, or pass --no-embed to mount without embedding."
                     ))?;
-                    Some(trove::embed::spawn_embedder(url, key)?)
+                    Some(trove::embed::spawn_embedder(url, key, schema.as_deref())?)
                 }
                 _ => None,
             };

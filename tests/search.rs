@@ -22,7 +22,7 @@ fn db_url() -> String {
 }
 
 fn store() -> VersionStore {
-    VersionStore::connect(&db_url())
+    VersionStore::connect(&db_url(), None)
         .expect("connect to Trove version DB — is the local supabase stack up? (`supabase start`)")
 }
 
