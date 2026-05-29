@@ -57,26 +57,41 @@ backend, was rejected: it abandons the live-FUSE thesis and needs a whole
 push/pull/merge/conflict engine — a different product. (P) keeps trove what it
 is, and "schemas travel" falls out for free (below).
 
-## Local state — outside the projection
+## Local state — outside the projection, creds shared across volumes
 
-The only local artifact is this machine's connection state, kept **outside** the
-projected folder so the mount can't shadow it and the write pipeline can't sweep
-it into the backend:
+Local state is kept **outside** the projected folder (so the mount can't shadow
+it and the write pipeline can't sweep it into the backend), and **split into
+shared credentials and per-volume config** — because one DB + one R2 credential
+typically backs *many* volumes (see Fleet, below), and the creds shouldn't be
+duplicated per volume.
 
-`~/.config/trove/<volume>/env` — **local, never synced:**
+`~/.config/trove/credentials.toml` — **shared, machine-wide, never synced** (`chmod 600`):
 
 ```
-versions_db = "postgres://…"    # embeds the DB password → secret, local only
-bucket      = "https://<account>.r2.cloudflarestorage.com/<volume>"
-schema      = "trove_<volume>"
-cache       = "/tmp/trove-cache"
-mountpoint  = "/home/you/<volume>"
+versions_db = "postgres://…"      # embeds the DB password
+# R2 creds resolved from env first (R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY),
+# else from here — kept for op/1password workflows:
+# r2_access_key_id = "…"
+# r2_secret_access_key = "…"
 ```
 
-Because it lives under `~/.config`, there's nothing in the vault folder to
-git-ignore and nothing for the write pipeline to hard-exclude — the secret
-simply isn't reachable from the projection. R2 creds stay in the environment
-(`R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY`), never written here.
+`~/.config/trove/volumes/<volume>.toml` — **per-volume, references the creds:**
+
+```
+bucket     = "https://<account>.r2.cloudflarestorage.com/<volume>"
+schema     = "trove_<volume>"
+mountpoint = "/home/you/<volume>"
+cache      = "/tmp/trove-cache"
+```
+
+Rotation is one-place (the credentials file / env). Nothing lives in the vault
+folder, so there's nothing to git-ignore and nothing for the write pipeline to
+exclude — the secret isn't reachable from the projection.
+
+**"Separate" is about the *backend*, not local disk.** The rule is: never
+co-locate the two creds in each other's backend store (DB URL never in the
+bucket; R2 keys never in the DB) — that's the blast-radius property. Holding
+both in the operator's local `~/.config` cred store is fine and expected.
 
 **Schemas travel as vault content.** The JSON-Schema type registry lives *in*
 the vault (`<vault>/.types/`), versioned like any file. A `clone` pulls it down
@@ -84,7 +99,26 @@ for free, and the mount loads it at startup to build the validation gate — no
 separate sync, no local copy to keep in step. This is what "we'd need the
 schemas everywhere" resolves to under (P).
 
-## Secrets stay separate (decided)
+## Fleet: one DB + one R2 credential → many volumes
+
+The substrate already supports this and it's a first-class case, not an edge:
+
+- **One database, many schemas** — each volume is its own `trove_<volume>`
+  schema (already shipped).
+- **One R2 credential, many buckets** — an R2 API token reaches every bucket in
+  the account, so the *same* creds format and mount any number of volumes, each
+  in its **own bucket**.
+
+So a machine holds **one shared credential set** and **N per-volume configs**
+(schema + bucket + mountpoint). This is exactly why local state is split as
+above. Concretely, after the first vault exists, a second is just:
+
+```
+cd ~/projectB && trove init           # reuses the shared DB URL + R2 creds;
+                                       # only asks for the bucket
+```
+
+No re-entering creds, no duplication, one-place rotation.
 
 JuiceFS strips the object-store secret key from the metadata by default
 (`--keep-secret-key` would persist it; we won't). The two credentials stay
@@ -105,7 +139,9 @@ shipped schema isolation (`trove_<volume>`, off Supabase's anon API) keeps
 
 ## `trove init`
 
-**Minimal inputs only:** **DB URL**, **bucket**, **R2 creds**. The volume name
+**Minimal inputs only:** **DB URL**, **bucket**, **R2 creds** — but the DB URL
+and R2 creds are read from the shared cred store / env if already present, so on
+any vault after the first you're asked **only for the bucket**. The volume name
 defaults to the folder basename (re-prompt if it isn't a clean identifier).
 Everything else is derived/defaulted, never asked: `meta` = the DB URL, `cache`
 = default, store = the folder, schema = derived, backup = a separate concern.
@@ -159,8 +195,10 @@ shared schema, and the validate → COW-version → embed write pipeline.
 1. Live FUSE projection (P), not a working copy (W).
 2. `init` mounts at cwd (volume = folder name); `clone <db-url>` makes
    `./<volume>/`. `install` removed.
-3. Local connection state in `~/.config/trove/<volume>/env`, never synced;
-   schemas travel as vault content; secrets never co-located.
+3. Local state split: **shared** creds (`~/.config/trove/credentials.toml` /
+   env) + **per-volume** config (`~/.config/trove/volumes/<volume>.toml`); never
+   synced; schemas travel as vault content; secrets never co-located in the
+   backend (local cred store is fine). One DB + one R2 cred → many volumes.
 4. Minimal inputs (DB URL, bucket, R2 creds); validate each at entry; mount
    implicitly.
 5. Volume names validated (reject non-clean; `trove` allowed; no `trove_default`).
