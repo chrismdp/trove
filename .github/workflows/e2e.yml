@@ -1,0 +1,31 @@
+# End-to-end test: two trove instances share one vault over a real object store
+# (MinIO) + Postgres, and we assert writes sync between them. GitHub-hosted
+# runners provide /dev/fuse, so the containerised FUSE mounts work here too.
+name: e2e
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install FUSE + build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse3-dev pkg-config
+
+      - name: Run e2e (MinIO + Postgres + two trove instances)
+        run: bash scripts/e2e.sh

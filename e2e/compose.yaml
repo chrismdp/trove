@@ -1,0 +1,77 @@
+# Full trove e2e stack: a local S3 (MinIO) + Postgres/pgvector + two trove
+# instances that mount the SAME vault. Driven by `scripts/e2e.sh`, which asserts
+# a write in one instance shows up in the other. Self-contained — touches
+# nothing on the host except Docker.
+name: trove-e2e
+
+x-trove: &trove
+  image: trove-e2e:local
+  cap_add: ["SYS_ADMIN"] # fusermount inside the container
+  devices: ["/dev/fuse"]
+  security_opt: ["apparmor:unconfined"]
+  # Mounted FUSE vault => container is "healthy" once /vault/notes is a mount.
+  healthcheck:
+    test: ["CMD-SHELL", "grep -q ' /vault/notes fuse' /proc/mounts"]
+    interval: 3s
+    timeout: 3s
+    retries: 40
+    start_period: 5s
+
+x-trove-env: &trove-env
+  TROVE_VERSIONS_DB: postgres://postgres:postgres@postgres:5432/postgres
+  TROVE_R2_ENDPOINT: http://minio:9000
+  R2_ACCESS_KEY_ID: minioadmin
+  R2_SECRET_ACCESS_KEY: minioadmin
+  TROVE_CACHE: /tmp/trove-cache
+
+services:
+  minio:
+    image: minio/minio:latest
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+
+  # One-shot: wait for MinIO, then create the (empty) bucket trove validates.
+  createbucket:
+    image: minio/mc:latest
+    depends_on: ["minio"]
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        until mc alias set local http://minio:9000 minioadmin minioadmin >/dev/null 2>&1; do
+          echo "waiting for minio..."; sleep 1
+        done
+        mc mb -p local/trove-notes
+        echo "bucket-ready"
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+
+  # Creator: empty bucket + no schema => creates the vault, then mounts.
+  trove-a:
+    <<: *trove
+    depends_on:
+      postgres: { condition: service_healthy }
+      createbucket: { condition: service_completed_successfully }
+    environment:
+      <<: *trove-env
+      ROLE: a
+
+  # Attacher: starts only once A is mounted (healthy), so it always attaches.
+  trove-b:
+    <<: *trove
+    depends_on:
+      postgres: { condition: service_healthy }
+      createbucket: { condition: service_completed_successfully }
+      trove-a: { condition: service_healthy }
+    environment:
+      <<: *trove-env
+      ROLE: b
