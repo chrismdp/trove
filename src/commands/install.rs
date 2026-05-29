@@ -320,25 +320,69 @@ fn run_interactive(flags: InstallFlags) -> Result<()> {
     );
     println!("\nFull walkthrough any time: {}\n", "trove docs quickstart".cyan());
 
-    // (a) non-secret config prompts
-    let new = Config {
-        versions_db: ask("versions_db (postgres URL)", cur.versions_db.as_deref())?,
-        volume: ask("volume name", cur.volume.as_deref().or(Some("trove")))?,
-        meta: ask("meta URL (blank = same as versions_db)", cur.meta.as_deref())?,
-        store: ask(
-            "store (vault path, used by `trove doctor`'s validation sweep)",
-            cur.store.as_deref(),
-        )?,
-        cache: ask("cache dir", cur.cache.as_deref().or(Some("/tmp/trove-cache")))?,
-        r2_bucket: ask(
-            "r2 bucket endpoint URL (https://<bucket>.<acct>.r2.cloudflarestorage.com)",
-            cur.r2_bucket.as_deref(),
-        )?,
-        backup_dir: ask(
-            "backup mirror directory [optional \u{2014} write a local copy of every committed file]",
-            cur.backup_dir.as_deref(),
-        )?,
-    };
+    // (a) non-secret config prompts. Each prompt is preceded by a short
+    //     "what this is / how to get it" paragraph. The walkthrough assumes
+    //     Supabase for the database and Cloudflare R2 for the bucket — the
+    //     proven, free-tier path — but any Postgres URL / S3-compatible
+    //     endpoint is accepted.
+    explain(
+        "Postgres database \u{2014} stores metadata, version history and embeddings.",
+        &[
+            "Easiest is Supabase (free tier): create a project at https://supabase.com,",
+            "then Project Settings \u{2192} Database \u{2192} Connection string \u{2192} URI.",
+            "Pick the \"Session pooler\" (port 5432), NOT the transaction pooler (6543).",
+            "Paste the whole URI below \u{2014} it already includes your database password.",
+        ],
+    );
+    let versions_db = ask("versions_db (postgres URL)", cur.versions_db.as_deref())?;
+
+    explain(
+        "Volume name \u{2014} a label for your storage volume.",
+        &["The default is fine for a single vault; press Enter to accept it."],
+    );
+    let volume = ask("volume name", cur.volume.as_deref().or(Some("trove")))?;
+
+    explain(
+        "Metadata URL \u{2014} where the storage layer keeps its own bookkeeping.",
+        &["It lives in the same Postgres as above, so press Enter to reuse that URL."],
+    );
+    let meta = ask("meta URL (blank = same as versions_db)", cur.meta.as_deref())?;
+
+    explain(
+        "Vault path \u{2014} the folder trove validates (your notes + a .types/ schema dir).",
+        &[
+            "Used by `trove doctor` and as the default --types for `trove mount`.",
+            "Leave blank if you haven't created it yet \u{2014} you can set it later.",
+        ],
+    );
+    let store = ask("store (vault path)", cur.store.as_deref())?;
+
+    explain(
+        "Cache directory \u{2014} local scratch space for caching file blocks.",
+        &["The default is fine for almost everyone; press Enter to accept it."],
+    );
+    let cache = ask("cache dir", cur.cache.as_deref().or(Some("/tmp/trove-cache")))?;
+
+    explain(
+        "Object store \u{2014} holds the actual file data (any S3-compatible bucket).",
+        &[
+            "Cloudflare R2 is the easy choice (free tier, no egress fees):",
+            "  1. dash.cloudflare.com \u{2192} R2 \u{2192} Create bucket.",
+            "  2. R2 \u{2192} Manage R2 API Tokens \u{2192} Create API token (Object Read & Write).",
+            "     That shows an Access Key ID + Secret \u{2014} you'll paste those next.",
+            "Enter the bucket's S3 endpoint URL below, e.g.",
+            "  https://<bucket>.<accountid>.r2.cloudflarestorage.com",
+        ],
+    );
+    let r2_bucket = ask("r2 bucket endpoint URL", cur.r2_bucket.as_deref())?;
+
+    explain(
+        "Backup mirror \u{2014} optional local copy of every committed file.",
+        &["Leave blank to skip; `trove backup` can write here later if it's set."],
+    );
+    let backup_dir = ask("backup mirror directory [optional]", cur.backup_dir.as_deref())?;
+
+    let new = Config { versions_db, volume, meta, store, cache, r2_bucket, backup_dir };
 
     // (b) secrets — prompt for any not already exported, kept out of config.
     println!(
@@ -453,18 +497,18 @@ fn provision(new: Config, flags: InstallFlags) -> Result<()> {
 const SECRETS: [(&str, &str, &str); 3] = [
     (
         "OPENAI_API_KEY",
-        "embeddings + `trove search` (optional)",
-        "https://platform.openai.com/api-keys",
+        "powers embeddings + `trove search` (optional \u{2014} skip and mount with --no-embed)",
+        "create one at https://platform.openai.com/api-keys",
     ),
     (
         "R2_ACCESS_KEY_ID",
-        "object-store access key id (needed to format the volume)",
-        "Cloudflare dashboard \u{2192} R2 \u{2192} Manage API Tokens",
+        "the Access Key ID from the R2 API token you created above",
+        "Cloudflare dashboard \u{2192} R2 \u{2192} Manage R2 API Tokens",
     ),
     (
         "R2_SECRET_ACCESS_KEY",
-        "object-store secret key",
-        "shown once when you create the R2 API token",
+        "the Secret Access Key from that same R2 API token (shown only once)",
+        "Cloudflare dashboard \u{2192} R2 \u{2192} Manage R2 API Tokens",
     ),
 ];
 
@@ -637,6 +681,16 @@ fn ask(label: &str, current: Option<&str>) -> io::Result<Option<String>> {
     } else {
         Some(line.to_string())
     })
+}
+
+/// Print a short "what this is / how to get it" paragraph before a prompt:
+/// a bold header line, then indented guidance.
+fn explain(header: &str, body: &[&str]) {
+    use colored::Colorize;
+    println!("\n{}", header.bold());
+    for line in body {
+        println!("  {line}");
+    }
 }
 
 /// Build a [`DbState`] snapshot. Reads only — no schema changes.
