@@ -108,6 +108,6 @@ report is internally consistent (`embedded + pending == blobs`,
 `statvfs` call. No bucket SDK call, no walk of the live tree.
 
 If a Trove table is missing, `trove usage` errors loudly with a "schema not
-migrated — run `trove install`" message rather than silently reporting 0.
+migrated — run `trove init`" message rather than silently reporting 0.
 Schema readiness is `trove doctor`'s job; `usage` assumes the migration has
 run.

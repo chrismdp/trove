@@ -28,3 +28,6 @@ pub mod embed;
 #[cfg(feature = "mount")]
 pub mod mount;
 
+/// Read-only S3/R2 bucket probes used by `trove init`.
+#[cfg(feature = "mount")]
+pub mod s3;

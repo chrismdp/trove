@@ -87,7 +87,7 @@ pub fn run(pin: Option<&str>, force: bool) -> Result<()> {
 
     if !status.success() {
         return Err(anyhow!(
-            "installer exited with status {status} — your existing trove install is unchanged"
+            "installer exited with status {status} — your current installation is unchanged"
         ));
     }
     println!("{} upgraded to {target_num}.", "trove:".green().bold());

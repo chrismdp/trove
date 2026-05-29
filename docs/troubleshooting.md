@@ -44,7 +44,7 @@ The validation gate is rejecting everything. Two common causes:
 
 `trove doctor` says the backend is bad. In order of likelihood:
 
-- **Volume not formatted.** Run `trove install` once (it formats the
+- **Volume not formatted.** Run `trove init` inside the vault folder (it formats the
   volume in-process; see [Running](/docs/running)).
 - **Postgres unreachable from the trove process.** Test with `psql
   $VERSIONS_DB`. Container networking is the usual culprit.

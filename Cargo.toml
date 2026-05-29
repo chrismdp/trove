@@ -10,14 +10,12 @@ name = "trove"
 path = "src/main.rs"
 
 [features]
-# `mount` pulls the substrate runtime: JuiceFS-backed FUSE (libjfs) + COW
-# version capture + the `trove embed` worker (ureq for the OpenAI call). It also
-# pulls `rustyline` so `trove install`'s interactive prompts get proper line
-# editing (arrow keys, home/end, ^U) — the install IO path is mount-gated
-# anyway. Kept behind a feature so `trove check` and the validator build with no
-# native deps. Note: tiny_http is NOT in this feature — `trove docs` serves the
-# embedded walkthrough without needing libjfs, Postgres, or an OpenAI key.
-mount = ["dep:fuser", "dep:libc", "dep:ureq", "dep:similar", "dep:rustyline"]
+# `mount` pulls the substrate runtime: JuiceFS-backed FUSE (libjfs), COW
+# version capture, `trove init`, and the `trove embed` worker. Kept behind a
+# feature so `trove check` and the validator build with no native deps. Note:
+# tiny_http is NOT in this feature — `trove docs` serves the embedded
+# walkthrough without needing libjfs, Postgres, or an OpenAI key.
+mount = ["dep:fuser", "dep:libc", "dep:ureq", "dep:similar", "dep:rustyline", "dep:hmac"]
 
 [dependencies]
 fuser = { version = "0.17", optional = true }
@@ -33,12 +31,12 @@ anyhow = "1"
 colored = "2"
 postgres = "0.19"
 sha2 = "0.10"
+hmac = { version = "0.12", optional = true }
 hex = "0.4"
 toml = "0.8"
 ureq = { version = "2", features = ["json"], optional = true }
-# Readline for `trove install`'s interactive prompts: arrow-key cursor movement,
-# home/end, ^U/^K, history within the session. Optional + mount-gated so the
-# core validator build stays dependency-free.
+# Readline support for mount-feature interactive prompts. Optional +
+# mount-gated so the core validator build stays dependency-free.
 rustyline = { version = "18", optional = true }
 similar = { version = "2", optional = true }
 # HTTP server. Used by both `trove server` (mount feature, vault data viewer)

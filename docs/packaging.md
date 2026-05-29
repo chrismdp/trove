@@ -156,8 +156,8 @@ directory. The install script puts both under
 ## macOS runtime requirements
 
 The macOS tarballs ship with `trove` linked against macFUSE's userland.
-**All trove commands except `trove mount` work without macFUSE installed**
-— `check`, `docs`, `install`, `search`, `server`, `log`, `cat`, `backup`
+**All trove commands except `trove mount` / `trove init` work without macFUSE installed**
+— `check`, `docs`, `search`, `server`, `log`, `cat`, `backup`
 have no FUSE dependency at runtime.
 
 For `trove mount`, you need macFUSE on the machine:

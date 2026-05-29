@@ -109,12 +109,11 @@ re-derives from `--layout by-rev` if you cared to keep one.
 
 ## Configure once, cron it
 
-The install prompt asks for an optional `backup mirror directory`. Set it
-and `trove backup` runs with no flags:
+Pass `--dest` explicitly, or set a backup destination in config, and
+`trove backup` runs with no flags:
 
 ```bash
-# during `trove install`
-backup mirror directory [optional — write a local copy of every committed file]: /var/backups/trove
+trove backup --dest /var/backups/trove
 ```
 
 Then a nightly cron one-liner:

@@ -1,11 +1,8 @@
 //! Thin CLI shell over the `trove` library. All logic lives in the lib so it
 //! can be tested directly (see `tests/`).
 //!
-//! Connection settings (`--versions-db`, `--volume`, `--meta`, `--cache`) all
-//! fall back to env vars then `~/.config/trove/config.toml` (written by `trove
-//! install`), so the common commands need no flags once configured. Secrets
-//! (`OPENAI_API_KEY`, R2 keys) are read from the environment only — never the
-//! config file.
+//! Connection settings resolve from explicit flags, environment variables, or
+//! the per-folder vault selected from the current working directory.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -26,6 +23,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Initialise or attach a vault using the current folder name, then mount it.
+    #[cfg(feature = "mount")]
+    Init {
+        /// Disable on-commit embedding for this mount.
+        #[arg(long)]
+        no_embed: bool,
+    },
+
     /// Validate every typed markdown file in a store against its type schema.
     Check {
         /// Path to the store (defaults to the current directory).
@@ -34,29 +39,6 @@ enum Command {
         /// Only print failures and the summary, not every passing file.
         #[arg(short, long)]
         quiet: bool,
-    },
-
-    /// Write ~/.config/trove/config.toml, then provision the backend: apply the
-    /// embedded SQL migration to the version DB and format the storage volume.
-    /// At a terminal this is a guided, interactive setup (prompts + secret
-    /// entry). With no TTY — i.e. an agent or script is driving it — it reads
-    /// every setting from the environment (TROVE_VERSIONS_DB, TROVE_R2_BUCKET,
-    /// R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, …) and either provisions straight
-    /// through or prints exactly which variables to set. Refuses to clobber
-    /// existing non-empty Trove tables or to re-format a volume against a
-    /// different bucket — use the safety flags to override. Secrets stay in the
-    /// environment, never the config file.
-    Install {
-        /// Accept existing Trove tables / a formatted volume; skip the create
-        /// steps. Use when re-running install against a backend you intend to keep.
-        #[arg(long)]
-        reuse: bool,
-        /// DROP existing Trove tables and reformat the storage volume.
-        /// DESTRUCTIVE — every destructive step still prompts for an explicit
-        /// `destroy` confirmation. Re-formatting against a new bucket orphans
-        /// the chunks under the old one; this flag is the only way through.
-        #[arg(long)]
-        reinstall: bool,
     },
 
     /// Read the bundled documentation. With no arguments it lists every page;
@@ -353,7 +335,12 @@ fn connect_versions(
     flag: Option<String>,
     cfg: &trove::config::Config,
 ) -> Result<trove::version::VersionStore> {
-    let url = trove::config::resolve(flag, "TROVE_VERSIONS_DB", cfg.versions_db.clone(), "versions DB URL")?;
+    let url = trove::config::resolve(
+        flag,
+        "TROVE_VERSIONS_DB",
+        cfg.versions_db.clone(),
+        "versions DB URL",
+    )?;
     trove::version::VersionStore::connect(&url, cfg.schema_name().as_deref())
 }
 
@@ -394,6 +381,45 @@ fn run() -> Result<usize> {
     #[cfg(feature = "mount")]
     let cfg = trove::config::Config::load();
     match cli.command {
+        #[cfg(feature = "mount")]
+        Command::Init { no_embed } => {
+            let init = trove::commands::init::run(trove::commands::init::InitOptions { no_embed })?;
+            let fs = trove::jfs::Fs::init(
+                &init.volume,
+                &trove::config::juicefs_meta_url(&init.meta, &init.schema),
+                &init.cache,
+            )?;
+            // The type registry travels *in* the vault (`<vault>/.types/`),
+            // versioned like any file. Read it through the volume (libjfs), not
+            // local disk — so attaching to an existing vault picks up its schemas
+            // (the local folder is empty until the mount surfaces the content).
+            let registry = trove::types::Registry::load_from_fs(&fs)?;
+            let versions = Some(trove::version::VersionStore::connect(
+                &init.versions_db,
+                Some(&init.schema),
+            )?);
+            let embed_tx = if !no_embed {
+                match openai_key() {
+                    Ok(key) => Some(trove::embed::spawn_embedder(
+                        &init.versions_db,
+                        key,
+                        Some(&init.schema),
+                    )?),
+                    Err(_) => {
+                        eprintln!(
+                            "{} OPENAI_API_KEY not set — embedding disabled for this mount",
+                            "warning:".yellow().bold()
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            trove::mount::mount_blocking(fs, registry, versions, embed_tx, &init.mountpoint)?;
+            Ok(0)
+        }
+
         Command::Check { store, quiet } => {
             let s = trove::commands::check::run(&store, quiet)?;
             // Schema count printed first so a `0 schemas` result is unmissable —
@@ -411,7 +437,12 @@ fn run() -> Result<usize> {
             Ok(s.failed)
         }
 
-        Command::Docs { page, all, serve, port } => {
+        Command::Docs {
+            page,
+            all,
+            serve,
+            port,
+        } => {
             if serve {
                 trove::commands::docs::serve(port)?;
             } else {
@@ -430,13 +461,17 @@ fn run() -> Result<usize> {
             Ok(0)
         }
 
-        Command::Install { reuse, reinstall } => {
-            trove::commands::install::run(trove::commands::install::InstallFlags { reuse, reinstall })?;
-            Ok(0)
-        }
-
         #[cfg(feature = "mount")]
-        Command::Mount { mountpoint, allow_non_empty, volume, meta, cache, types, versions_db, no_embed } => {
+        Command::Mount {
+            mountpoint,
+            allow_non_empty,
+            volume,
+            meta,
+            cache,
+            types,
+            versions_db,
+            no_embed,
+        } => {
             // FUSE overlays the mountpoint while mounted — any existing files
             // become invisible (recoverable on unmount, but alarming). Refuse
             // non-empty mountpoints by default; the `--allow-non-empty` escape
@@ -447,13 +482,7 @@ fn run() -> Result<usize> {
             let visible = std::fs::read_dir(&mountpoint)
                 .with_context(|| format!("opening mountpoint {}", mountpoint.display()))?
                 .filter_map(|e| e.ok())
-                .filter(|e| {
-                    e.file_name()
-                        .to_string_lossy()
-                        .chars()
-                        .next()
-                        != Some('.')
-                })
+                .filter(|e| e.file_name().to_string_lossy().chars().next() != Some('.'))
                 .count();
             if visible > 0 && !allow_non_empty {
                 anyhow::bail!(
@@ -466,18 +495,28 @@ fn run() -> Result<usize> {
                 );
             }
             let fs = init_fs(volume, meta, cache, &cfg)?;
+            // Prefer the vault's own `.types/` (schemas travel as vault content,
+            // read through the volume); an explicit `--types <dir>` still
+            // overrides for local/dev use.
             let registry = match &types {
                 Some(dir) => trove::types::Registry::load(dir)?,
-                None => trove::types::Registry::empty(),
+                None => trove::types::Registry::load_from_fs(&fs)?,
             };
             // Versioning is optional: resolve the URL without erroring (flag >
             // env > config); None anywhere = versioning off.
             let versions_url = versions_db
-                .or_else(|| std::env::var("TROVE_VERSIONS_DB").ok().filter(|s| !s.is_empty()))
+                .or_else(|| {
+                    std::env::var("TROVE_VERSIONS_DB")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                })
                 .or_else(|| cfg.versions_db.clone());
             let schema = cfg.schema_name();
             let versions = match &versions_url {
-                Some(url) => Some(trove::version::VersionStore::connect(url, schema.as_deref())?),
+                Some(url) => Some(trove::version::VersionStore::connect(
+                    url,
+                    schema.as_deref(),
+                )?),
                 None => None,
             };
             // On-commit embedding is ON by default whenever versioning is on.
@@ -486,9 +525,11 @@ fn run() -> Result<usize> {
             // for offline runs.
             let embed_tx = match (&versions_url, no_embed) {
                 (Some(url), false) => {
-                    let key = openai_key().map_err(|e| anyhow::anyhow!(
+                    let key = openai_key().map_err(|e| {
+                        anyhow::anyhow!(
                         "{e}. Set OPENAI_API_KEY, or pass --no-embed to mount without embedding."
-                    ))?;
+                    )
+                    })?;
                     Some(trove::embed::spawn_embedder(url, key, schema.as_deref())?)
                 }
                 _ => None,
@@ -500,7 +541,10 @@ fn run() -> Result<usize> {
                 if registry.is_empty() {
                     "no validation".to_string()
                 } else {
-                    format!("validating via {}", types.as_ref().unwrap().display())
+                    match &types {
+                        Some(dir) => format!("validating via {}", dir.display()),
+                        None => "validating via vault .types/".to_string(),
+                    }
                 },
                 if versions.is_some() { "on" } else { "off" },
                 if embed_tx.is_some() {
@@ -516,10 +560,25 @@ fn run() -> Result<usize> {
         }
 
         #[cfg(feature = "mount")]
-        Command::Import { path, types, volume, meta, cache, versions_db, no_embed, yes, force } => {
+        Command::Import {
+            path,
+            types,
+            volume,
+            meta,
+            cache,
+            versions_db,
+            no_embed,
+            yes,
+            force,
+        } => {
             use trove::commands::import::ImportOptions;
             trove::commands::import::run(
-                ImportOptions { path, types, yes, force },
+                ImportOptions {
+                    path,
+                    types,
+                    yes,
+                    force,
+                },
                 &cfg,
                 volume,
                 meta,
@@ -531,7 +590,14 @@ fn run() -> Result<usize> {
         }
 
         #[cfg(feature = "mount")]
-        Command::Embed { volume, meta, cache, versions_db, watch, remodel } => {
+        Command::Embed {
+            volume,
+            meta,
+            cache,
+            versions_db,
+            watch,
+            remodel,
+        } => {
             if remodel && watch.is_some() {
                 return Err(anyhow::anyhow!(
                     "--remodel and --watch are mutually exclusive — remodel is a one-shot migration"
@@ -542,13 +608,21 @@ fn run() -> Result<usize> {
             let mut versions = connect_versions(versions_db, &cfg)?;
             if remodel {
                 let n = trove::embed::run_remodel(&fs, &mut versions, &api_key)?;
-                println!("{} re-embedded {n} blob(s) for model upgrade", "trove:".bold());
+                println!(
+                    "{} re-embedded {n} blob(s) for model upgrade",
+                    "trove:".bold()
+                );
                 return Ok(0);
             }
             match watch {
                 Some(secs) => {
                     println!("{} embedding (watch, every {secs}s)…", "trove:".bold());
-                    trove::embed::run_watch(&fs, &mut versions, &api_key, std::time::Duration::from_secs(secs))?;
+                    trove::embed::run_watch(
+                        &fs,
+                        &mut versions,
+                        &api_key,
+                        std::time::Duration::from_secs(secs),
+                    )?;
                     Ok(0)
                 }
                 None => {
@@ -560,7 +634,11 @@ fn run() -> Result<usize> {
         }
 
         #[cfg(feature = "mount")]
-        Command::Search { query, versions_db, top_k } => {
+        Command::Search {
+            query,
+            versions_db,
+            top_k,
+        } => {
             let literal = trove::embed::embed_query_literal(&openai_key()?, &query)?;
             let mut versions = connect_versions(versions_db, &cfg)?;
             let hits = versions.search_chunks(&literal, top_k)?;
@@ -582,7 +660,13 @@ fn run() -> Result<usize> {
         }
 
         #[cfg(feature = "mount")]
-        Command::Server { port, volume, meta, cache, versions_db } => {
+        Command::Server {
+            port,
+            volume,
+            meta,
+            cache,
+            versions_db,
+        } => {
             let api_key = openai_key()?;
             let fs = init_fs(volume, meta, cache, &cfg)?;
             let mut versions = connect_versions(versions_db, &cfg)?;
@@ -591,8 +675,15 @@ fn run() -> Result<usize> {
         }
 
         #[cfg(feature = "mount")]
-        Command::Doctor { versions_db, volume, meta, cache, store } => {
-            let checks = trove::commands::doctor::run(&cfg, versions_db, volume, meta, cache, store);
+        Command::Doctor {
+            versions_db,
+            volume,
+            meta,
+            cache,
+            store,
+        } => {
+            let checks =
+                trove::commands::doctor::run(&cfg, versions_db, volume, meta, cache, store);
             let failed = checks.iter().filter(|c| !c.ok).count();
             println!("{}", "trove doctor".bold());
 
@@ -608,8 +699,12 @@ fn run() -> Result<usize> {
             }
             for section in sections_in_order {
                 let rows: Vec<_> = checks.iter().filter(|c| c.section == section).collect();
-                if rows.is_empty() { continue; }
-                if !printed_sections.is_empty() { println!(); }
+                if rows.is_empty() {
+                    continue;
+                }
+                if !printed_sections.is_empty() {
+                    println!();
+                }
                 println!("  {}", section.bold());
                 for c in rows {
                     let mark = if c.ok { "✓".green() } else { "✗".red() };
@@ -627,7 +722,12 @@ fn run() -> Result<usize> {
         }
 
         #[cfg(feature = "mount")]
-        Command::Usage { volume, meta, cache, versions_db } => {
+        Command::Usage {
+            volume,
+            meta,
+            cache,
+            versions_db,
+        } => {
             let fs = init_fs(volume, meta, cache, &cfg)?;
             let mut versions = connect_versions(versions_db, &cfg)?;
             let report = trove::commands::usage::run(&fs, &mut versions)?;
@@ -643,7 +743,12 @@ fn run() -> Result<usize> {
                 println!("{} no versions for {path}", "trove:".bold());
                 return Ok(0);
             }
-            println!("{} {} ({} revision(s))", "trove:".bold(), path, entries.len());
+            println!(
+                "{} {} ({} revision(s))",
+                "trove:".bold(),
+                path,
+                entries.len()
+            );
             for v in &entries {
                 let author = v.author.as_deref().unwrap_or("—");
                 println!(
@@ -659,7 +764,14 @@ fn run() -> Result<usize> {
         }
 
         #[cfg(feature = "mount")]
-        Command::Cat { path, rev, volume, meta, cache, versions_db } => {
+        Command::Cat {
+            path,
+            rev,
+            volume,
+            meta,
+            cache,
+            versions_db,
+        } => {
             use std::io::Write;
             let fs = init_fs(volume, meta, cache, &cfg)?;
             let mut versions = connect_versions(versions_db, &cfg)?;
@@ -669,7 +781,15 @@ fn run() -> Result<usize> {
         }
 
         #[cfg(feature = "mount")]
-        Command::Diff { path, rev_a, rev_b, volume, meta, cache, versions_db } => {
+        Command::Diff {
+            path,
+            rev_a,
+            rev_b,
+            volume,
+            meta,
+            cache,
+            versions_db,
+        } => {
             let fs = init_fs(volume, meta, cache, &cfg)?;
             let mut versions = connect_versions(versions_db, &cfg)?;
             let out = trove::commands::history::diff(&fs, &mut versions, &path, rev_a, rev_b)?;
@@ -678,24 +798,43 @@ fn run() -> Result<usize> {
         }
 
         #[cfg(feature = "mount")]
-        Command::Backup { dest, layout, dry_run, volume, meta, cache, versions_db } => {
+        Command::Backup {
+            dest,
+            layout,
+            dry_run,
+            volume,
+            meta,
+            cache,
+            versions_db,
+        } => {
             use trove::commands::backup::{self, BackupOptions, Layout};
             let layout = Layout::parse(&layout)?;
             // Flag > config — backup_dir is purely optional, so failing-fast
             // here is cleaner than the `resolve` helper (no env var pairing).
             let dest = dest
                 .or_else(|| cfg.backup_dir.as_deref().map(PathBuf::from))
-                .ok_or_else(|| anyhow::anyhow!(
-                    "no backup destination — pass --dest <dir>, or set `backup_dir` in ~/.config/trove/config.toml (run `trove install`)"
-                ))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no backup destination — pass --dest <dir>, or set `backup_dir` in config"
+                    )
+                })?;
             let fs = init_fs(volume, meta, cache, &cfg)?;
             let mut versions = connect_versions(versions_db, &cfg)?;
             let report = backup::run(
                 &fs,
                 &mut versions,
-                &BackupOptions { dest: dest.clone(), layout, since: None, dry_run },
+                &BackupOptions {
+                    dest: dest.clone(),
+                    layout,
+                    since: None,
+                    dry_run,
+                },
             )?;
-            let prefix = if dry_run { "trove backup (dry-run):" } else { "trove backup:" };
+            let prefix = if dry_run {
+                "trove backup (dry-run):"
+            } else {
+                "trove backup:"
+            };
             println!(
                 "{} {} path(s) walked \u{2192} {}; {} rev(s) written ({}), {} unchanged",
                 prefix.bold(),
@@ -714,7 +853,14 @@ fn run() -> Result<usize> {
         }
 
         #[cfg(feature = "mount")]
-        Command::Restore { path, rev, volume, meta, cache, versions_db } => {
+        Command::Restore {
+            path,
+            rev,
+            volume,
+            meta,
+            cache,
+            versions_db,
+        } => {
             let fs = init_fs(volume, meta, cache, &cfg)?;
             let mut versions = connect_versions(versions_db, &cfg)?;
             let new_rev = trove::commands::history::restore(&fs, &mut versions, &path, rev)?;

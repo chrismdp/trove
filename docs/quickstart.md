@@ -59,10 +59,9 @@ Optional fourth: `OPENAI_API_KEY` for semantic search. Without it, pass
 `--no-embed` to `trove mount` and you'll still get validation + version
 history.
 
-Don't have a Postgres database or a bucket yet? You can provision both in
-one go with [Stripe Projects](/docs/stripe-projects) (optional) instead of
-clicking through provider dashboards — then come back here for
-`trove install`.
+Don't have a Postgres database or a bucket yet? Create a Postgres database and
+create the R2 bucket named for your folder (`trove-<folder-name>`), then run
+`trove init` from that folder.
 
 ## Just the validator (no native deps, no Postgres)
 
@@ -129,45 +128,36 @@ path glob, applied to YAML frontmatter. The rest of the system builds the
 
 ## The full substrate (mount + history + search)
 
-With the three secrets above exported:
+With the DB URL and R2 credentials available, create or enter the folder that
+will be the vault. The folder name is the vault name:
 
 ```bash
-# 1. Write config + provision the backend (one-time).
-trove install
-#    → at a terminal: a guided setup — prompts for the Postgres URL, bucket
-#      endpoint, volume name and vault path, and reads any missing secrets
-#      (R2 keys, OpenAI key) without echoing them
-#    → no TTY (an agent/script): reads everything from the environment
-#      (TROVE_VERSIONS_DB, TROVE_R2_BUCKET, R2_ACCESS_KEY_ID,
-#      R2_SECRET_ACCESS_KEY) and provisions with no prompts — or prints
-#      exactly which variables to set if something's missing
-#    → writes ~/.config/trove/config.toml
-#    → applies the embedded SQL migration (blobs, file_versions, blob_chunks, pgvector)
-#    → formats the storage volume on your bucket
+mkdir notes
+cd notes
+
+# Create bucket `trove-notes` in R2 first, then:
+trove init
+#    → derives schema `trove_notes` and bucket `trove-notes`
+#    → validates the bucket exists and whether it is empty/non-empty
+#    → creates or attaches the matching Postgres schema
+#    → writes ~/.config/trove/credentials.toml and ~/.config/trove/volumes/notes.toml
+#    → mounts this folder as the live vault
 ```
 
-`trove install` runs the migration and formats the volume automatically;
-safety flags `--reuse` / `--reinstall` cover non-empty DBs (the default
-refuses to clobber existing Trove data, and refuses to re-format a
-volume against a different bucket — that would orphan its chunks).
-
-`trove install` is idempotent, so if it fails partway — a flaky DB
-connection, a missing key — fix the cause and run it again; it skips the
-steps that already succeeded (`--reuse` to keep an existing populated DB
-or volume). The volume is formatted in-process, so there's no separate
-tool to run — re-running `trove install` is how you retry that step. If
-you'd rather apply the schema migration by hand, it's a single file:
+If the schema and a non-empty bucket already exist, `trove init` attaches this
+machine to that vault. If the bucket is missing, create it in R2 and re-run. If
+only one side exists, Trove stops with a conflict error so you can rename the
+folder or clear the stray resource. If you'd rather apply the schema migration
+by hand, it's a single file:
 
 ```bash
 psql "$TROVE_VERSIONS_DB" -f supabase/migrations/*_init_version_chain_and_embeddings.sql
 ```
 
-**Preflight + mount**:
+**Preflight**:
 
 ```bash
 trove doctor                            # all green?
-mkdir -p /mnt/trove
-trove mount /mnt/trove --types ./my-store
 ```
 
 Got an existing vault you want trove to manage? Use `trove import
@@ -182,29 +172,33 @@ echo '---
 type: person
 name: Bob
 dob: "1985-03-20"
----' > /mnt/trove/people/bob.md
+---' > people/bob.md
 
 trove log /people/bob.md                # version history
 trove search "people born in March"     # semantic search
 ```
 
-## What `trove install` writes
+## What `trove init` writes
 
-`~/.config/trove/config.toml`:
+Shared machine credentials in `~/.config/trove/credentials.toml`:
 
 ```toml
 versions_db = "postgres://user:pass@host:5432/dbname"
-volume      = "notes"
-meta        = "postgres://user:pass@host:5432/dbname"   # same as versions_db
-cache       = "/tmp/trove-cache"
-r2_bucket   = "https://<bucket>.<acct>.r2.cloudflarestorage.com"
-store       = "/home/you/vault"
-schema      = "trove_notes"   # derived from the volume name
+r2_endpoint = "https://<acct>.r2.cloudflarestorage.com"
 ```
 
-**Secrets are NOT in this file.** `R2_ACCESS_KEY_ID`,
-`R2_SECRET_ACCESS_KEY`, and `OPENAI_API_KEY` stay in the environment (or
-your `.envrc` / `1password run`).
+Per-volume config in `~/.config/trove/volumes/notes.toml`:
+
+```toml
+bucket     = "https://<acct>.r2.cloudflarestorage.com/trove-notes"
+schema     = "trove_notes"
+mountpoint = "/home/you/notes"
+cache      = "/tmp/trove-cache"
+```
+
+`OPENAI_API_KEY` stays in the environment. R2 keys are read from the environment
+first and may be saved in the shared credentials file for local operator
+convenience.
 
 ### One database, many volumes — and nothing in `public`
 
@@ -222,7 +216,7 @@ derived from the volume name), not in `public`. Two consequences:
   trove reads and writes.) To confirm, hit `…/rest/v1/blobs` with your anon
   key: it should 404.
 
-The `vector` extension is database-global, so `trove install` creates it
+The `vector` extension is database-global, so `trove init` creates it
 once in a shared location, not inside a volume's schema.
 
 ## Next

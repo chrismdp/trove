@@ -48,7 +48,9 @@ impl VersionStore {
             // any quote defensively before interpolating.
             let ident = s.replace('"', "\"\"");
             client
-                .batch_execute(&format!("set search_path to \"{ident}\", public, extensions"))
+                .batch_execute(&format!(
+                    "set search_path to \"{ident}\", public, extensions"
+                ))
                 .with_context(|| format!("setting search_path to schema {s}"))?;
         }
         Ok(Self { client })
@@ -86,7 +88,11 @@ impl VersionStore {
                 &[&path],
             )?
             .get(0);
-        let (rev, parent) = if head == 0 { (1, None) } else { (head + 1, Some(head)) };
+        let (rev, parent) = if head == 0 {
+            (1, None)
+        } else {
+            (head + 1, Some(head))
+        };
         tx.execute(
             "insert into file_versions (path, rev, blob_hash, parent_rev, author, size) \
              values ($1, $2, $3, $4, $5, $6)",
@@ -238,7 +244,7 @@ impl VersionStore {
                 .get(0);
             if !present {
                 anyhow::bail!(
-                    "schema not migrated — table `{table}` is missing. Run `trove install`."
+                    "schema not migrated — table `{table}` is missing. Run `trove init` in the vault folder."
                 );
             }
         }
@@ -302,7 +308,10 @@ impl VersionStore {
         rows: &[ChunkInsert],
     ) -> Result<()> {
         let mut tx = self.client.transaction()?;
-        tx.execute("delete from blob_chunks where blob_hash = $1", &[&blob_hash])?;
+        tx.execute(
+            "delete from blob_chunks where blob_hash = $1",
+            &[&blob_hash],
+        )?;
         for r in rows {
             tx.execute(
                 // `$6::text::vector`: bind the param as text (so the driver
@@ -312,7 +321,15 @@ impl VersionStore {
                 "insert into blob_chunks \
                  (blob_hash, ordinal, heading, start_byte, end_byte, embedding, embedding_model) \
                  values ($1, $2, $3, $4, $5, $6::text::vector, $7)",
-                &[&blob_hash, &r.ordinal, &r.heading, &r.start_byte, &r.end_byte, &r.embedding, &model],
+                &[
+                    &blob_hash,
+                    &r.ordinal,
+                    &r.heading,
+                    &r.start_byte,
+                    &r.end_byte,
+                    &r.embedding,
+                    &model,
+                ],
             )?;
         }
         tx.commit()?;

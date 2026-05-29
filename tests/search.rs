@@ -76,7 +76,7 @@ fn ranks_nearest_chunk_first_and_resolves_the_path() {
     seed(&mut s, &path_far, &format!("boats {tag}"), "Boats", &vec_literal(&[0.0, 1.0]));
 
     // Query mostly along dim 0 -> NEAR should win.
-    let hits = s.search_chunks(&vec_literal(&[0.9, 0.1]), 20).unwrap();
+    let hits = s.search_chunks(&vec_literal(&[0.9, 0.1]), 1000).unwrap();
 
     let pos = |p: &str| hits.iter().position(|h| h.path == p);
     let (np, fp) = (pos(&path_near), pos(&path_far));

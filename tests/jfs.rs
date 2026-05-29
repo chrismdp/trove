@@ -2,7 +2,7 @@
 //! (SQLite metadata + local-file object store — fast, isolated; R2 is proven
 //! separately) and drives it through the safe wrapper. Requires the built
 //! `libjfs`; run with `--features mount`. No `juicefs` binary needed — format
-//! goes through the `jfs_format` FFI entry the same way `trove install` does.
+//! goes through the `jfs_format` FFI entry the same way `trove init` does.
 #![cfg(feature = "mount")]
 
 use std::path::PathBuf;
@@ -63,7 +63,7 @@ fn init_opens_a_formatted_volume() {
 #[test]
 fn jfs_format_ffi_creates_volume_that_can_be_opened() {
     // Targeted test for the `jfs_format` FFI entry (the one that replaced the
-    // `juicefs` CLI shell-out in `trove install`). Asserts the round-trip:
+    // `juicefs` CLI shell-out in `trove init`). Asserts the round-trip:
     // format → open. If libjfs ever stops accepting our JSON shape, or the
     // newly-created volume can't be opened, this fails loudly.
     use std::sync::atomic::{AtomicU64, Ordering};

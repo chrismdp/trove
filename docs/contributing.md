@@ -9,8 +9,8 @@ cargo build                         # native-dep-free core
 cargo build --features mount        # full substrate (libjfs + FUSE + Postgres + OpenAI)
 ```
 
-The default build produces a binary that runs `trove check`, `trove
-install`, and `trove docs`. The `mount` feature adds `mount`, `embed`,
+The default build produces a binary that runs `trove check` and `trove docs`.
+The `mount` feature adds `init`, `mount`, `embed`,
 `search`, `server`, `doctor`, and the history commands (`log`, `cat`,
 `diff`, `restore`).
 
@@ -91,7 +91,7 @@ See [Troubleshooting](/docs/troubleshooting) for CI tips.
 |---|---|
 | `src/main.rs` | Thin CLI shell. No logic; everything calls into `lib`. |
 | `src/lib.rs` | Module declarations. |
-| `src/config.rs` | `~/.config/trove/config.toml`; resolve(flag > env > config). |
+| `src/config.rs` | Shared credentials, per-volume config, and cwd vault resolution. |
 | `src/frontmatter.rs` | YAML frontmatter parser. |
 | `src/types.rs` | Schema registry, glob selection. |
 | `src/validate.rs` | JSON Schema runner. |

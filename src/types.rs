@@ -28,6 +28,48 @@ impl TypeSchema {
     }
 }
 
+/// Parse one JSON-Schema file into a [`TypeSchema`]. Shared by the disk loader
+/// ([`Registry::load`]) and the FUSE-projection loader ([`Registry::load_from_fs`])
+/// so both interpret `globs` and the pinned type const identically. `src_label`
+/// names the source in error messages.
+fn parse_schema(name: String, raw: &str, src_label: &str) -> Result<TypeSchema> {
+    let schema: serde_json::Value =
+        serde_json::from_str(raw).with_context(|| format!("parsing schema {src_label}"))?;
+
+    // Extract glob patterns (top-level "globs": ["...", ...]).
+    let mut builder = GlobSetBuilder::new();
+    let mut has_globs = false;
+    if let Some(arr) = schema.get("globs").and_then(|g| g.as_array()) {
+        for g in arr {
+            if let Some(pat) = g.as_str() {
+                // literal_separator(true): `*` does not cross `/`, so `*.md` is
+                // root-only and `**` is needed to descend.
+                let glob = GlobBuilder::new(pat)
+                    .literal_separator(true)
+                    .build()
+                    .with_context(|| format!("invalid glob {pat:?} in {src_label}"))?;
+                builder.add(glob);
+                has_globs = true;
+            }
+        }
+    }
+    let globs = builder.build().context("building glob set")?;
+
+    // Extract the pinned type const, if the schema declares one.
+    let type_const = schema
+        .pointer("/properties/type/const")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    Ok(TypeSchema {
+        name,
+        schema,
+        type_const,
+        globs,
+        has_globs,
+    })
+}
+
 pub struct Registry {
     schemas: Vec<TypeSchema>,
 }
@@ -56,43 +98,42 @@ impl Registry {
                 .to_string();
             let raw = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading schema {}", path.display()))?;
-            let schema: serde_json::Value = serde_json::from_str(&raw)
-                .with_context(|| format!("parsing schema {}", path.display()))?;
+            schemas.push(parse_schema(name, &raw, &path.display().to_string())?);
+        }
+        Ok(Self { schemas })
+    }
 
-            // Extract glob patterns (top-level "globs": ["...", ...]).
-            let mut builder = GlobSetBuilder::new();
-            let mut has_globs = false;
-            if let Some(arr) = schema.get("globs").and_then(|g| g.as_array()) {
-                for g in arr {
-                    if let Some(pat) = g.as_str() {
-                        // literal_separator(true): `*` does not cross `/`, so
-                        // `*.md` is root-only and `**` is needed to descend.
-                        let glob = GlobBuilder::new(pat)
-                            .literal_separator(true)
-                            .build()
-                            .with_context(|| {
-                                format!("invalid glob {pat:?} in {}", path.display())
-                            })?;
-                        builder.add(glob);
-                        has_globs = true;
-                    }
-                }
-            }
-            let globs = builder.build().context("building glob set")?;
-
-            // Extract the pinned type const, if the schema declares one.
-            let type_const = schema
-                .pointer("/properties/type/const")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
-            schemas.push(TypeSchema {
-                name,
-                schema,
-                type_const,
-                globs,
-                has_globs,
-            });
+    /// Load `.types/*.json` **through the volume** (libjfs), not local disk.
+    /// Under the per-folder-vaults model the type registry is vault content
+    /// (`<vault>/.types/`, versioned like any file): the mount reads it at
+    /// startup to build the validation gate, so attaching to an existing vault
+    /// on a second machine picks up its schemas without any local copy. A vault
+    /// with no `.types/` directory (a fresh one) yields an empty registry —
+    /// pass-through until schemas are written in.
+    #[cfg(feature = "mount")]
+    pub fn load_from_fs(fs: &crate::jfs::Fs) -> Result<Self> {
+        let mut schemas = Vec::new();
+        if !fs.exists("/.types") {
+            return Ok(Self { schemas });
+        }
+        let mut entries: Vec<String> = fs
+            .readdir("/.types")
+            .context("reading /.types/ from the vault")?
+            .into_iter()
+            .filter(|e| !e.is_dir())
+            .map(|e| e.name)
+            .filter(|n| n.ends_with(".json"))
+            .collect();
+        entries.sort();
+        for file in entries {
+            let path = format!("/.types/{file}");
+            let bytes = fs
+                .read_all(&path)
+                .with_context(|| format!("reading schema {path}"))?;
+            let raw = String::from_utf8(bytes)
+                .with_context(|| format!("schema {path} is not valid UTF-8"))?;
+            let name = file.strip_suffix(".json").unwrap_or(&file).to_string();
+            schemas.push(parse_schema(name, &raw, &path)?);
         }
         Ok(Self { schemas })
     }

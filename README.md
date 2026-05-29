@@ -41,10 +41,18 @@ trove docs --all           # print the whole manual (handy to pipe to an agent)
 trove docs --serve         # browser UI at http://127.0.0.1:38081
 ```
 
-`trove install` is the one-time setup. At a terminal it's a guided,
-interactive flow (prompts + no-echo secret entry); with no TTY it reads
-everything from the environment and either provisions straight through or
-prints exactly which variables to set — so an agent can run it unattended.
+`trove init` is the setup path. Create or enter an empty folder, make the
+matching R2 bucket (`trove-<folder-name>`), then run:
+
+```sh
+cd notes
+trove init
+```
+
+Trove derives the schema and bucket from the folder name, writes shared
+credentials under `~/.config/trove/credentials.toml`, writes per-volume config
+under `~/.config/trove/volumes/`, provisions or attaches the backend, and mounts
+the vault at the current directory.
 
 ## Status — v0.1 (single-tenant)
 
@@ -77,6 +85,7 @@ a schema is how you migrate; writes self-heal lazily as records are touched.
 ## Commands
 
 - **`trove check <store>`** — schema-on-write validation. ✅
+- **`trove init`** — initialise or attach the current folder as a vault. ✅
 - **`trove mount <mnt> --volume … --meta … [--types …] [--versions-db …] [--embed]`**
   — the FUSE projection. The validation gate runs on the write path (a
   schema-violating `fsync` returns `EINVAL` + a `.errors` sidecar); `--versions-db`

@@ -1,9 +1,13 @@
 pub mod check;
 
-/// `trove install` — interactive setup. Writes the config file, applies the
-/// embedded SQL migration, and formats the JuiceFS volume. Pure decision logic
-/// lives in [`install::plan`] for unit-test coverage of the state machine.
-pub mod install;
+/// Internal provisioning helpers shared by `trove init`. Pure decision logic
+/// lives in [`provision::plan`] for unit-test coverage of the state machine.
+#[cfg(feature = "mount")]
+pub mod provision;
+
+/// `trove init` — initialise or attach the vault described by the current folder.
+#[cfg(feature = "mount")]
+pub mod init;
 
 /// `trove docs` — embedded walkthrough served on localhost. No native deps,
 /// so it's available in the core build (not gated on `mount`).

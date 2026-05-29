@@ -15,43 +15,39 @@ versions, embeddings.
   [Packaging](/docs/packaging)).
 - **OPENAI_API_KEY** (or `--no-embed`).
 
-## Step 1: configuration
+## Step 1: initialise the folder vault
 
 ```bash
-trove install
+mkdir notes
+cd notes
+trove init
 ```
 
-This walks you through `~/.config/trove/config.toml`. Non-secret settings
-(volume name, meta URL, cache path, R2 bucket name) live here so you
-don't have to pass flags every time. **Secrets stay in the environment**
-— never the config file.
+Create the R2 bucket first. For a folder named `notes`, the bucket is
+`trove-notes` and the Postgres schema is `trove_notes`. `trove init` validates
+the bucket, creates or attaches the schema, formats the storage volume if this
+is a new vault, writes local config, then mounts the current folder.
 
 You'll be asked for:
 
 - `versions_db` — the Postgres URL (e.g.
   `postgres://postgres:postgres@127.0.0.1:54322/postgres`)
-- `volume` — the storage volume name
-- `meta` — usually the same as `versions_db`
-- `cache` — local block-cache directory (default `/tmp/trove-cache`)
-- `r2_bucket` — for `trove doctor`'s reference
+- `R2 endpoint` — e.g. `https://<account>.r2.cloudflarestorage.com`
+- `R2_ACCESS_KEY_ID`
+- `R2_SECRET_ACCESS_KEY`
+
+Shared credentials live in `~/.config/trove/credentials.toml`; per-volume
+settings live under `~/.config/trove/volumes/`.
 
 ## Steps 2 + 3: migration and volume setup
 
-**`trove install` does this for you** — it applies the embedded SQL
+**`trove init` does this for you** — it applies the embedded SQL
 migration (`blobs`, `file_versions`, `blob_chunks`, pgvector, HNSW
 index) and formats the storage volume on your bucket in the same run.
-Safety flags:
 
-- `--reuse` — accept an existing populated Trove DB / formatted volume.
-  Use when re-running install against a backend you intend to keep.
-- `--reinstall` — DROP existing Trove tables and reformat the volume.
-  Destructive — every step prompts for an explicit `destroy`
-  confirmation, and re-formatting against a new bucket (which would
-  orphan the chunks under the old one) requires this flag.
-
-`trove install` is idempotent — if it fails partway, fix the cause and
-run it again. The volume is formatted in-process, so there's no separate
-tool to run. If you'd rather apply the schema migration by hand:
+If the schema and bucket already exist, `trove init` attaches to that vault. If
+only one side exists, it stops with a conflict error rather than guessing. If
+you'd rather apply the schema migration by hand:
 
 ```bash
 psql "$VERSIONS_DB" -f supabase/migrations/<timestamp>_init_version_chain_and_embeddings.sql
@@ -140,18 +136,17 @@ confirmation in scripts.
 ## Step 5: mount
 
 ```bash
-mkdir -p /mnt/trove
-trove mount /mnt/trove --types ~/vault
+trove init
 ```
 
-That's the full command. Everything else (volume, meta, versions_db,
-cache) comes from `~/.config/trove/config.toml`. Embedding is **on by
-default** (set `--no-embed` to skip).
+For normal use, `trove init` is the mount command: run it inside the vault
+folder. Other commands resolve the active vault from the current working
+directory. Embedding is **on by default** (set `--no-embed` to skip).
 
 You'll see:
 
 ```
-trove: mounting at /mnt/trove (validating via /home/you/vault; versioning on; embed on)
+trove init: mounting `notes` at /home/you/notes
 ```
 
 The process is foreground; Ctrl-C unmounts. (Or detach with `nohup` /
@@ -162,9 +157,9 @@ The process is foreground; Ctrl-C unmounts. (Or detach with `nohup` /
 In another shell:
 
 ```bash
-ls /mnt/trove                                  # empty volume
-mkdir -p /mnt/trove/people
-cat > /mnt/trove/people/alice.md <<EOF
+ls                                           # empty volume
+mkdir -p people
+cat > people/alice.md <<EOF
 ---
 type: person
 name: Alice
@@ -179,9 +174,9 @@ If the file matches the schema, the write succeeds silently. If it
 doesn't:
 
 ```bash
-echo "garbage" > /mnt/trove/people/bob.md
+echo "garbage" > people/bob.md
 # bash: echo: write error: Invalid argument
-cat /mnt/trove/people/bob.md.errors
+cat people/bob.md.errors
 # (root): "type" is a required property
 ```
 
