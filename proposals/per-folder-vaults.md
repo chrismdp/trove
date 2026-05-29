@@ -1,8 +1,7 @@
 # Proposal: per-folder vaults (`trove init` / `trove clone`)
 
-Status: **settled bar one call** (R2 bucket-create permission — see Open) ·
-supersedes the global-config / `trove install` / `trove clone` model · no
-migration path (no users yet)
+Status: **settled — ready to build** · supersedes the global-config / `trove
+install` / `trove clone` model · no migration path (no users yet)
 
 ## Problem
 
@@ -39,46 +38,43 @@ cd notes && trove init     # adopt the existing "notes" vault, or create it
 1. Resolve the **DB URL** and **R2 creds** — from the shared cred store / env if
    present, else prompt (and save them shared).
 2. Probe: does schema `trove_<name>` exist (a valid trove vault) **and** does
-   bucket `trove-<name>` exist?
-   - **Both present & consistent** → it's an existing vault. *"Found vault
-     `notes` — attach to it? [Y/n]"*. Confirm → mount. (This is the old
-     `clone`, folded in — fast on a second machine: same folder name + creds,
-     one confirm.)
-   - **Neither present** → new vault. **trove creates the bucket** (`trove-<name>`)
-     and the schema itself, formats, mounts.
-   - **One present, not the other / mismatch** → conflict. Plain error: e.g.
-     *"bucket `trove-notes` already exists but isn't a trove vault — use a
-     different folder name, or remove it."*
+   bucket `trove-<name>` exist (the user must have created it — trove doesn't)?
+   - **Schema + non-empty bucket, consistent** → existing vault. *"Found vault
+     `notes` — attach to it? [Y/n]"* → mount. (The old `clone`, folded in — fast
+     on a second machine: same folder name + creds, one confirm.)
+   - **Empty bucket, no schema** → new vault. Create the schema, migrate, format,
+     mount. (trove does **not** create the bucket — see below.)
+   - **Bucket missing** → *"create bucket `trove-notes` in your R2 dashboard
+     (trove uses the whole bucket), then re-run."*
+   - **Other mismatch** (schema without bucket, non-empty bucket without schema)
+     → conflict error: rename the folder, or clear the stray resource.
 
 The content is a **live FUSE projection** (decision (P)) mounted at the cwd; the
 folder *is* the vault. Other commands (`search`, `log`, `doctor`, `embed`,
 `backup`) resolve the vault from the cwd. `trove install` and `trove clone` are
 both removed.
 
-### Three things this assumes (settle these)
+### Decided: trove validates the bucket, the user creates it
 
-1. **trove creates the bucket → the R2 token needs bucket-create permission.**
-   A typical "Object Read & Write" R2 token *can't* create buckets — that's an
-   Admin-scope operation. So either the walkthrough requires an admin-scoped
-   token, or trove detects the permission failure and falls back to *"couldn't
-   create `trove-notes` — create it yourself and re-run."* **Decide which.**
-2. **trove now needs an S3 admin client** (sigv4) to HeadBucket / CreateBucket /
-   ListObjects. Today trove only touches storage *through* libjfs (which neither
-   creates nor lists buckets). This is a new component — and it's also what your
-   "validate the bucket is present and empty" check requires, so we need it
-   regardless.
-3. **The R2 endpoint/account is a shared input.** To form & create
-   `<endpoint>/trove-<name>` trove needs the account endpoint
-   (`https://<account>.r2.cloudflarestorage.com`) — provided once with the R2
-   creds, not per-vault. (We can't derive the account id from the access key.)
+- **trove does not create buckets.** The user creates `trove-<name>` once in the
+  dashboard. This keeps the R2 token at plain **Object Read & Write** (no admin
+  scope) and means trove's S3 client only needs **HeadBucket / ListObjects**
+  (existence + empty/non-empty), never `CreateBucket`. trove still *needs* that
+  read-only S3 client (libjfs neither lists nor creates buckets) — it's what the
+  present/empty validation requires.
+- **The R2 endpoint is a shared input** — `https://<account>.r2.cloudflarestorage.com`,
+  given once with the creds (we can't derive the account id from the access
+  key). trove appends `trove-<name>`.
 
-### Naming consequence
+### Name normalization (decided)
 
-`trove_<name>` (schema) and `trove-<name>` (bucket) aren't byte-identical — `_`
-is illegal in S3 bucket names, `-` is awkward in unquoted SQL identifiers — so
-each is derived from the folder with its own separator. The folder name is
-therefore validated to a clean lowercase token (`[a-z0-9-]`, no leading/trailing
-separator) so *both* derivations are valid; rejected and re-prompted otherwise.
+S3 buckets allow only `-`; Postgres schemas effectively allow only `_` (a `-`
+needs the identifier quoted everywhere). So instead of restricting the input,
+**normalize**: treat `-`/`_`/case as one word-break in the volume name, then emit
+each target's native separator — bucket `trove-<name>` (`-`), schema
+`trove_<name>` (`_`). Folder `my-notes` *and* `my_notes` both work and resolve to
+the same vault (deterministic, so attach matches). Reject only genuinely-invalid
+characters (spaces, dots, other punctuation) with a re-prompt.
 
 ## Decision (P): live FUSE projection, not a git working copy
 
@@ -201,50 +197,47 @@ the shipped `postgresql://` → `postgres://` scheme fix):
 
 ## Volume-name handling — validate, don't silently transform
 
-At the prompt, require a clean identifier (`[a-z0-9-]`). Anything else (spaces,
-capitals, punctuation) is **rejected and re-prompted** with the reason — no
-silent sanitizing. Echo the resulting schema inline (`→ metadata schema:
-trove_notes`). `trove` is a **valid** name; the `trove → trove_default`
-special-case is dropped.
+At the prompt, **normalize** rather than restrict (see *Name normalization*):
+`-`/`_`/case are one word-break; reject only genuinely-invalid characters
+(spaces, dots, other punctuation) with a re-prompt. Echo both derived names
+inline (`→ schema trove_notes · bucket trove-notes`). `trove` is a **valid**
+name; the `trove → trove_default` special-case is dropped.
 
 ## Unchanged substrate
 
 Untouched: per-volume schema isolation, the embedded migration, `vector` in a
 shared schema, and the validate → COW-version → embed write pipeline. The new
-surface is a config/UX skin over the plumbing validated on v0.2.x, **plus** an
-S3 admin client (new — see below).
+surface is a config/UX skin over the plumbing validated on v0.2.x, **plus** a
+read-only S3 client (new — for bucket validation).
 
 ## All decisions settled
 
 1. Live FUSE projection (P), not a working copy (W).
 2. **One command, `trove init`**, run inside a folder: derives names from the
-   folder, probes the backend, and attaches to an existing vault or creates a
-   new one. `trove install` and `trove clone` both removed.
-3. Names derived from the folder: schema `trove_<name>` (`_`), bucket
-   `trove-<name>` (`-`); folder name validated to satisfy both. trove **creates
-   the bucket** for a new vault.
-4. Local state split: **shared** creds (`~/.config/trove/credentials.toml` / env,
+   folder, probes the backend, attaches to an existing vault or creates a new
+   one. `trove install` and `trove clone` both removed.
+3. Names derived from the folder, separators normalized: schema `trove_<name>`
+   (`_`), bucket `trove-<name>` (`-`); `my-notes` and `my_notes` resolve alike.
+4. **The user creates the bucket; trove only validates it** (present + empty/
+   non-empty). Keeps the R2 token at Object R/W; S3 client is HeadBucket /
+   ListObjects only, no `CreateBucket`.
+5. Local state split: **shared** creds (`~/.config/trove/credentials.toml` / env,
    incl. the R2 endpoint) + **per-volume** config
    (`~/.config/trove/volumes/<name>.toml`); never synced; schemas travel as vault
    content; secrets never co-located in the backend. One DB + one R2 cred → many
    volumes.
-5. Minimal inputs (DB URL, R2 creds + endpoint, all shared); validate each at
+6. Minimal inputs (DB URL, R2 creds + endpoint, all shared); validate each at
    entry; mount implicitly at the cwd.
-6. Volume names validated (reject non-clean; `trove` allowed; no `trove_default`).
-
-## Open (need a call)
-
-- **R2 bucket-create permission:** require an admin-scoped token, or detect the
-  failure and fall back to "create `trove-<name>` yourself and re-run"? (See the
-  three assumptions under *The model*.)
+7. Volume names normalized/validated; `trove` allowed; no `trove_default`.
 
 ## Build order (suggested)
 
-1. **S3 admin client** (sigv4): HeadBucket / CreateBucket / ListObjects — needed
-   for bucket create + the present/empty validation. New component.
+1. **Read-only S3 client** (sigv4): HeadBucket / ListObjects — for the
+   present/empty bucket validation. New component (libjfs can't list buckets).
 2. Config refactor: shared creds + per-volume config; resolve the vault from the
    cwd; remove the global `config.toml`.
-3. `trove init` — folder-name validation → resolve+validate creds → probe →
-   attach-or-create (create bucket + schema + migrate + format) → mount at cwd.
+3. `trove init` — folder-name normalize/validate → resolve+validate creds →
+   probe (schema × bucket) → attach-or-create (create schema + migrate + format;
+   bucket must pre-exist) → mount at cwd.
 4. Move the type registry to `<vault>/.types/` as vault content; load at mount.
 5. Retire `trove install` / `trove clone`; rewrite the docs.
