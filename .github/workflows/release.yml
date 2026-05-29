@@ -16,15 +16,33 @@ on:
     tags: ['v*.*.*']
 
 jobs:
-  # Gate: a tag must pass the same CI (build + lib tests, all targets) and the
-  # full containerised e2e before any artefact is built or published.
-  ci:
-    uses: ./.github/workflows/ci.yml
-  e2e:
-    uses: ./.github/workflows/e2e.yml
+  # Gate: wait for the existing ci.yml + e2e.yml checks on THIS commit to pass
+  # before building or publishing — we don't re-run them. The tag sits on the
+  # same commit the push to main already tested, so we just wait on its checks.
+  # NB: the version bump must live in the substantive commit (not a separate
+  # `chore(release):` commit), so the tagged commit has real CI to wait on — see
+  # docs/contributing.md. The check names below mirror ci.yml's job names + the
+  # e2e job; update them together if the CI matrix changes.
+  wait-for-green:
+    name: require ${{ matrix.check }} green
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: true
+      matrix:
+        check: [linux-amd64, linux-arm64, macos-arm64, e2e]
+    steps:
+      - name: Wait for ${{ matrix.check }} on ${{ github.sha }}
+        uses: lewagon/wait-on-check-action@v1.7.0
+        with:
+          ref: ${{ github.sha }}
+          check-name: ${{ matrix.check }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          wait-interval: 20
+          allowed-conclusions: success
 
   build:
-    needs: [ci, e2e]
+    needs: [wait-for-green]
     name: build-${{ matrix.os_label }}-${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
     permissions:

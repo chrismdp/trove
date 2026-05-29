@@ -44,6 +44,28 @@ built libjfs somewhere else.
 For the release-engineering matrix (how the four-platform tarballs are
 produced), see [Packaging & release matrix](/docs/packaging).
 
+## Releasing
+
+**Bump the version in the same commit as the change it ships — never in a
+separate `chore(release):` commit.** A version-only commit can't change a build
+or test outcome, so re-running CI on it is wasted; and the release gate waits on
+the *tagged commit's own* CI checks, so the tagged commit must be one CI
+actually ran on. Folding `Cargo.toml` (+ `Cargo.lock`) into the substantive
+commit gives exactly one CI run and a commit with checks to gate on.
+
+The flow:
+
+1. Make the change **and** bump `version` in `Cargo.toml` in the **same commit**
+   (run any cargo command to sync `Cargo.lock`). Pre-1.0, a breaking change
+   bumps the minor (`0.2.x` → `0.3.0`).
+2. Push to `main`. `ci.yml` + `e2e.yml` run on that commit.
+3. Once they're green, tag that commit `vX.Y.Z` and push the tag.
+
+The tag triggers `release.yml`, which **does not re-run the tests** — it waits
+for the commit's existing `ci.yml` + `e2e.yml` checks to be green (via
+`wait-on-check-action`), then builds and publishes the tarballs. A tag on a red
+or untested commit never publishes.
+
 ## Running tests
 
 ```bash
