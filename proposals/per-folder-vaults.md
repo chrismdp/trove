@@ -1,7 +1,8 @@
 # Proposal: per-folder vaults (`trove init` / `trove clone`)
 
-Status: **settled — ready to build** · supersedes the global-config / `trove
-install` model · no migration path (no users yet)
+Status: **settled bar one call** (R2 bucket-create permission — see Open) ·
+supersedes the global-config / `trove install` / `trove clone` model · no
+migration path (no users yet)
 
 ## Problem
 
@@ -19,34 +20,65 @@ install` flow that:
 The install fought the first real user at nearly every step. The fix is a more
 obvious, git-shaped model.
 
-## The model: git-shaped, but the content is a live projection
+## The model: one `trove init`, folder-aware
+
+There's a single command. You `cd` into a folder and run `trove init`; it derives
+everything from the folder name and figures out whether this is a *new* vault or
+an *existing* one to attach to. No separate `clone`.
 
 ```
-trove init                 # in an empty dir → create a NEW vault, mount here
-trove clone <db-url>       # → make ./<volume>/ from the DB, mount there
+cd notes && trove init     # adopt the existing "notes" vault, or create it
 ```
 
-Like git: `init` adopts the directory you're in; `clone <handle>` creates a
-named subdirectory. The one difference from git is **decision (P)**: the vault
-content isn't stored locally — it's a live FUSE projection of the DB + bucket
-(trove's "filesystem that talks back" thesis). So there are no tracked local
-files; the folder *is* the mount.
+**Names derived from the folder (`<name>` = folder basename):**
+- schema → `trove_<name>`   (underscore form — `my-notes` → `trove_my_notes`)
+- bucket → `trove-<name>`   (hyphen form — `my-notes` → `trove-my-notes`; S3 forbids `_`)
 
-- **`trove init`** — run inside an **empty** folder. trove formats a new volume,
-  mounts it **at the cwd** (the folder becomes the live vault), and names the
-  volume after the folder basename (validated; re-prompt if it isn't a clean
-  identifier).
-- **`trove clone <db-url>`** — the **DB URL is the handle.** A bare volume name
-  can't locate the database on a fresh machine (that's the secrets-separate
-  decision), so clone takes the URL, connects, reads the volume name + bucket +
-  schema back from the DB, creates **`./<volume>/`** (or a given dir) and mounts
-  there. If the DB hosts several volumes, `--volume <name>` selects one.
-- Other commands (`search`, `log`, `doctor`, `embed`, `backup`) resolve the
-  vault from the cwd's mountpoint → its local config. `trove install` is removed.
+**`trove init` resolves creds, then probes for those two resources:**
 
-Why `init` mounts at cwd but `clone` makes a subdir: on `init` you've already
-chosen/created the folder and `cd`'d in; on `clone` you don't yet know the name
-— it comes back from the DB and names the directory, exactly like `git clone`.
+1. Resolve the **DB URL** and **R2 creds** — from the shared cred store / env if
+   present, else prompt (and save them shared).
+2. Probe: does schema `trove_<name>` exist (a valid trove vault) **and** does
+   bucket `trove-<name>` exist?
+   - **Both present & consistent** → it's an existing vault. *"Found vault
+     `notes` — attach to it? [Y/n]"*. Confirm → mount. (This is the old
+     `clone`, folded in — fast on a second machine: same folder name + creds,
+     one confirm.)
+   - **Neither present** → new vault. **trove creates the bucket** (`trove-<name>`)
+     and the schema itself, formats, mounts.
+   - **One present, not the other / mismatch** → conflict. Plain error: e.g.
+     *"bucket `trove-notes` already exists but isn't a trove vault — use a
+     different folder name, or remove it."*
+
+The content is a **live FUSE projection** (decision (P)) mounted at the cwd; the
+folder *is* the vault. Other commands (`search`, `log`, `doctor`, `embed`,
+`backup`) resolve the vault from the cwd. `trove install` and `trove clone` are
+both removed.
+
+### Three things this assumes (settle these)
+
+1. **trove creates the bucket → the R2 token needs bucket-create permission.**
+   A typical "Object Read & Write" R2 token *can't* create buckets — that's an
+   Admin-scope operation. So either the walkthrough requires an admin-scoped
+   token, or trove detects the permission failure and falls back to *"couldn't
+   create `trove-notes` — create it yourself and re-run."* **Decide which.**
+2. **trove now needs an S3 admin client** (sigv4) to HeadBucket / CreateBucket /
+   ListObjects. Today trove only touches storage *through* libjfs (which neither
+   creates nor lists buckets). This is a new component — and it's also what your
+   "validate the bucket is present and empty" check requires, so we need it
+   regardless.
+3. **The R2 endpoint/account is a shared input.** To form & create
+   `<endpoint>/trove-<name>` trove needs the account endpoint
+   (`https://<account>.r2.cloudflarestorage.com`) — provided once with the R2
+   creds, not per-vault. (We can't derive the account id from the access key.)
+
+### Naming consequence
+
+`trove_<name>` (schema) and `trove-<name>` (bucket) aren't byte-identical — `_`
+is illegal in S3 bucket names, `-` is awkward in unquoted SQL identifiers — so
+each is derived from the folder with its own separator. The folder name is
+therefore validated to a clean lowercase token (`[a-z0-9-]`, no leading/trailing
+separator) so *both* derivations are valid; rejected and re-prompted otherwise.
 
 ## Decision (P): live FUSE projection, not a git working copy
 
@@ -126,8 +158,8 @@ independent and are never co-located:
 
 | Secret | Where it lives | Why |
 |---|---|---|
-| DB URL (+ password) | `~/.config/trove/<volume>/env`, local only; passed as the arg to `clone` | the handle to the vault |
-| R2 access key + secret | environment / keychain | supplied at runtime, never stored |
+| DB URL (+ password) | `~/.config/trove/credentials.toml` / env — shared, local only | the handle to the vault |
+| R2 access key + secret | environment / keychain (or the shared creds file) | account-level; reaches every bucket |
 
 **Property preserved:** a database leak yields metadata + version chain +
 embeddings, but **not the file bytes** — those need the R2 secret, which lives
@@ -137,34 +169,25 @@ separation, and object stores go accidentally-public more often than DBs. The
 shipped schema isolation (`trove_<volume>`, off Supabase's anon API) keeps
 `jfs_setting` and our tables unreadable by the anon key regardless.
 
-## `trove init`
+## `trove init` — step by step
 
-**Minimal inputs only:** **DB URL**, **bucket**, **R2 creds** — but the DB URL
-and R2 creds are read from the shared cred store / env if already present, so on
-any vault after the first you're asked **only for the bucket**. The volume name
-defaults to the folder basename (re-prompt if it isn't a clean identifier).
-Everything else is derived/defaulted, never asked: `meta` = the DB URL, `cache`
-= default, store = the folder, schema = derived, backup = a separate concern.
+Inputs are minimal: the **DB URL** and **R2 creds** (+ R2 endpoint), read from
+the shared cred store / env if present, else prompted once and saved shared. The
+volume name is the folder basename (validated). Everything else is derived:
+schema `trove_<name>`, bucket `trove-<name>`, `meta` = the DB URL, `cache` =
+default, store = the folder.
 
-1. Confirm the cwd is **empty** (else: "run `trove import` to adopt existing
-   files").
-2. **Validate as you go, fail early with plain errors:**
-   - DB URL → connect now; bad host/creds fail immediately, not at migration.
-   - bucket + creds → reach the object store; require it **present and EMPTY**
-     ("bucket `x` isn't empty — clear it or use a fresh one"). One whole bucket =
-     one volume; no prefix/subpath.
-3. Create the schema, run the migration there, format the volume.
-4. Write `~/.config/trove/<volume>/env`, then **mount at the cwd** (implicit).
-
-## `trove clone <db-url>`
-
-1. Connect to the DB (the URL is the handle). The **database is the source of
-   truth** — read the volume + bucket + schema back from it (`jfs_setting` + a
-   small trove config row added at init). `--volume` disambiguates a multi-volume
-   DB.
-2. Validate: DB connects; bucket **present and NON-empty** (data should be there).
-3. Prompt/accept **R2 creds** (env/prompt) — not in the DB by design.
-4. Write `~/.config/trove/<volume>/env`, create `./<volume>/`, **mount there**.
+1. Validate the folder name → clean token; re-prompt if not. Confirm the cwd is
+   **empty** (else: "run `trove import` to adopt existing files").
+2. Resolve creds; **validate as you go, plain errors:** DB URL → connect now
+   (bad host/creds fail immediately, not at migration); R2 creds + endpoint →
+   reach the object store.
+3. **Probe** schema `trove_<name>` and bucket `trove-<name>`:
+   - **both present & consistent** → attach (confirm) → mount. *(former `clone`)*
+   - **neither** → create the bucket + schema, run the migration, format. *(former `init`)*
+   - **partial / mismatch** → conflict error (rename the folder, or remove the
+     stray bucket/schema).
+4. Write `~/.config/trove/volumes/<name>.toml`, **mount at the cwd**.
 
 ## Bucket input — be generous, normalize
 
@@ -187,28 +210,41 @@ special-case is dropped.
 ## Unchanged substrate
 
 Untouched: per-volume schema isolation, the embedded migration, `vector` in a
-shared schema, and the validate → COW-version → embed write pipeline.
-`init`/`clone` is a cleaner config/UX skin over the plumbing validated on v0.2.x.
+shared schema, and the validate → COW-version → embed write pipeline. The new
+surface is a config/UX skin over the plumbing validated on v0.2.x, **plus** an
+S3 admin client (new — see below).
 
 ## All decisions settled
 
 1. Live FUSE projection (P), not a working copy (W).
-2. `init` mounts at cwd (volume = folder name); `clone <db-url>` makes
-   `./<volume>/`. `install` removed.
-3. Local state split: **shared** creds (`~/.config/trove/credentials.toml` /
-   env) + **per-volume** config (`~/.config/trove/volumes/<volume>.toml`); never
-   synced; schemas travel as vault content; secrets never co-located in the
-   backend (local cred store is fine). One DB + one R2 cred → many volumes.
-4. Minimal inputs (DB URL, bucket, R2 creds); validate each at entry; mount
-   implicitly.
-5. Volume names validated (reject non-clean; `trove` allowed; no `trove_default`).
-6. Bucket input accepted generously and normalized; one whole bucket per volume.
+2. **One command, `trove init`**, run inside a folder: derives names from the
+   folder, probes the backend, and attaches to an existing vault or creates a
+   new one. `trove install` and `trove clone` both removed.
+3. Names derived from the folder: schema `trove_<name>` (`_`), bucket
+   `trove-<name>` (`-`); folder name validated to satisfy both. trove **creates
+   the bucket** for a new vault.
+4. Local state split: **shared** creds (`~/.config/trove/credentials.toml` / env,
+   incl. the R2 endpoint) + **per-volume** config
+   (`~/.config/trove/volumes/<name>.toml`); never synced; schemas travel as vault
+   content; secrets never co-located in the backend. One DB + one R2 cred → many
+   volumes.
+5. Minimal inputs (DB URL, R2 creds + endpoint, all shared); validate each at
+   entry; mount implicitly at the cwd.
+6. Volume names validated (reject non-clean; `trove` allowed; no `trove_default`).
+
+## Open (need a call)
+
+- **R2 bucket-create permission:** require an admin-scoped token, or detect the
+  failure and fall back to "create `trove-<name>` yourself and re-run"? (See the
+  three assumptions under *The model*.)
 
 ## Build order (suggested)
 
-1. Config refactor: per-volume `~/.config/trove/<volume>/env`; command resolves
-   the vault from cwd mountpoint.
-2. `trove init` (validate DB + empty bucket → schema + migrate + format + mount).
-3. `trove clone` (DB-as-source-of-truth read-back + non-empty bucket + mount).
+1. **S3 admin client** (sigv4): HeadBucket / CreateBucket / ListObjects — needed
+   for bucket create + the present/empty validation. New component.
+2. Config refactor: shared creds + per-volume config; resolve the vault from the
+   cwd; remove the global `config.toml`.
+3. `trove init` — folder-name validation → resolve+validate creds → probe →
+   attach-or-create (create bucket + schema + migrate + format) → mount at cwd.
 4. Move the type registry to `<vault>/.types/` as vault content; load at mount.
-5. Retire `trove install`; update docs.
+5. Retire `trove install` / `trove clone`; rewrite the docs.
