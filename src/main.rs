@@ -496,19 +496,6 @@ fn run() -> Result<usize> {
                 );
                 trove::mount::mount_blocking(fs, registry, versions, embed_tx, &init.mountpoint)?;
             } else {
-                // A boot agent runs with a bare environment. If the R2 keys live
-                // only in the user's shell (op/1Password flow), the agent's mount
-                // can't reach the object store — warn before installing one.
-                if init.keys_in_env_only {
-                    eprintln!(
-                        "{} your R2 keys come from the environment and aren't saved to \
-                         credentials.toml. The login boot agent runs without your shell env, so \
-                         auto-mount will fail to reach the object store.\n  \
-                         Fix: add `r2_access_key_id` + `r2_secret_access_key` to \
-                         ~/.config/trove/credentials.toml, or re-run with `--no-autostart`.",
-                        "warning:".yellow().bold()
-                    );
-                }
                 // Install + start the per-vault boot agent. The mount runs in the
                 // background and re-mounts at every login; you get your shell
                 // back immediately. The set of agents IS this machine's vault

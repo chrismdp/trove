@@ -43,21 +43,14 @@ pub struct InitMount {
     pub meta: String,
     pub cache: String,
     pub versions_db: String,
-    /// True when the R2 keys came from the environment and were *not* written to
-    /// `credentials.toml` (the op/1Password flow). A boot agent runs with a bare
-    /// environment, so auto-mount can't reach the object store — the caller
-    /// warns before installing one.
-    pub keys_in_env_only: bool,
 }
 
-/// R2 inputs that passed a live probe, plus where the keys came from.
+/// R2 inputs that passed a live probe.
 struct R2Resolved {
     endpoint: String,
     bucket: String,
     access_key: String,
     secret_key: String,
-    access_from_env: bool,
-    secret_from_env: bool,
     bucket_state: BucketState,
 }
 
@@ -154,35 +147,28 @@ pub fn run(opts: InitOptions) -> Result<InitMount> {
 
     // Everything that *can* be checked has passed → persist the creds. (Done
     // even when the bucket is missing: the creds are valid, so the re-run after
-    // you create the bucket won't ask again.) The keys must also reach libjfs
-    // this run, so push them into the environment regardless of source.
+    // you create the bucket won't ask again.) Always save all four, whatever
+    // their source — env values were confirmed at the prompt above, and saving
+    // them is what makes the vault self-sufficient: the boot agent runs with a
+    // bare environment, so it can only mount if the keys live in the file. The
+    // keys must also reach libjfs this run, so push them into the environment.
     std::env::set_var("R2_ACCESS_KEY_ID", &r2.access_key);
     std::env::set_var("R2_SECRET_ACCESS_KEY", &r2.secret_key);
+    let resolved = CredProfile {
+        versions_db: Some(versions_db.clone()),
+        r2_endpoint: Some(r2.endpoint.clone()),
+        r2_access_key_id: Some(r2.access_key.clone()),
+        r2_secret_access_key: Some(r2.secret_key.clone()),
+    };
     match profile {
         None => {
-            // Default profile: keep env the source of truth for the keys — only
-            // persist a key we gathered ourselves (typed at the prompt).
-            creds.versions_db = Some(versions_db.clone());
-            creds.r2_endpoint = Some(r2.endpoint.clone());
-            if !r2.access_from_env {
-                creds.r2_access_key_id = Some(r2.access_key.clone());
-            }
-            if !r2.secret_from_env {
-                creds.r2_secret_access_key = Some(r2.secret_key.clone());
-            }
+            creds.versions_db = resolved.versions_db.clone();
+            creds.r2_endpoint = resolved.r2_endpoint.clone();
+            creds.r2_access_key_id = resolved.r2_access_key_id.clone();
+            creds.r2_secret_access_key = resolved.r2_secret_access_key.clone();
         }
         Some(name) => {
-            // Named profile: self-contained (no env source), so persist all four
-            // so the boot agent can resolve them with nothing in the shell.
-            creds.profiles.insert(
-                name.to_string(),
-                CredProfile {
-                    versions_db: Some(versions_db.clone()),
-                    r2_endpoint: Some(r2.endpoint.clone()),
-                    r2_access_key_id: Some(r2.access_key.clone()),
-                    r2_secret_access_key: Some(r2.secret_key.clone()),
-                },
-            );
+            creds.profiles.insert(name.to_string(), resolved);
         }
     }
     let cred_path = creds.save()?;
@@ -275,10 +261,6 @@ pub fn run(opts: InitOptions) -> Result<InitMount> {
         println!("{} embedding disabled for this mount", "trove init:".bold());
     }
 
-    // Only the default profile defers keys to env; named profiles always
-    // persist all four, so their boot agent is self-sufficient.
-    let keys_in_env_only = profile.is_none() && (r2.access_from_env || r2.secret_from_env);
-
     Ok(InitMount {
         volume,
         schema,
@@ -287,7 +269,6 @@ pub fn run(opts: InitOptions) -> Result<InitMount> {
         meta: versions_db.clone(),
         cache,
         versions_db,
-        keys_in_env_only,
     })
 }
 
@@ -301,7 +282,10 @@ fn resolve_and_connect_db(
     consult_env: bool,
     tty: bool,
 ) -> Result<(String, Client)> {
-    let mut candidate = if consult_env {
+    // The default offered at the prompt: env (default profile only) → the saved
+    // file value. At a TTY we still ASK, prefilling this so the user confirms
+    // (Enter) or edits it; the resolved value is then saved either way.
+    let mut default = if consult_env {
         provision::env_nonempty("TROVE_VERSIONS_DB")
             .or_else(|| provision::env_nonempty("DATABASE_URL"))
             .or(file_seed)
@@ -310,24 +294,30 @@ fn resolve_and_connect_db(
     };
     let mut explained = false;
     loop {
-        let url = match candidate.take() {
-            Some(v) => v,
-            None => {
-                if !explained {
-                    explain(
-                        "Postgres database — metadata, version history and embeddings.",
-                        &[
-                            "Easiest is Supabase (free tier): create a project, then Connect →",
-                            "Connection string → Session pooler (host ends .pooler.supabase.com,",
-                            "port 5432). Paste that URI — it includes your DB password.",
-                            "Avoid the 'Direct connection' db.<ref>.supabase.co host: it is",
-                            "IPv6-only and usually unreachable.",
-                        ],
-                    );
-                    explained = true;
-                }
-                ask_required("versions_db (postgres URL)")?
+        let url = if !tty {
+            // No TTY: can't prompt, so accept the default as-is (the
+            // non-interactive guard guaranteed one exists).
+            match default.take() {
+                Some(v) => v,
+                None => bail!("no database URL and no TTY to prompt"),
             }
+        } else {
+            // The Supabase explainer is only useful when there's nothing to
+            // default to — skip it when we're just asking the user to confirm.
+            if default.is_none() && !explained {
+                explain(
+                    "Postgres database — metadata, version history and embeddings.",
+                    &[
+                        "Easiest is Supabase (free tier): create a project, then Connect →",
+                        "Connection string → Session pooler (host ends .pooler.supabase.com,",
+                        "port 5432). Paste that URI — it includes your DB password.",
+                        "Avoid the 'Direct connection' db.<ref>.supabase.co host: it is",
+                        "IPv6-only and usually unreachable.",
+                    ],
+                );
+                explained = true;
+            }
+            ask_with_default("versions_db (postgres URL)", default.as_deref())?
         };
         match connect_db(&url) {
             Ok(client) => {
@@ -339,7 +329,8 @@ fn resolve_and_connect_db(
                 if !tty {
                     return Err(e);
                 }
-                // candidate is already None → loop re-prompts.
+                // Keep the rejected value as the prefill so a typo is fixed in place.
+                default = Some(url);
             }
         }
     }
@@ -357,39 +348,47 @@ fn resolve_and_probe_r2(
     tty: bool,
     bucket_name: &str,
 ) -> Result<R2Resolved> {
-    let ak_env = consult_env.then(|| provision::env_nonempty("R2_ACCESS_KEY_ID")).flatten();
-    let sk_env = consult_env
-        .then(|| provision::env_nonempty("R2_SECRET_ACCESS_KEY"))
-        .flatten();
-    let mut ep_c = if consult_env {
+    // Defaults offered at the prompt: env (default profile only) → saved file
+    // values. At a TTY we still ASK, prefilling these; the resolved values are
+    // saved either way.
+    let mut ep_default = if consult_env {
         provision::env_nonempty("TROVE_R2_ENDPOINT")
             .or_else(|| provision::env_nonempty("TROVE_R2_BUCKET"))
             .or(file_ep)
     } else {
         file_ep
     };
-    let mut ak_c = ak_env.clone().or(file_ak);
-    let mut sk_c = sk_env.clone().or(file_sk);
+    let mut ak_default = if consult_env {
+        provision::env_nonempty("R2_ACCESS_KEY_ID").or(file_ak)
+    } else {
+        file_ak
+    };
+    let mut sk_default = if consult_env {
+        provision::env_nonempty("R2_SECRET_ACCESS_KEY").or(file_sk)
+    } else {
+        file_sk
+    };
     let mut explained_ep = false;
     let mut explained_key = false;
 
     loop {
-        let endpoint_input = match ep_c.take() {
-            Some(v) => v,
-            None => {
-                if !explained_ep {
-                    explain(
-                        "R2 account endpoint — the account's S3 endpoint (NOT a bucket URL).",
-                        &[
-                            "Cloudflare dashboard → R2 → API → S3 endpoint:",
-                            "  https://<accountid>.r2.cloudflarestorage.com",
-                            "trove appends the bucket name itself.",
-                        ],
-                    );
-                    explained_ep = true;
-                }
-                ask_required("R2 endpoint")?
+        let endpoint_input = if !tty {
+            ep_default
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("no R2 endpoint and no TTY to prompt"))?
+        } else {
+            if ep_default.is_none() && !explained_ep {
+                explain(
+                    "R2 account endpoint — the account's S3 endpoint (NOT a bucket URL).",
+                    &[
+                        "Cloudflare dashboard → R2 → API → S3 endpoint:",
+                        "  https://<accountid>.r2.cloudflarestorage.com",
+                        "trove appends the bucket name itself.",
+                    ],
+                );
+                explained_ep = true;
             }
+            ask_with_default("R2 endpoint", ep_default.as_deref())?
         };
         let (endpoint, bucket) =
             match config::r2_endpoint_from_bucket_input(&endpoint_input, bucket_name) {
@@ -399,29 +398,34 @@ fn resolve_and_probe_r2(
                     if !tty {
                         return Err(e);
                     }
+                    ep_default = Some(endpoint_input); // keep bad value as the prefill
                     continue; // re-prompt the endpoint only
                 }
             };
 
-        let access_key = match ak_c.take() {
-            Some(v) => v,
-            None => {
-                if !explained_key {
-                    explain(
-                        "R2 API token — Object Read & Write (no admin scope needed).",
-                        &[
-                            "Cloudflare → R2 → Manage R2 API Tokens → Create. It shows an",
-                            "Access Key ID + Secret Access Key (the secret is shown once).",
-                        ],
-                    );
-                    explained_key = true;
-                }
-                prompt_secret_required("R2_ACCESS_KEY_ID")?
+        let access_key = if !tty {
+            ak_default
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("no R2 access key and no TTY to prompt"))?
+        } else {
+            if ak_default.is_none() && !explained_key {
+                explain(
+                    "R2 API token — Object Read & Write (no admin scope needed).",
+                    &[
+                        "Cloudflare → R2 → Manage R2 API Tokens → Create. It shows an",
+                        "Access Key ID + Secret Access Key (the secret is shown once).",
+                    ],
+                );
+                explained_key = true;
             }
+            ask_secret_with_default("R2_ACCESS_KEY_ID", ak_default.as_deref())?
         };
-        let secret_key = match sk_c.take() {
-            Some(v) => v,
-            None => prompt_secret_required("R2_SECRET_ACCESS_KEY")?,
+        let secret_key = if !tty {
+            sk_default
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("no R2 secret key and no TTY to prompt"))?
+        } else {
+            ask_secret_with_default("R2_SECRET_ACCESS_KEY", sk_default.as_deref())?
         };
 
         let probe = BucketProbe {
@@ -443,8 +447,6 @@ fn resolve_and_probe_r2(
                     bucket,
                     access_key,
                     secret_key,
-                    access_from_env: ak_env.is_some(),
-                    secret_from_env: sk_env.is_some(),
                     bucket_state: state,
                 });
             }
@@ -453,11 +455,12 @@ fn resolve_and_probe_r2(
                 if !tty {
                     return Err(e);
                 }
-                // Could be the endpoint or either key — re-ask all three.
+                // Could be the endpoint or either key — re-ask all three, each
+                // prefilled with what was just entered so a typo is fixed in place.
                 println!("  re-enter the R2 endpoint and keys:");
-                ep_c = None;
-                ak_c = None;
-                sk_c = None;
+                ep_default = Some(endpoint_input);
+                ak_default = Some(access_key);
+                sk_default = Some(secret_key);
             }
         }
     }
@@ -546,6 +549,49 @@ fn ask_required(label: &str) -> Result<String> {
     }
 }
 
+/// Prompt with `default` prefilled and editable — the user presses Enter to keep
+/// it or edits in place. With no default, falls back to a required prompt.
+/// TTY-only; callers gate the no-TTY path before calling.
+fn ask_with_default(label: &str, default: Option<&str>) -> Result<String> {
+    match default {
+        None => ask_required(label),
+        Some(d) => loop {
+            let line = read_input_line_with_default(&format!("{label}: "), d)?;
+            let v = line.trim();
+            if !v.is_empty() {
+                return Ok(v.to_string());
+            }
+            println!(
+                "  {} required — press Enter to keep the shown value, or type a new one.",
+                "·".dimmed()
+            );
+        },
+    }
+}
+
+/// Like [`prompt_secret_required`] but offers a default (from env / the saved
+/// file): an empty submission keeps it. The secret is never echoed, so we can't
+/// prefill the line — we show its length and accept Enter-to-keep.
+fn ask_secret_with_default(name: &str, default: Option<&str>) -> Result<String> {
+    match default {
+        None => prompt_secret_required(name),
+        Some(d) => {
+            let n = d.chars().count();
+            let v = read_secret_line(&format!(
+                "{name} [{n}-char value already set — Enter to keep, or paste a new one]: "
+            ))?;
+            let v = v.trim();
+            if v.is_empty() {
+                println!("  {} {name} kept ({n} chars)", "✓".green());
+                Ok(d.to_string())
+            } else {
+                println!("  {} {name} set ({} chars)", "✓".green(), v.chars().count());
+                Ok(v.to_string())
+            }
+        }
+    }
+}
+
 /// Read one line with readline-style editing (arrow keys, ^U/^K) — what people
 /// expect when fixing a pasted connection string.
 fn read_input_line(prompt: &str) -> Result<String> {
@@ -555,6 +601,20 @@ fn read_input_line(prompt: &str) -> Result<String> {
     match editor.readline(prompt) {
         Ok(line) => Ok(line),
         Err(ReadlineError::Eof) => Ok(String::new()),
+        Err(ReadlineError::Interrupted) => bail!("aborted (Ctrl-C)"),
+        Err(e) => Err(anyhow::anyhow!("reading input: {e}")),
+    }
+}
+
+/// Read one line, prefilled with `initial` and editable (Enter keeps it). Used
+/// to offer an env/saved value as the default the user confirms or edits.
+fn read_input_line_with_default(prompt: &str, initial: &str) -> Result<String> {
+    use rustyline::error::ReadlineError;
+    let mut editor = rustyline::DefaultEditor::new()
+        .map_err(|e| anyhow::anyhow!("initialising the line editor: {e}"))?;
+    match editor.readline_with_initial(prompt, (initial, "")) {
+        Ok(line) => Ok(line),
+        Err(ReadlineError::Eof) => Ok(initial.to_string()), // Ctrl-D keeps the default
         Err(ReadlineError::Interrupted) => bail!("aborted (Ctrl-C)"),
         Err(e) => Err(anyhow::anyhow!("reading input: {e}")),
     }
