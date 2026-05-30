@@ -111,6 +111,13 @@ See **[ARCHITECTURE.md](ARCHITECTURE.md)** for how it all fits together.
 
 ## Licence
 
-Functional Source License (FSL-1.1, future-converts to Apache 2.0). See
-[LICENSE.md](LICENSE.md). Internal/commercial use permitted; competing hosting
-services reserved for two years, then auto-converts to OSS.
+Trove's own code is under the **Functional Source License (FSL-1.1-ALv2)**:
+internal and commercial use permitted; building a competing hosting service is
+reserved for two years, after which each version auto-converts to Apache 2.0.
+Full text in [LICENSE.md](LICENSE.md).
+
+The bundled **JuiceFS** (compiled as `libjfs`) is © 2020 Juicedata, Inc. under
+the **Apache License 2.0**, and Trove's `libjfs/patches/` are Apache-2.0
+derivative works — the FSL does not relicense them. Release tarballs ship a
+generated `THIRD-PARTY-LICENSES.md` with the Apache 2.0 text and attribution
+for JuiceFS and every statically-linked Go dependency.

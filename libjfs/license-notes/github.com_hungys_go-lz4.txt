@@ -1,0 +1,12 @@
+github.com/hungys/go-lz4
+
+This module version includes no license file and no license statement in its
+README or source headers, and GitHub reports no detected license for the
+repository. It provides cgo bindings to the LZ4 compression library
+(https://github.com/lz4/lz4), which is itself licensed under BSD-2-Clause.
+
+Trove redistributes this module unmodified, exactly as JuiceFS depends on it.
+No license text is reproduced here because none is provided upstream. This is
+recorded transparently rather than omitted; see https://pkg.go.dev/github.com/hungys/go-lz4
+
+(Curated by Trove; see libjfs/license-notes/. Pulled in transitively by JuiceFS.)

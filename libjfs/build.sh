@@ -56,17 +56,24 @@ LIBFILE="libjfs-${ARCH}.${EXT}"
 HEADERFILE="libjfs-${ARCH}.h"
 MARKER="$BUILD_DIR/.sha"
 
-# Cache identity = pinned juicefs SHA + a hash of this script and every patch.
-# Keying on the SHA alone is a trap: editing a patch (e.g. adding the locks
-# export) leaves JUICEFS_SHA unchanged, so a restored stale build/ would be
-# treated as a cache hit and the new symbols would never be built. CI restores
-# build/ via a partial cache-key match, so this guard is what forces the
-# rebuild. (sha256sum on Linux, shasum on macOS.)
+# Cache identity = pinned juicefs SHA + a hash of this script, every patch, and
+# the license-generation inputs (collect-licenses.sh, the head, the curated
+# notes). Keying on the SHA alone is a trap: editing a patch (e.g. adding the
+# locks export) or a license note leaves JUICEFS_SHA unchanged, so a restored
+# stale build/ would be treated as a cache hit and the new symbols / license
+# text would never be regenerated. CI restores build/ via a partial cache-key
+# match, so this guard is what forces the rebuild. (sha256sum / shasum.)
 if command -v sha256sum >/dev/null 2>&1; then
-    PATCH_HASH="$(cat "$0" "$SCRIPT_DIR"/patches/*.patch 2>/dev/null | sha256sum | cut -d' ' -f1)"
+    HASHER="sha256sum"
 else
-    PATCH_HASH="$(cat "$0" "$SCRIPT_DIR"/patches/*.patch 2>/dev/null | shasum -a 256 | cut -d' ' -f1)"
+    HASHER="shasum -a 256"
 fi
+PATCH_HASH="$(cat "$0" \
+    "$SCRIPT_DIR"/patches/*.patch \
+    "$SCRIPT_DIR/collect-licenses.sh" \
+    "$SCRIPT_DIR/THIRD-PARTY-LICENSES.head.md" \
+    "$SCRIPT_DIR"/license-notes/*.txt \
+    2>/dev/null | $HASHER | cut -d' ' -f1)"
 STAMP="${JUICEFS_SHA}-${PATCH_HASH}"
 
 if [ "$FORCE" -eq 1 ]; then
@@ -74,8 +81,11 @@ if [ "$FORCE" -eq 1 ]; then
     rm -rf "$BUILD_DIR"
 fi
 
-# Cache hit: built artefact + marker matching the SHA *and* the patch hash.
-if [ -f "$BUILD_DIR/$LIBFILE" ] && [ -f "$MARKER" ] && [ "$(cat "$MARKER")" = "$STAMP" ]; then
+# Cache hit: built artefact + the license manifest + marker matching the SHA
+# *and* the patch hash. The license file is part of the hit condition so a
+# partial cache restore (lib without manifest) falls through and regenerates.
+if [ -f "$BUILD_DIR/$LIBFILE" ] && [ -f "$BUILD_DIR/THIRD-PARTY-LICENSES.md" ] \
+        && [ -f "$MARKER" ] && [ "$(cat "$MARKER")" = "$STAMP" ]; then
     echo "libjfs cached at $BUILD_DIR/$LIBFILE (stamp $STAMP)"
     exit 0
 fi
@@ -118,6 +128,19 @@ cp "$WORKTREE/sdk/java/libjfs/$LIBFILE" "$BUILD_DIR/$LIBFILE"
 if [ -f "$WORKTREE/sdk/java/libjfs/$HEADERFILE" ]; then
     cp "$WORKTREE/sdk/java/libjfs/$HEADERFILE" "$BUILD_DIR/$HEADERFILE"
 fi
+
+# Generate the third-party license manifest from the exact module set just
+# built. collect-licenses.sh needs the worktree (go list + the module cache),
+# so this must run before cleanup. Apache 2.0 §4 requires shipping JuiceFS's
+# license + attribution alongside the binary; the statically-linked Go deps
+# carry their own notices. A failure here aborts before the cache is stamped,
+# so we never mark a build "done" without its manifest.
+echo "generating THIRD-PARTY-LICENSES.md..."
+LICENSE_OUT="$BUILD_DIR/THIRD-PARTY-LICENSES.md"
+cat "$SCRIPT_DIR/THIRD-PARTY-LICENSES.head.md" > "$LICENSE_OUT"
+printf '\n' >> "$LICENSE_OUT"
+GO="$GO" sh "$SCRIPT_DIR/collect-licenses.sh" "$WORKTREE" >> "$LICENSE_OUT"
+echo "wrote $LICENSE_OUT"
 
 # Stamp the SHA + patch hash so subsequent runs detect a cache hit.
 printf '%s\n' "$STAMP" > "$MARKER"

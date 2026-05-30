@@ -92,6 +92,12 @@ To track a newer upstream JuiceFS release:
    (regenerate from a working tree, or edit the hunks by hand) and
    re-run.
 4. Commit the SHA bump and the updated patches together.
+5. The rebuild regenerates `THIRD-PARTY-LICENSES.md` for the new
+   dependency set. Watch the build output for any
+   `collect-licenses: WARNING no license text for …` line — that means a
+   newly-pulled module ships no license file. Add a curated note under
+   `libjfs/license-notes/<module-path-with-slashes-as-underscores>.txt`
+   (see the three already there) so the manifest stays complete.
 
 ### Cross-builds for other platforms
 
@@ -99,6 +105,29 @@ The build script builds for the host arch only — Linux amd64 from amd64,
 arm64 from arm64, macOS native from native. Cross-builds are handled in
 the release pipeline (`.github/workflows/release.yml`), which runs the
 script on a per-platform runner from the matrix.
+
+## Third-party licenses
+
+`libjfs` is built from Apache-2.0 JuiceFS and statically links a large set of
+third-party Go modules, so every binary release must carry their attribution
+(Apache 2.0 §4 for JuiceFS; each module's own terms for the rest). `build.sh`
+handles this automatically: after `make`, it concatenates
+`libjfs/THIRD-PARTY-LICENSES.head.md` (JuiceFS attribution + Trove's
+modification notice + the full Apache 2.0 text) with the output of
+`libjfs/collect-licenses.sh`. That script walks the exact module set linked
+into the build (`go list -deps -tags nogspt`) and pulls each module's license
+from the Go module cache — no extra tooling, just `go` + a POSIX shell. The
+result, `libjfs/build/THIRD-PARTY-LICENSES.md`, is copied into every release
+tarball.
+
+A few small transitive deps ship no license file in their pinned version;
+those have curated notes under `libjfs/license-notes/`, which the collector
+prefers over a cache lookup. If a JuiceFS bump pulls in a new such module the
+build prints a `WARNING` naming it (see "Bumping the JuiceFS base" above).
+
+Trove's own code is under the FSL — see [LICENSE.md](../LICENSE.md). The FSL
+does not relicense the bundled JuiceFS or its patches; those stay Apache 2.0,
+and recipients keep their Apache-2.0 rights to that component.
 
 ## Release process
 
@@ -134,7 +163,7 @@ The workflow:
    `install_name_tool` edits). Linux is unaffected — ELF DT_NEEDED
    resolves via `$ORIGIN` from the load name directly.
 4. Tars `trove`, the matching `libjfs-<arch>.{so,dylib}`,
-   `LICENSE.md` and `README.md` into
+   `LICENSE.md`, `README.md` and `THIRD-PARTY-LICENSES.md` into
    `trove-<version>-<os>-<arch>.tar.gz`.
 5. Computes `sha256` of the tarball, emits a sidecar `.sha256` file.
 6. Uploads all six assets (3 tarballs + 3 sha256s) as a GitHub
@@ -145,8 +174,9 @@ Users get sha256 verification automatically via the install script
 the `.sha256` and runs `sha256sum -c` / `shasum -a 256 -c` before
 extracting.
 
-Each archive ships **four files**: the `trove` binary, the matching
-`libjfs-*.so` / `libjfs-*.dylib`, `LICENSE.md` and `README.md`. The
+Each archive ships **five files**: the `trove` binary, the matching
+`libjfs-*.so` / `libjfs-*.dylib`, `LICENSE.md`, `README.md` and
+`THIRD-PARTY-LICENSES.md`. The
 binary's rpath is `$ORIGIN` (Linux) / `@loader_path` (macOS), so the
 loader finds libjfs alongside the binary — no `LD_LIBRARY_PATH` /
 `DYLD_LIBRARY_PATH` needed as long as users keep them in the same

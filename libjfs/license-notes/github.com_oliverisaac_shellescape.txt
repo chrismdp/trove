@@ -1,0 +1,13 @@
+github.com/oliverisaac/shellescape
+
+This module version includes no license file and no license statement in its
+source headers, and GitHub reports no detected license for the repository. It
+is a fork of github.com/alessio/shellescape, which is licensed under the MIT
+License.
+
+Trove redistributes this module unmodified, exactly as JuiceFS depends on it.
+No license text is reproduced here because none is provided in this fork. This
+is recorded transparently rather than omitted; see
+https://pkg.go.dev/github.com/oliverisaac/shellescape
+
+(Curated by Trove; see libjfs/license-notes/. Pulled in transitively by JuiceFS.)

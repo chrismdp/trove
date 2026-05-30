@@ -1,0 +1,15 @@
+github.com/dchest/siphash
+
+This module version ships no LICENSE file, but the package dedicates itself to
+the public domain in its README and source headers. GitHub identifies the
+project as CC0-1.0. The dedication, as stated by the authors:
+
+    Written by Dmitry Chestnykh and Damian Gryski.
+
+    To the extent possible under law, the authors have dedicated all copyright
+    and related and neighboring rights to this software to the public domain
+    worldwide. This software is distributed without any warranty.
+    http://creativecommons.org/publicdomain/zero/1.0/
+
+(Curated by Trove because this pinned module version does not include the file;
+see libjfs/license-notes/. Pulled in transitively by JuiceFS.)
