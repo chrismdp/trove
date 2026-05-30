@@ -5,6 +5,7 @@
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -37,8 +38,12 @@ pub struct Config {
     pub schema: Option<String>,
 }
 
+/// One credential set: a database URL + the R2/S3 endpoint and keys that back a
+/// volume. The top-level fields of [`Credentials`] are the *default* (unnamed)
+/// profile — the fleet case, one cred set for every volume; `[profiles.<name>]`
+/// blocks add independent sets for volumes on different accounts.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct Credentials {
+pub struct CredProfile {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub versions_db: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -50,11 +55,100 @@ pub struct Credentials {
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct Credentials {
+    // The default (unnamed) profile lives at the top level: a single-account
+    // machine just has these four keys and never writes a `[profiles]` block.
+    // Multi-account machines add named profiles under `[profiles.<name>]`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub versions_db: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub r2_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub r2_access_key_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub r2_secret_access_key: Option<String>,
+    /// Named, independent credential sets. Volumes select one via
+    /// `credentials = "<name>"`; omitting it uses the default (top-level) set.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub profiles: HashMap<String, CredProfile>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct VolumeConfig {
     pub bucket: String,
     pub schema: String,
     pub mountpoint: String,
     pub cache: String,
+    /// Credential profile backing this volume (a key in `credentials.toml`'s
+    /// `[profiles]`). Omitted ⇒ the default (top-level) credentials — the fleet
+    /// case where one DB + one R2 cred backs every volume.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub credentials: Option<String>,
+}
+
+/// A volume's config plus its resolved credentials — everything `trove mount
+/// --volume <name>` needs with no cwd and no ambient env (the boot-agent case).
+pub struct ResolvedVolume {
+    pub name: String,
+    pub volume: VolumeConfig,
+    pub creds: CredProfile,
+}
+
+impl ResolvedVolume {
+    /// Load a named volume's config file and resolve its credential profile.
+    /// Errors if no such volume is configured on this machine.
+    pub fn load(name: &str) -> Result<ResolvedVolume> {
+        let name = normalise_volume_name(name)?;
+        let path = Config::volume_path(&name)?;
+        let text = std::fs::read_to_string(&path).map_err(|e| {
+            anyhow::anyhow!(
+                "no volume `{name}` configured on this machine ({}): {e}\n\
+                 Run `trove init` in the vault folder to attach it here, or `trove ls` to list configured volumes.",
+                path.display()
+            )
+        })?;
+        let volume: VolumeConfig =
+            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        let creds = Credentials::load().resolve(volume.credentials.as_deref());
+        Ok(ResolvedVolume {
+            name,
+            volume,
+            creds,
+        })
+    }
+
+    /// The Postgres URL (version chain + JuiceFS meta), or a clear error naming
+    /// the profile it tried.
+    pub fn versions_db(&self) -> Result<&str> {
+        self.creds.versions_db.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "no database URL for volume `{}` (credential profile `{}`) — \
+                 add it to credentials.toml",
+                self.name,
+                self.volume.credentials.as_deref().unwrap_or("default")
+            )
+        })
+    }
+
+    /// The JuiceFS meta URL: the DB URL with the scheme + search_path fixups,
+    /// pointed at this volume's schema.
+    pub fn meta_url(&self) -> Result<String> {
+        Ok(juicefs_meta_url(self.versions_db()?, &self.volume.schema))
+    }
+
+    /// Export the resolved R2 keys into the process environment so libjfs (which
+    /// reads `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` at mount/format) can
+    /// reach the object store. Mirrors what `trove init` does before mounting
+    /// in-process — the boot agent runs in a bare environment, so the keys must
+    /// come from the saved credentials, not the ambient shell.
+    pub fn export_r2_env(&self) {
+        if let Some(k) = &self.creds.r2_access_key_id {
+            std::env::set_var("R2_ACCESS_KEY_ID", k);
+        }
+        if let Some(s) = &self.creds.r2_secret_access_key {
+            std::env::set_var("R2_SECRET_ACCESS_KEY", s);
+        }
+    }
 }
 
 impl Config {
@@ -68,6 +162,47 @@ impl Config {
 
     pub fn volume_path(volume: &str) -> Result<PathBuf> {
         Ok(Self::volumes_dir()?.join(format!("{volume}.toml")))
+    }
+
+    /// Every volume configured on this machine: `(name, config)` pairs read from
+    /// `~/.config/trove/volumes/*.toml`, sorted by name. The basis for `trove
+    /// ls` and the fleet view. An unreadable / malformed file is skipped (it
+    /// shouldn't take the whole listing down).
+    pub fn list_volumes() -> Vec<(String, VolumeConfig)> {
+        let Ok(dir) = Self::volumes_dir() else {
+            return Vec::new();
+        };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(String, VolumeConfig)> = Vec::new();
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("toml") {
+                continue;
+            }
+            let Some(name) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if let Ok(vol) = toml::from_str::<VolumeConfig>(&text) {
+                out.push((name, vol));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Delete a volume's config file (the local membership record). Returns the
+    /// removed path. The backend (schema + bucket) is untouched — `detach`
+    /// removes only this machine's footprint.
+    pub fn remove_volume(volume: &str) -> Result<PathBuf> {
+        let path = Self::volume_path(volume)?;
+        std::fs::remove_file(&path)
+            .with_context(|| format!("removing volume config {}", path.display()))?;
+        Ok(path)
     }
 
     /// Load the config file if present; an absent file is an empty config (not
@@ -113,8 +248,11 @@ impl Config {
             }
         }
         let (_, volume, vol) = best?;
+        // Resolve the DB URL through this volume's credential profile, so a
+        // cwd-selected vault on a non-default account gets the right database.
+        let resolved = creds.resolve(vol.credentials.as_deref());
         Some(Config {
-            versions_db: creds.versions_db,
+            versions_db: resolved.versions_db,
             volume: Some(volume),
             meta: None,
             cache: Some(vol.cache),
@@ -135,6 +273,54 @@ impl Config {
 }
 
 impl Credentials {
+    /// The default (unnamed) profile, assembled from the top-level fields.
+    fn default_profile(&self) -> CredProfile {
+        CredProfile {
+            versions_db: self.versions_db.clone(),
+            r2_endpoint: self.r2_endpoint.clone(),
+            r2_access_key_id: self.r2_access_key_id.clone(),
+            r2_secret_access_key: self.r2_secret_access_key.clone(),
+        }
+    }
+
+    /// Resolve the credential set for a volume's profile.
+    ///
+    /// - A **named** profile resolves each field from `[profiles.<name>]`, then
+    ///   falls back to the default (top-level) set. Env vars are *not* consulted
+    ///   for named profiles — a multi-account machine must keep each set in the
+    ///   file, so an ambient `R2_*` from one account can't leak into another.
+    /// - The **default** profile resolves each field from the file, then the
+    ///   environment (`TROVE_VERSIONS_DB`/`DATABASE_URL`, `TROVE_R2_ENDPOINT`,
+    ///   `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`) — the op/1Password path,
+    ///   where keys live only in the shell and were never written to disk.
+    pub fn resolve(&self, profile: Option<&str>) -> CredProfile {
+        let base = self.default_profile();
+        let named = profile
+            .filter(|p| !p.is_empty() && *p != "default")
+            .and_then(|p| self.profiles.get(p));
+        match named {
+            Some(p) => CredProfile {
+                versions_db: p.versions_db.clone().or(base.versions_db),
+                r2_endpoint: p.r2_endpoint.clone().or(base.r2_endpoint),
+                r2_access_key_id: p.r2_access_key_id.clone().or(base.r2_access_key_id),
+                r2_secret_access_key: p.r2_secret_access_key.clone().or(base.r2_secret_access_key),
+            },
+            None => CredProfile {
+                versions_db: base
+                    .versions_db
+                    .or_else(|| env_nonempty("TROVE_VERSIONS_DB"))
+                    .or_else(|| env_nonempty("DATABASE_URL")),
+                r2_endpoint: base.r2_endpoint.or_else(|| env_nonempty("TROVE_R2_ENDPOINT")),
+                r2_access_key_id: base
+                    .r2_access_key_id
+                    .or_else(|| env_nonempty("R2_ACCESS_KEY_ID")),
+                r2_secret_access_key: base
+                    .r2_secret_access_key
+                    .or_else(|| env_nonempty("R2_SECRET_ACCESS_KEY")),
+            },
+        }
+    }
+
     pub fn load() -> Credentials {
         let Ok(path) = Config::credentials_path() else {
             return Credentials::default();
@@ -176,6 +362,12 @@ impl VolumeConfig {
         std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
         Ok(path)
     }
+}
+
+/// An environment variable, treating empty-string as unset. (Mirrors
+/// `provision::env_nonempty`, kept local so config has no mount-feature dep.)
+fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|s| !s.is_empty())
 }
 
 fn config_dir() -> Result<PathBuf> {
@@ -512,5 +704,108 @@ mod tests {
             juicefs_meta_url("postgres://h/db", "trove_x"),
             "postgres://h/db?search_path=trove_x"
         );
+    }
+
+    // -- credential profiles --
+
+    /// A single-account file (no `[profiles]`) resolves through the default
+    /// profile — the top-level fields *are* that profile.
+    #[test]
+    fn top_level_fields_are_the_default_profile() {
+        let text = "versions_db = \"postgres://a\"\n\
+                    r2_endpoint = \"https://acctA.r2.cloudflarestorage.com\"\n\
+                    r2_access_key_id = \"ak\"\n\
+                    r2_secret_access_key = \"sk\"\n";
+        let creds: Credentials = toml::from_str(text).unwrap();
+        assert!(creds.profiles.is_empty());
+        let d = creds.resolve(None);
+        assert_eq!(d.versions_db.as_deref(), Some("postgres://a"));
+        assert_eq!(d.r2_access_key_id.as_deref(), Some("ak"));
+        // An unknown profile name falls back to the default set.
+        let f = creds.resolve(Some("nope"));
+        assert_eq!(f.versions_db.as_deref(), Some("postgres://a"));
+    }
+
+    #[test]
+    fn named_profile_overrides_default_and_round_trips() {
+        let mut creds = Credentials {
+            versions_db: Some("postgres://A".into()),
+            r2_endpoint: Some("https://acctA".into()),
+            r2_access_key_id: Some("akA".into()),
+            r2_secret_access_key: Some("skA".into()),
+            profiles: HashMap::new(),
+        };
+        creds.profiles.insert(
+            "work".into(),
+            CredProfile {
+                versions_db: Some("postgres://B".into()),
+                r2_endpoint: Some("https://acctB".into()),
+                r2_access_key_id: Some("akB".into()),
+                r2_secret_access_key: Some("skB".into()),
+            },
+        );
+        // Named profile wins entirely.
+        let w = creds.resolve(Some("work"));
+        assert_eq!(w.versions_db.as_deref(), Some("postgres://B"));
+        assert_eq!(w.r2_access_key_id.as_deref(), Some("akB"));
+        // `default`/None still resolves the top-level set.
+        assert_eq!(
+            creds.resolve(None).versions_db.as_deref(),
+            Some("postgres://A")
+        );
+        assert_eq!(
+            creds.resolve(Some("default")).versions_db.as_deref(),
+            Some("postgres://A")
+        );
+        // Round-trips through TOML with a `[profiles.work]` table.
+        let ser = toml::to_string_pretty(&creds).unwrap();
+        assert!(ser.contains("[profiles.work]"));
+        let back: Credentials = toml::from_str(&ser).unwrap();
+        assert_eq!(
+            back.resolve(Some("work")).r2_secret_access_key.as_deref(),
+            Some("skB")
+        );
+    }
+
+    /// A named profile missing a field falls back to the default (top-level) set
+    /// for that field only — the documented `named → default` chain.
+    #[test]
+    fn named_profile_falls_back_to_default_per_field() {
+        let mut creds = Credentials {
+            versions_db: Some("postgres://A".into()),
+            r2_endpoint: Some("https://acctA".into()),
+            r2_access_key_id: Some("akA".into()),
+            r2_secret_access_key: Some("skA".into()),
+            profiles: HashMap::new(),
+        };
+        creds.profiles.insert(
+            "partial".into(),
+            CredProfile {
+                versions_db: Some("postgres://B".into()),
+                ..Default::default()
+            },
+        );
+        let p = creds.resolve(Some("partial"));
+        assert_eq!(p.versions_db.as_deref(), Some("postgres://B")); // from profile
+        assert_eq!(p.r2_endpoint.as_deref(), Some("https://acctA")); // from default
+    }
+
+    #[test]
+    fn volume_config_credentials_field_is_optional() {
+        // Omitted ⇒ None (the default-profile fleet case).
+        let v: VolumeConfig = toml::from_str(
+            "bucket = \"b\"\nschema = \"s\"\nmountpoint = \"/m\"\ncache = \"/c\"\n",
+        )
+        .unwrap();
+        assert_eq!(v.credentials, None);
+        // Present ⇒ the named profile, and it round-trips.
+        let v2 = VolumeConfig {
+            credentials: Some("work".into()),
+            ..v
+        };
+        let text = toml::to_string_pretty(&v2).unwrap();
+        assert!(text.contains("credentials = \"work\""));
+        let back: VolumeConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back.credentials.as_deref(), Some("work"));
     }
 }

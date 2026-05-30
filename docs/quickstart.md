@@ -141,8 +141,29 @@ trove init
 #    → validates the bucket exists and whether it is empty/non-empty
 #    → creates or attaches the matching Postgres schema
 #    → writes ~/.config/trove/credentials.toml and ~/.config/trove/volumes/notes.toml
-#    → mounts this folder as the live vault
+#    → installs a per-vault boot agent and mounts in the background — shell back
 ```
+
+`trove init` (alias `trove attach`) sets this machine up and **mounts in the
+background**, so you get your prompt straight back. It also installs a per-vault
+**boot agent** (launchd on macOS, a `systemd --user` service on Linux) so the
+vault **re-mounts automatically at every login** — a FUSE mount never survives a
+reboot on its own, and that re-mounting is the whole point. Pass `--no-autostart`
+to skip the agent and mount in the foreground instead (no system change).
+
+Once mounted, the lifecycle is two command pairs:
+
+```bash
+trove ls                       # every vault on this machine + mount/agent status
+trove unmount --volume notes   # runtime "down for now" (re-mounts next login)
+trove mount --volume notes     # bring it back up now (what the boot agent runs)
+trove detach --volume notes    # remove this machine's footprint (backend untouched)
+```
+
+`unmount`/`mount` are transient up/down and never touch the config or agent.
+`detach` removes this machine's config + agent but **leaves the vault intact in
+its backend** — other machines are unaffected and `trove init` re-attaches here
+later. See [the vault lifecycle](/docs/lifecycle) for the full model.
 
 If the schema and a non-empty bucket already exist, `trove init` attaches this
 machine to that vault. If the bucket is missing, create it in R2 and re-run. If
@@ -199,6 +220,39 @@ cache      = "/tmp/trove-cache"
 `OPENAI_API_KEY` stays in the environment. R2 keys are read from the environment
 first and may be saved in the shared credentials file for local operator
 convenience.
+
+…plus a **boot agent** so the vault re-mounts at login:
+`~/Library/LaunchAgents/com.trove.notes.plist` (macOS) or the
+`systemd --user` instance `trove@notes.service` (Linux). It runs `trove mount
+--volume notes`, resolving everything from the saved config.
+
+### Many accounts on one machine — credential profiles
+
+The default (top-level) credentials back every volume — the fleet case (one DB +
+one R2 cred → many volumes). When a machine holds vaults on *different* accounts,
+add a **named profile** and attach under it:
+
+```bash
+cd work-notes
+trove init --profile work     # prompts for + saves [profiles.work]; this volume uses it
+```
+
+```toml
+# ~/.config/trove/credentials.toml
+versions_db = "postgres://…A"          # default profile (unchanged)
+r2_endpoint = "https://acctA.r2.cloudflarestorage.com"
+
+[profiles.work]                         # an independent account
+versions_db = "postgres://…B"
+r2_endpoint = "https://acctB.r2.cloudflarestorage.com"
+r2_access_key_id = "…"
+r2_secret_access_key = "…"
+```
+
+The volume records only `credentials = "work"` (a profile name, not a secret);
+every secret stays in the one `chmod 600` file. Volumes on different accounts
+auto-mount independently. Omit `--profile` and nothing changes — you never see
+profiles unless you need them.
 
 ### One database, many volumes — and nothing in `public`
 

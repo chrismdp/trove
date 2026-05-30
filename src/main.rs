@@ -23,12 +23,27 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Initialise or attach a vault using the current folder name, then mount it.
+    /// Initialise or attach a vault using the current folder name. Installs a
+    /// per-vault boot agent so it re-mounts at every login (auto-mount), and
+    /// starts that mount now in the background — you get your shell straight
+    /// back. Pass `--no-autostart` to mount in the foreground instead (no system
+    /// change). `attach` is an alias.
     #[cfg(feature = "mount")]
+    #[command(alias = "attach")]
     Init {
         /// Disable on-commit embedding for this mount.
         #[arg(long)]
         no_embed: bool,
+        /// Don't install the login boot agent — mount in the foreground (blocks
+        /// the terminal), like a bare `trove mount`. Use when you'd rather not
+        /// make a system change (installing a login agent).
+        #[arg(long)]
+        no_autostart: bool,
+        /// Attach this volume under a named credential profile — a separate
+        /// DB / R2 account. A new profile is prompted for and saved under
+        /// `[profiles.<name>]`. Omit for the default (single-account) creds.
+        #[arg(long)]
+        profile: Option<String>,
     },
 
     /// Validate every typed markdown file in a store against its type schema.
@@ -61,11 +76,41 @@ enum Command {
         port: u16,
     },
 
-    /// Mount a Trove filesystem at <mountpoint> (foreground).
+    /// Unmount a vault's live FUSE mount — runtime "down for now". The local
+    /// config and boot agent are untouched, so it re-mounts at the next login.
+    /// Resolves the vault by `--volume <name>` or the current folder.
+    #[cfg(feature = "mount")]
+    Unmount {
+        /// Volume to unmount. Defaults to the vault of the current folder.
+        #[arg(long)]
+        volume: Option<String>,
+    },
+
+    /// Detach a vault from this machine: unmount, remove its boot agent, and
+    /// delete the local config. The backend (schema + bucket) is **left intact**
+    /// — other machines are unaffected and `trove init` re-attaches it here
+    /// later. (Destroying a vault is a separate, manual step.)
+    #[cfg(feature = "mount")]
+    Detach {
+        /// Volume to detach. Defaults to the vault of the current folder.
+        #[arg(long)]
+        volume: Option<String>,
+    },
+
+    /// List every vault configured on this machine with its mount + boot-agent
+    /// status — the fleet view.
+    #[cfg(feature = "mount")]
+    Ls,
+
+    /// Mount a Trove filesystem (foreground). Give a <mountpoint>, or resolve a
+    /// vault entirely from its saved config — by `--volume <name>` or the
+    /// current folder. The `--volume` form (no cwd, no ambient env) is what each
+    /// boot agent runs.
     #[cfg(feature = "mount")]
     Mount {
-        /// Where to mount (an existing empty directory).
-        mountpoint: PathBuf,
+        /// Where to mount (an existing empty directory). Omit to resolve the
+        /// mountpoint from saved config via `--volume <name>` or the cwd's vault.
+        mountpoint: Option<PathBuf>,
         /// Mount onto a non-empty directory. By default `trove mount` refuses
         /// — FUSE overlays the mountpoint, so existing files become invisible
         /// while mounted (recoverable on unmount, but alarming). Pass this when
@@ -375,6 +420,22 @@ fn openai_key() -> Result<String> {
     std::env::var("OPENAI_API_KEY").map_err(|_| anyhow::anyhow!("OPENAI_API_KEY not set"))
 }
 
+/// Resolve the target volume name for a lifecycle command: the explicit
+/// `--volume` flag, else the vault of the current folder (from config). The
+/// boot agent always passes `--volume` (it has no cwd); a person in a vault
+/// folder can omit it.
+#[cfg(feature = "mount")]
+fn volume_name(flag: Option<String>, cfg: &trove::config::Config) -> Result<String> {
+    flag.filter(|s| !s.is_empty())
+        .or_else(|| cfg.volume.clone())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no volume — pass `--volume <name>`, or run inside a vault folder. \
+                 `trove ls` lists what's configured."
+            )
+        })
+}
+
 /// Returns the number of failed files (0 = clean).
 fn run() -> Result<usize> {
     let cli = Cli::parse();
@@ -382,43 +443,112 @@ fn run() -> Result<usize> {
     let cfg = trove::config::Config::load();
     match cli.command {
         #[cfg(feature = "mount")]
-        Command::Init { no_embed } => {
-            let init = trove::commands::init::run(trove::commands::init::InitOptions { no_embed })?;
-            let fs = trove::jfs::Fs::init(
-                &init.volume,
-                &trove::config::juicefs_meta_url(&init.meta, &init.schema),
-                &init.cache,
-            )?;
-            // The type registry travels *in* the vault (`<vault>/.types/`),
-            // versioned like any file. Read it through the volume (libjfs), not
-            // local disk — so attaching to an existing vault picks up its schemas
-            // (the local folder is empty until the mount surfaces the content).
-            let registry = trove::types::Registry::load_from_fs(&fs)?;
-            let versions = Some(trove::version::VersionStore::connect(
-                &init.versions_db,
-                Some(&init.schema),
-            )?);
-            let embed_tx = if !no_embed {
-                match openai_key() {
-                    Ok(key) => Some(trove::embed::spawn_embedder(
-                        &init.versions_db,
-                        key,
-                        Some(&init.schema),
-                    )?),
-                    Err(_) => {
-                        eprintln!(
-                            "{} OPENAI_API_KEY not set — embedding disabled for this mount",
-                            "warning:".yellow().bold()
-                        );
-                        None
+        Command::Init {
+            no_embed,
+            no_autostart,
+            profile,
+        } => {
+            let init = trove::commands::init::run(trove::commands::init::InitOptions {
+                no_embed,
+                profile,
+            })?;
+            if no_autostart {
+                // Foreground mount: no system change, blocks the terminal (the
+                // classic `trove mount` shape). The vault is *not* set to come
+                // back after logout/reboot — that's what the boot agent is for.
+                let fs = trove::jfs::Fs::init(
+                    &init.volume,
+                    &trove::config::juicefs_meta_url(&init.meta, &init.schema),
+                    &init.cache,
+                )?;
+                // The type registry travels *in* the vault (`<vault>/.types/`),
+                // versioned like any file. Read it through the volume (libjfs),
+                // not local disk — so attaching to an existing vault picks up its
+                // schemas (the local folder is empty until the mount surfaces it).
+                let registry = trove::types::Registry::load_from_fs(&fs)?;
+                let versions = Some(trove::version::VersionStore::connect(
+                    &init.versions_db,
+                    Some(&init.schema),
+                )?);
+                let embed_tx = if !no_embed {
+                    match openai_key() {
+                        Ok(key) => Some(trove::embed::spawn_embedder(
+                            &init.versions_db,
+                            key,
+                            Some(&init.schema),
+                        )?),
+                        Err(_) => {
+                            eprintln!(
+                                "{} OPENAI_API_KEY not set — embedding disabled for this mount",
+                                "warning:".yellow().bold()
+                            );
+                            None
+                        }
                     }
-                }
+                } else {
+                    None
+                };
+                println!(
+                    "{} mounting `{}` at {} (foreground — Ctrl-C to unmount)",
+                    "trove init:".bold(),
+                    init.volume,
+                    init.mountpoint.display()
+                );
+                trove::mount::mount_blocking(fs, registry, versions, embed_tx, &init.mountpoint)?;
             } else {
-                None
-            };
-            trove::mount::mount_blocking(fs, registry, versions, embed_tx, &init.mountpoint)?;
+                // A boot agent runs with a bare environment. If the R2 keys live
+                // only in the user's shell (op/1Password flow), the agent's mount
+                // can't reach the object store — warn before installing one.
+                if init.keys_in_env_only {
+                    eprintln!(
+                        "{} your R2 keys come from the environment and aren't saved to \
+                         credentials.toml. The login boot agent runs without your shell env, so \
+                         auto-mount will fail to reach the object store.\n  \
+                         Fix: add `r2_access_key_id` + `r2_secret_access_key` to \
+                         ~/.config/trove/credentials.toml, or re-run with `--no-autostart`.",
+                        "warning:".yellow().bold()
+                    );
+                }
+                // Install + start the per-vault boot agent. The mount runs in the
+                // background and re-mounts at every login; you get your shell
+                // back immediately. The set of agents IS this machine's vault
+                // membership — removed only by `trove detach`.
+                let mountpoint = init.mountpoint.to_string_lossy().into_owned();
+                trove::platform::install_agent(&init.volume, &mountpoint)?;
+                println!(
+                    "{} `{}` will auto-mount at login and is mounting now at {} ({}).",
+                    "trove init:".bold(),
+                    init.volume,
+                    mountpoint,
+                    trove::platform::agent_status(&init.volume).label()
+                );
+                println!("  logs: {}", trove::platform::log_hint(&init.volume));
+                println!(
+                    "  {} `trove ls` · `trove unmount --volume {}` (down for now) · `trove detach --volume {}` (remove here)",
+                    "·".dimmed(),
+                    init.volume,
+                    init.volume
+                );
+            }
             Ok(0)
         }
+
+        #[cfg(feature = "mount")]
+        Command::Unmount { volume } => {
+            let name = volume_name(volume, &cfg)?;
+            trove::commands::lifecycle::unmount(&name)?;
+            Ok(0)
+        }
+
+        #[cfg(feature = "mount")]
+        Command::Detach { volume } => {
+            let name = volume_name(volume, &cfg)?;
+            trove::commands::lifecycle::detach(&name)?;
+            Ok(0)
+        }
+
+        #[cfg(feature = "mount")]
+        Command::Ls => trove::commands::lifecycle::ls(),
 
         Command::Check { store, quiet } => {
             let s = trove::commands::check::run(&store, quiet)?;
@@ -472,6 +602,18 @@ fn run() -> Result<usize> {
             versions_db,
             no_embed,
         } => {
+            // No explicit <mountpoint>: resolve the whole vault (mountpoint,
+            // schema, cache, creds) from its saved config — by `--volume <name>`
+            // or, inside a vault folder, the current directory's vault. This is
+            // the form each boot agent runs (it passes `--volume`; it has no cwd).
+            let mountpoint = match mountpoint {
+                Some(mp) => mp,
+                None => {
+                    let name = volume_name(volume.clone(), &cfg)?;
+                    trove::commands::lifecycle::mount_volume(&name, no_embed)?;
+                    return Ok(0);
+                }
+            };
             // FUSE overlays the mountpoint while mounted — any existing files
             // become invisible (recoverable on unmount, but alarming). Refuse
             // non-empty mountpoints by default; the `--allow-non-empty` escape

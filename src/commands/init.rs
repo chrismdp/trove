@@ -24,11 +24,15 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use crate::commands::provision::{self, FormatAction, MigrationAction, ProvisionFlags};
-use crate::config::{self, Credentials, VolumeConfig};
+use crate::config::{self, CredProfile, Credentials, VolumeConfig};
 use crate::s3::{BucketProbe, BucketState};
 
 pub struct InitOptions {
     pub no_embed: bool,
+    /// Credential profile to attach this volume under. `None` ⇒ the default
+    /// (top-level) credentials — the common, single-account case. A named
+    /// profile is prompted for and saved under `[profiles.<name>]` if new.
+    pub profile: Option<String>,
 }
 
 pub struct InitMount {
@@ -39,6 +43,11 @@ pub struct InitMount {
     pub meta: String,
     pub cache: String,
     pub versions_db: String,
+    /// True when the R2 keys came from the environment and were *not* written to
+    /// `credentials.toml` (the op/1Password flow). A boot agent runs with a bare
+    /// environment, so auto-mount can't reach the object store — the caller
+    /// warns before installing one.
+    pub keys_in_env_only: bool,
 }
 
 /// R2 inputs that passed a live probe, plus where the keys came from.
@@ -66,38 +75,116 @@ pub fn run(opts: InitOptions) -> Result<InitMount> {
     let tty = io::stdin().is_terminal();
     let mut creds = Credentials::load();
 
+    // The credential profile this volume attaches under. `default`/empty ⇒ the
+    // top-level (default) creds; a named profile is independent (its own
+    // account) and never consults env — the keys must live in the file.
+    let profile = opts
+        .profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty() && *p != "default");
+    let consult_env = profile.is_none();
+
     println!(
-        "{} folder `{}` -> schema `{}` · bucket `{}`",
+        "{} folder `{}` -> schema `{}` · bucket `{}`{}",
         "trove init:".bold(),
         basename,
         schema.cyan(),
-        bucket_name.cyan()
+        bucket_name.cyan(),
+        profile
+            .map(|p| format!(" · profile {}", p.cyan()))
+            .unwrap_or_default()
     );
 
-    // With no TTY we can't prompt, so everything must already resolve — print a
-    // setup guide and bail if not, rather than failing one variable at a time.
+    // Seed the resolver from the file: the named profile if one is requested,
+    // else the default (top-level) creds. Env is folded in by the resolvers
+    // themselves, but only for the default profile.
+    let seed = match profile {
+        Some(name) => creds.profiles.get(name).cloned().unwrap_or_default(),
+        None => CredProfile {
+            versions_db: creds.versions_db.clone(),
+            r2_endpoint: creds.r2_endpoint.clone(),
+            r2_access_key_id: creds.r2_access_key_id.clone(),
+            r2_secret_access_key: creds.r2_secret_access_key.clone(),
+        },
+    };
+
+    // With no TTY we can't prompt, so everything must already resolve. For the
+    // default profile that means env/creds (print the agent guide); for a named
+    // profile it means a complete `[profiles.<name>]` block.
     if !tty {
-        noninteractive_guard(&creds, &bucket_name)?;
+        let seen_db = seed.versions_db.is_some()
+            || (consult_env
+                && (provision::env_nonempty("TROVE_VERSIONS_DB").is_some()
+                    || provision::env_nonempty("DATABASE_URL").is_some()));
+        let seen_ep = seed.r2_endpoint.is_some()
+            || (consult_env && provision::env_nonempty("TROVE_R2_ENDPOINT").is_some());
+        let seen_ak = seed.r2_access_key_id.is_some()
+            || (consult_env && provision::env_nonempty("R2_ACCESS_KEY_ID").is_some());
+        let seen_sk = seed.r2_secret_access_key.is_some()
+            || (consult_env && provision::env_nonempty("R2_SECRET_ACCESS_KEY").is_some());
+        if !(seen_db && seen_ep && seen_ak && seen_sk) {
+            match profile {
+                None => {
+                    print_agent_guide(seen_db, seen_ep, seen_ak, seen_sk);
+                    bail!(
+                        "not enough configuration in the environment and no TTY to prompt — \
+                         set the variables above, then re-run `trove init`"
+                    );
+                }
+                Some(name) => bail!(
+                    "credential profile `{name}` is incomplete and there's no TTY to prompt — \
+                     add a full `[profiles.{name}]` block (versions_db + r2 endpoint/keys) to \
+                     credentials.toml, then re-run."
+                ),
+            }
+        }
     }
 
     // Resolve + validate each credential, re-prompting on failure (at a TTY).
-    let (versions_db, mut client) = resolve_and_connect_db(&creds, tty)?;
-    let r2 = resolve_and_probe_r2(&creds, tty, &bucket_name)?;
+    let (versions_db, mut client) = resolve_and_connect_db(seed.versions_db.clone(), consult_env, tty)?;
+    let r2 = resolve_and_probe_r2(
+        seed.r2_endpoint.clone(),
+        seed.r2_access_key_id.clone(),
+        seed.r2_secret_access_key.clone(),
+        consult_env,
+        tty,
+        &bucket_name,
+    )?;
 
-    // Everything that *can* be checked has passed → persist the shared creds.
-    // (Done even when the bucket is missing: the creds are valid, so the re-run
-    // after you create the bucket won't ask again.) Keep env the source of truth
-    // for the keys — only persist a key we gathered ourselves.
-    creds.versions_db = Some(versions_db.clone());
-    creds.r2_endpoint = Some(r2.endpoint.clone());
-    if !r2.access_from_env {
-        creds.r2_access_key_id = Some(r2.access_key.clone());
-    }
-    if !r2.secret_from_env {
-        creds.r2_secret_access_key = Some(r2.secret_key.clone());
-    }
+    // Everything that *can* be checked has passed → persist the creds. (Done
+    // even when the bucket is missing: the creds are valid, so the re-run after
+    // you create the bucket won't ask again.) The keys must also reach libjfs
+    // this run, so push them into the environment regardless of source.
     std::env::set_var("R2_ACCESS_KEY_ID", &r2.access_key);
     std::env::set_var("R2_SECRET_ACCESS_KEY", &r2.secret_key);
+    match profile {
+        None => {
+            // Default profile: keep env the source of truth for the keys — only
+            // persist a key we gathered ourselves (typed at the prompt).
+            creds.versions_db = Some(versions_db.clone());
+            creds.r2_endpoint = Some(r2.endpoint.clone());
+            if !r2.access_from_env {
+                creds.r2_access_key_id = Some(r2.access_key.clone());
+            }
+            if !r2.secret_from_env {
+                creds.r2_secret_access_key = Some(r2.secret_key.clone());
+            }
+        }
+        Some(name) => {
+            // Named profile: self-contained (no env source), so persist all four
+            // so the boot agent can resolve them with nothing in the shell.
+            creds.profiles.insert(
+                name.to_string(),
+                CredProfile {
+                    versions_db: Some(versions_db.clone()),
+                    r2_endpoint: Some(r2.endpoint.clone()),
+                    r2_access_key_id: Some(r2.access_key.clone()),
+                    r2_secret_access_key: Some(r2.secret_key.clone()),
+                },
+            );
+        }
+    }
     let cred_path = creds.save()?;
     println!("{} saved credentials to {}", "trove init:".bold(), cred_path.display());
 
@@ -179,18 +266,18 @@ pub fn run(opts: InitOptions) -> Result<InitMount> {
         schema: schema.clone(),
         mountpoint: mountpoint.to_string_lossy().into_owned(),
         cache: cache.clone(),
+        credentials: profile.map(|s| s.to_string()),
     };
     let vol_path = vol_cfg.save(&volume)?;
     println!("{} wrote {}", "trove init:".bold(), vol_path.display());
-    println!(
-        "{} mounting `{volume}` at {}",
-        "trove init:".bold(),
-        mountpoint.display()
-    );
 
     if opts.no_embed {
         println!("{} embedding disabled for this mount", "trove init:".bold());
     }
+
+    // Only the default profile defers keys to env; named profiles always
+    // persist all four, so their boot agent is self-sufficient.
+    let keys_in_env_only = profile.is_none() && (r2.access_from_env || r2.secret_from_env);
 
     Ok(InitMount {
         volume,
@@ -200,6 +287,7 @@ pub fn run(opts: InitOptions) -> Result<InitMount> {
         meta: versions_db.clone(),
         cache,
         versions_db,
+        keys_in_env_only,
     })
 }
 
@@ -208,10 +296,18 @@ pub fn run(opts: InitOptions) -> Result<InitMount> {
 /// DB URL precedence: env (`TROVE_VERSIONS_DB`, then `DATABASE_URL`) → creds
 /// file → interactive prompt. The candidate is **connected** before being
 /// accepted; a failure re-prompts (at a TTY) so a typo is fixed in place.
-fn resolve_and_connect_db(creds: &Credentials, tty: bool) -> Result<(String, Client)> {
-    let mut candidate = provision::env_nonempty("TROVE_VERSIONS_DB")
-        .or_else(|| provision::env_nonempty("DATABASE_URL"))
-        .or_else(|| creds.versions_db.clone());
+fn resolve_and_connect_db(
+    file_seed: Option<String>,
+    consult_env: bool,
+    tty: bool,
+) -> Result<(String, Client)> {
+    let mut candidate = if consult_env {
+        provision::env_nonempty("TROVE_VERSIONS_DB")
+            .or_else(|| provision::env_nonempty("DATABASE_URL"))
+            .or(file_seed)
+    } else {
+        file_seed
+    };
     let mut explained = false;
     loop {
         let url = match candidate.take() {
@@ -253,14 +349,27 @@ fn resolve_and_connect_db(creds: &Credentials, tty: bool) -> Result<(String, Cli
 /// `ListObjectsV2`. A bad endpoint shape or a failed probe (403 / unreachable)
 /// re-prompts the trio at a TTY. A `404` (bucket not created yet) is *success*
 /// for the credentials — it's returned as [`BucketState::Missing`].
-fn resolve_and_probe_r2(creds: &Credentials, tty: bool, bucket_name: &str) -> Result<R2Resolved> {
-    let ak_env = provision::env_nonempty("R2_ACCESS_KEY_ID");
-    let sk_env = provision::env_nonempty("R2_SECRET_ACCESS_KEY");
-    let mut ep_c = provision::env_nonempty("TROVE_R2_ENDPOINT")
-        .or_else(|| provision::env_nonempty("TROVE_R2_BUCKET"))
-        .or_else(|| creds.r2_endpoint.clone());
-    let mut ak_c = ak_env.clone().or_else(|| creds.r2_access_key_id.clone());
-    let mut sk_c = sk_env.clone().or_else(|| creds.r2_secret_access_key.clone());
+fn resolve_and_probe_r2(
+    file_ep: Option<String>,
+    file_ak: Option<String>,
+    file_sk: Option<String>,
+    consult_env: bool,
+    tty: bool,
+    bucket_name: &str,
+) -> Result<R2Resolved> {
+    let ak_env = consult_env.then(|| provision::env_nonempty("R2_ACCESS_KEY_ID")).flatten();
+    let sk_env = consult_env
+        .then(|| provision::env_nonempty("R2_SECRET_ACCESS_KEY"))
+        .flatten();
+    let mut ep_c = if consult_env {
+        provision::env_nonempty("TROVE_R2_ENDPOINT")
+            .or_else(|| provision::env_nonempty("TROVE_R2_BUCKET"))
+            .or(file_ep)
+    } else {
+        file_ep
+    };
+    let mut ak_c = ak_env.clone().or(file_ak);
+    let mut sk_c = sk_env.clone().or(file_sk);
     let mut explained_ep = false;
     let mut explained_key = false;
 
@@ -381,29 +490,6 @@ fn connect_db(url: &str) -> Result<Client> {
 /// Heuristic for "this is Supabase's direct (non-pooler) host".
 fn is_supabase_direct(url: &str) -> bool {
     url.contains("@db.") && url.contains(".supabase.co")
-}
-
-/// No-TTY guard: every required value must already resolve from env / creds
-/// file, else print the setup guide (with a ✓/✗ per variable) and bail.
-fn noninteractive_guard(creds: &Credentials, _bucket_name: &str) -> Result<()> {
-    let db = provision::env_nonempty("TROVE_VERSIONS_DB")
-        .or_else(|| provision::env_nonempty("DATABASE_URL"))
-        .or_else(|| creds.versions_db.clone());
-    let ep = provision::env_nonempty("TROVE_R2_ENDPOINT")
-        .or_else(|| provision::env_nonempty("TROVE_R2_BUCKET"))
-        .or_else(|| creds.r2_endpoint.clone());
-    let ak =
-        provision::env_nonempty("R2_ACCESS_KEY_ID").or_else(|| creds.r2_access_key_id.clone());
-    let sk = provision::env_nonempty("R2_SECRET_ACCESS_KEY")
-        .or_else(|| creds.r2_secret_access_key.clone());
-    if db.is_some() && ep.is_some() && ak.is_some() && sk.is_some() {
-        return Ok(());
-    }
-    print_agent_guide(db.is_some(), ep.is_some(), ak.is_some(), sk.is_some());
-    bail!(
-        "not enough configuration in the environment and no TTY to prompt — \
-         set the variables above, then re-run `trove init`"
-    )
 }
 
 /// The non-interactive setup guide — printed when `trove init` runs with no TTY

@@ -86,6 +86,10 @@ slug = "running"
 title = "Running it end-to-end"
 
 [[sections.pages]]
+slug = "lifecycle"
+title = "The vault lifecycle"
+
+[[sections.pages]]
 slug = "usage"
 title = "trove usage"
 

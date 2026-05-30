@@ -230,31 +230,16 @@ Open in a browser. File list, search box, raw content viewer. Bound to
 **localhost only**; front with nginx for external access. No auth in
 v0.1 (single-tenant).
 
-## A systemd unit for the mount
+## Auto-mount at login — handled for you
 
-```ini
-# /etc/systemd/system/trove-mount.service
-[Unit]
-Description=Trove FUSE mount
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/trove mount /mnt/trove --types /home/cp/vault
-Restart=on-failure
-RestartSec=5s
-User=cp
-Environment="OPENAI_API_KEY=sk-..."
-Environment="R2_ACCESS_KEY_ID=..."
-Environment="R2_SECRET_ACCESS_KEY=..."
-
-[Install]
-WantedBy=default.target
-```
-
-`systemctl --user enable --now trove-mount.service`. The mount
-auto-restarts on crash. Embeddings restart with it (the thread is
-in-process).
+You don't write a unit file by hand. `trove init` (= `trove attach`) installs a
+**per-vault boot agent** that re-mounts the vault at every login — a launchd
+LaunchAgent on macOS, a `systemd --user` instance (`trove@<vault>.service`) on
+Linux — and starts it now in the background. `trove detach` removes it. See
+[the vault lifecycle](/docs/lifecycle) for the full model, log locations, and the
+conservative restart policy (start-at-login yes; auto-restart-on-crash off until
+the mount path is proven). To run a mount in the foreground instead, use
+`trove init --no-autostart` or a bare `trove mount`.
 
 See [`trove usage`](/docs/usage) to check storage growth at a glance — DB
 size, embedding backlog, and the bucket's bill-shaped figure.

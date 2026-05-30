@@ -9,6 +9,11 @@ pub mod provision;
 #[cfg(feature = "mount")]
 pub mod init;
 
+/// `trove mount --volume` / `unmount` / `detach` / `ls` — the vault lifecycle
+/// command pairs (runtime up/down + machine membership) and the fleet view.
+#[cfg(feature = "mount")]
+pub mod lifecycle;
+
 /// `trove docs` — embedded walkthrough served on localhost. No native deps,
 /// so it's available in the core build (not gated on `mount`).
 pub mod docs;

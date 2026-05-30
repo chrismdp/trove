@@ -51,8 +51,13 @@ trove init
 
 Trove derives the schema and bucket from the folder name, writes shared
 credentials under `~/.config/trove/credentials.toml`, writes per-volume config
-under `~/.config/trove/volumes/`, provisions or attaches the backend, and mounts
-the vault at the current directory.
+under `~/.config/trove/volumes/`, provisions or attaches the backend, installs a
+per-vault boot agent so it **re-mounts at every login**, and mounts the vault in
+the background — so you get your shell straight back. `trove ls` shows every
+vault on the machine; `trove unmount` / `trove mount --volume <name>` take one
+down and up; `trove detach` removes a vault from this machine while leaving its
+backend intact. See **[the vault lifecycle](docs/lifecycle.md)** for the full
+model and **[`trove docs lifecycle`](docs/lifecycle.md)** in the shipped manual.
 
 ## Status — v0.1 (single-tenant)
 
@@ -85,11 +90,19 @@ a schema is how you migrate; writes self-heal lazily as records are touched.
 ## Commands
 
 - **`trove check <store>`** — schema-on-write validation. ✅
-- **`trove init`** — initialise or attach the current folder as a vault. ✅
-- **`trove mount <mnt> --volume … --meta … [--types …] [--versions-db …] [--embed]`**
-  — the FUSE projection. The validation gate runs on the write path (a
-  schema-violating `fsync` returns `EINVAL` + a `.errors` sidecar); `--versions-db`
-  turns on COW version history; `--embed` self-triggers embedding on each commit. ✅
+- **`trove init`** (alias **`attach`**) — set this machine up for the current
+  folder's vault, install the login boot agent, and mount in the background.
+  `--no-autostart` mounts in the foreground without an agent; `--profile <name>`
+  attaches under a separate credential profile. ✅
+- **`trove ls`** — every vault on this machine with its mount + boot-agent status. ✅
+- **`trove mount --volume <name>`** — mount a vault resolved entirely from its
+  saved config (the form the boot agent runs); or **`trove mount <mnt> --volume …
+  --meta … [--types …] [--versions-db …]`** for an explicit mountpoint. The
+  validation gate runs on the write path (a schema-violating `fsync` returns
+  `EINVAL` + a `.errors` sidecar); `--versions-db` turns on COW version history. ✅
+- **`trove unmount --volume <name>`** — runtime down (re-mounts at next login). ✅
+- **`trove detach --volume <name>`** — remove this machine's footprint (config +
+  agent); the backend (schema + bucket) is left intact. ✅
 - **`trove embed --volume … --meta … --versions-db … [--watch SECS]`** — backfill /
   poll embeddings for any un-embedded blobs. ✅
 - **`trove search`** — semantic query over the embeddings. _next_

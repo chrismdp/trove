@@ -31,3 +31,9 @@ pub mod mount;
 /// Read-only S3/R2 bucket probes used by `trove init`.
 #[cfg(feature = "mount")]
 pub mod s3;
+
+/// Cross-platform boot-agent layer (launchd / systemd --user) powering
+/// auto-mount at login. One agent per vault; the set of agents is the machine's
+/// vault membership.
+#[cfg(feature = "mount")]
+pub mod platform;
