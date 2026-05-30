@@ -217,11 +217,12 @@ mountpoint = "/home/you/notes"
 cache      = "/tmp/trove-cache"
 ```
 
-`OPENAI_API_KEY` stays in the environment. The DB URL and R2 endpoint + keys are
-**prompted for at init**, defaulting to any matching env vars you've set (press
-Enter to accept, or edit in place), and are **always saved** to
-`credentials.toml`. Saving them is what lets the boot agent mount — it runs with
-a bare environment, so anything left only in your shell wouldn't reach it.
+The DB URL, R2 endpoint + keys, **and `OPENAI_API_KEY`** are all **prompted for
+at init**, defaulting to any matching env vars you've set (press Enter to accept,
+or edit in place), and **saved** to `credentials.toml`. The OpenAI key is the one
+optional of these — leave it blank to skip embedding. Saving them is what lets
+the boot agent mount *and embed* — it runs with a bare environment, so anything
+left only in your shell wouldn't reach it.
 
 …plus a **boot agent** so the vault re-mounts at login:
 `~/Library/LaunchAgents/com.trove.notes.plist` (macOS) or the

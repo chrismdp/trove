@@ -52,6 +52,11 @@ pub struct CredProfile {
     pub r2_access_key_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub r2_secret_access_key: Option<String>,
+    /// OpenAI API key for on-commit embedding + `trove search`. Optional (a
+    /// vault works fine without it — embedding is just disabled). Saved here so
+    /// the boot agent, which runs with a bare environment, can embed.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub openai_api_key: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -67,6 +72,8 @@ pub struct Credentials {
     pub r2_access_key_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub r2_secret_access_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub openai_api_key: Option<String>,
     /// Named, independent credential sets. Volumes select one via
     /// `credentials = "<name>"`; omitting it uses the default (top-level) set.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -280,6 +287,7 @@ impl Credentials {
             r2_endpoint: self.r2_endpoint.clone(),
             r2_access_key_id: self.r2_access_key_id.clone(),
             r2_secret_access_key: self.r2_secret_access_key.clone(),
+            openai_api_key: self.openai_api_key.clone(),
         }
     }
 
@@ -304,6 +312,7 @@ impl Credentials {
                 r2_endpoint: p.r2_endpoint.clone().or(base.r2_endpoint),
                 r2_access_key_id: p.r2_access_key_id.clone().or(base.r2_access_key_id),
                 r2_secret_access_key: p.r2_secret_access_key.clone().or(base.r2_secret_access_key),
+                openai_api_key: p.openai_api_key.clone().or(base.openai_api_key),
             },
             None => CredProfile {
                 versions_db: base
@@ -317,6 +326,7 @@ impl Credentials {
                 r2_secret_access_key: base
                     .r2_secret_access_key
                     .or_else(|| env_nonempty("R2_SECRET_ACCESS_KEY")),
+                openai_api_key: base.openai_api_key.or_else(|| env_nonempty("OPENAI_API_KEY")),
             },
         }
     }
@@ -733,6 +743,7 @@ mod tests {
             r2_endpoint: Some("https://acctA".into()),
             r2_access_key_id: Some("akA".into()),
             r2_secret_access_key: Some("skA".into()),
+            openai_api_key: Some("sk-A".into()),
             profiles: HashMap::new(),
         };
         creds.profiles.insert(
@@ -742,12 +753,15 @@ mod tests {
                 r2_endpoint: Some("https://acctB".into()),
                 r2_access_key_id: Some("akB".into()),
                 r2_secret_access_key: Some("skB".into()),
+                openai_api_key: Some("sk-B".into()),
             },
         );
         // Named profile wins entirely.
         let w = creds.resolve(Some("work"));
         assert_eq!(w.versions_db.as_deref(), Some("postgres://B"));
         assert_eq!(w.r2_access_key_id.as_deref(), Some("akB"));
+        assert_eq!(w.openai_api_key.as_deref(), Some("sk-B"));
+        assert_eq!(creds.resolve(None).openai_api_key.as_deref(), Some("sk-A"));
         // `default`/None still resolves the top-level set.
         assert_eq!(
             creds.resolve(None).versions_db.as_deref(),
@@ -776,6 +790,7 @@ mod tests {
             r2_endpoint: Some("https://acctA".into()),
             r2_access_key_id: Some("akA".into()),
             r2_secret_access_key: Some("skA".into()),
+            openai_api_key: None,
             profiles: HashMap::new(),
         };
         creds.profiles.insert(

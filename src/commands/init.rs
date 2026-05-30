@@ -99,6 +99,7 @@ pub fn run(opts: InitOptions) -> Result<InitMount> {
             r2_endpoint: creds.r2_endpoint.clone(),
             r2_access_key_id: creds.r2_access_key_id.clone(),
             r2_secret_access_key: creds.r2_secret_access_key.clone(),
+            openai_api_key: creds.openai_api_key.clone(),
         },
     };
 
@@ -145,20 +146,29 @@ pub fn run(opts: InitOptions) -> Result<InitMount> {
         &bucket_name,
     )?;
 
+    // The OpenAI key follows the same pattern, but it's OPTIONAL: a vault works
+    // without it (embedding just turns off). Default to env/file, still ask
+    // (blank skips), and save what we get so the bare-env boot agent can embed.
+    let openai = resolve_openai(seed.openai_api_key.clone(), consult_env, tty, opts.no_embed)?;
+
     // Everything that *can* be checked has passed → persist the creds. (Done
     // even when the bucket is missing: the creds are valid, so the re-run after
-    // you create the bucket won't ask again.) Always save all four, whatever
-    // their source — env values were confirmed at the prompt above, and saving
-    // them is what makes the vault self-sufficient: the boot agent runs with a
-    // bare environment, so it can only mount if the keys live in the file. The
-    // keys must also reach libjfs this run, so push them into the environment.
+    // you create the bucket won't ask again.) Always save them, whatever their
+    // source — env values were confirmed at the prompt above, and saving them is
+    // what makes the vault self-sufficient: the boot agent runs with a bare
+    // environment, so it can only mount + embed if the keys live in the file. The
+    // keys must also reach libjfs / the embedder this run, via the environment.
     std::env::set_var("R2_ACCESS_KEY_ID", &r2.access_key);
     std::env::set_var("R2_SECRET_ACCESS_KEY", &r2.secret_key);
+    if let Some(k) = &openai {
+        std::env::set_var("OPENAI_API_KEY", k);
+    }
     let resolved = CredProfile {
         versions_db: Some(versions_db.clone()),
         r2_endpoint: Some(r2.endpoint.clone()),
         r2_access_key_id: Some(r2.access_key.clone()),
         r2_secret_access_key: Some(r2.secret_key.clone()),
+        openai_api_key: openai.clone(),
     };
     match profile {
         None => {
@@ -166,6 +176,7 @@ pub fn run(opts: InitOptions) -> Result<InitMount> {
             creds.r2_endpoint = resolved.r2_endpoint.clone();
             creds.r2_access_key_id = resolved.r2_access_key_id.clone();
             creds.r2_secret_access_key = resolved.r2_secret_access_key.clone();
+            creds.openai_api_key = resolved.openai_api_key.clone();
         }
         Some(name) => {
             creds.profiles.insert(name.to_string(), resolved);
@@ -466,6 +477,29 @@ fn resolve_and_probe_r2(
     }
 }
 
+/// Resolve the OpenAI API key (on-commit embedding + `trove search`). Unlike the
+/// DB / R2 creds this is **optional** — a blank prompt (and nothing in env/file)
+/// just disables embedding. Defaults to env (default profile only) → the saved
+/// file value, still asks at a TTY, and the result is saved so the bare-env boot
+/// agent can embed. `--no-embed` skips the prompt (nothing to embed this run) but
+/// still carries any known value through to be saved.
+fn resolve_openai(
+    file_seed: Option<String>,
+    consult_env: bool,
+    tty: bool,
+    no_embed: bool,
+) -> Result<Option<String>> {
+    let default = if consult_env {
+        provision::env_nonempty("OPENAI_API_KEY").or(file_seed)
+    } else {
+        file_seed
+    };
+    if no_embed || !tty {
+        return Ok(default);
+    }
+    ask_optional_secret_with_default("OPENAI_API_KEY (embeddings + search)", default.as_deref())
+}
+
 /// Connect to the version DB. Validates the URL's scheme first, then connects,
 /// turning the most common failure (Supabase's IPv6-only *direct* host) into
 /// actionable guidance rather than a bare DNS error.
@@ -590,6 +624,47 @@ fn ask_secret_with_default(name: &str, default: Option<&str>) -> Result<String> 
             }
         }
     }
+}
+
+/// Hidden prompt for an OPTIONAL secret offering a default. Enter keeps the
+/// default (or skips, if there is none); `-` clears it; anything else replaces
+/// it. Returns `None` when the secret is skipped/cleared.
+fn ask_optional_secret_with_default(name: &str, default: Option<&str>) -> Result<Option<String>> {
+    let prompt = match default {
+        Some(d) => format!(
+            "{name} [{}-char value set — Enter to keep, paste to change, '-' to clear]: ",
+            d.chars().count()
+        ),
+        None => format!("{name} [optional — paste a key, or Enter to skip embedding]: "),
+    };
+    let v = read_secret_line(&prompt)?;
+    let v = v.trim();
+    if v == "-" {
+        println!("  {} embedding disabled (OpenAI key cleared)", "·".dimmed());
+        return Ok(None);
+    }
+    if v.is_empty() {
+        return Ok(match default {
+            Some(d) => {
+                println!(
+                    "  {} OPENAI_API_KEY kept ({} chars)",
+                    "✓".green(),
+                    d.chars().count()
+                );
+                Some(d.to_string())
+            }
+            None => {
+                println!("  {} embedding disabled (no OpenAI key)", "·".dimmed());
+                None
+            }
+        });
+    }
+    println!(
+        "  {} OPENAI_API_KEY set ({} chars)",
+        "✓".green(),
+        v.chars().count()
+    );
+    Ok(Some(v.to_string()))
 }
 
 /// Read one line with readline-style editing (arrow keys, ^U/^K) — what people

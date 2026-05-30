@@ -50,10 +50,16 @@ pub fn mount_volume(name: &str, no_embed: bool) -> Result<()> {
         Some(&rv.volume.schema),
     )?);
 
+    // OpenAI key: the environment first, else the vault's saved credentials —
+    // so the boot agent (bare env) can still embed from the file.
+    let openai = std::env::var("OPENAI_API_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| rv.creds.openai_api_key.clone());
     let embed_tx = if no_embed {
         None
     } else {
-        match std::env::var("OPENAI_API_KEY").ok().filter(|s| !s.is_empty()) {
+        match openai {
             Some(key) => Some(crate::embed::spawn_embedder(
                 &versions_db,
                 key,
@@ -61,7 +67,7 @@ pub fn mount_volume(name: &str, no_embed: bool) -> Result<()> {
             )?),
             None => {
                 eprintln!(
-                    "{} OPENAI_API_KEY not set — embedding disabled for this mount",
+                    "{} no OPENAI_API_KEY (env or saved credentials) — embedding disabled for this mount",
                     "warning:".yellow().bold()
                 );
                 None

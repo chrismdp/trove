@@ -414,10 +414,26 @@ fn init_fs(
     trove::jfs::Fs::init(&volume, &meta, &cache)
 }
 
-/// `OPENAI_API_KEY` or a clear error.
+/// The OpenAI API key: the environment first, else the saved credentials — the
+/// cwd vault's profile if we're in a vault folder, else the default profile. So
+/// `embed`/`search`/`server` (and a backgrounded mount) all reach a key written
+/// to `credentials.toml` at init, not just one exported in the shell.
 #[cfg(feature = "mount")]
-fn openai_key() -> Result<String> {
-    std::env::var("OPENAI_API_KEY").map_err(|_| anyhow::anyhow!("OPENAI_API_KEY not set"))
+fn openai_key(cfg: &trove::config::Config) -> Result<String> {
+    if let Some(k) = std::env::var("OPENAI_API_KEY").ok().filter(|s| !s.is_empty()) {
+        return Ok(k);
+    }
+    if let Some(vol) = &cfg.volume {
+        if let Ok(rv) = trove::config::ResolvedVolume::load(vol) {
+            if let Some(k) = rv.creds.openai_api_key {
+                return Ok(k);
+            }
+        }
+    }
+    if let Some(k) = trove::config::Credentials::load().resolve(None).openai_api_key {
+        return Ok(k);
+    }
+    anyhow::bail!("OPENAI_API_KEY not set (and none saved in credentials.toml)")
 }
 
 /// Resolve the target volume name for a lifecycle command: the explicit
@@ -471,7 +487,7 @@ fn run() -> Result<usize> {
                     Some(&init.schema),
                 )?);
                 let embed_tx = if !no_embed {
-                    match openai_key() {
+                    match openai_key(&cfg) {
                         Ok(key) => Some(trove::embed::spawn_embedder(
                             &init.versions_db,
                             key,
@@ -654,7 +670,7 @@ fn run() -> Result<usize> {
             // for offline runs.
             let embed_tx = match (&versions_url, no_embed) {
                 (Some(url), false) => {
-                    let key = openai_key().map_err(|e| {
+                    let key = openai_key(&cfg).map_err(|e| {
                         anyhow::anyhow!(
                         "{e}. Set OPENAI_API_KEY, or pass --no-embed to mount without embedding."
                     )
@@ -732,7 +748,7 @@ fn run() -> Result<usize> {
                     "--remodel and --watch are mutually exclusive — remodel is a one-shot migration"
                 ));
             }
-            let api_key = openai_key()?;
+            let api_key = openai_key(&cfg)?;
             let fs = init_fs(volume, meta, cache, &cfg)?;
             let mut versions = connect_versions(versions_db, &cfg)?;
             if remodel {
@@ -768,7 +784,7 @@ fn run() -> Result<usize> {
             versions_db,
             top_k,
         } => {
-            let literal = trove::embed::embed_query_literal(&openai_key()?, &query)?;
+            let literal = trove::embed::embed_query_literal(&openai_key(&cfg)?, &query)?;
             let mut versions = connect_versions(versions_db, &cfg)?;
             let hits = versions.search_chunks(&literal, top_k)?;
             if hits.is_empty() {
@@ -796,7 +812,7 @@ fn run() -> Result<usize> {
             cache,
             versions_db,
         } => {
-            let api_key = openai_key()?;
+            let api_key = openai_key(&cfg)?;
             let fs = init_fs(volume, meta, cache, &cfg)?;
             let mut versions = connect_versions(versions_db, &cfg)?;
             trove::commands::server::run(&fs, &mut versions, &api_key, port)?;
